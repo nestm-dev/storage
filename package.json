@@ -1,6 +1,6 @@
 {
   "name": "@nestm/storage",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0-alpha.1",
   "description": "NestJS 12 storage integration with named stores, streaming I/O, and an optional guarded HTTP gateway.",
   "license": "MIT",
   "author": "Kauan Guesser",
