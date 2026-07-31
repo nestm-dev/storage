@@ -1,0 +1,25 @@
+packages:
+  - '.'
+
+# Nest 12.0.0-alpha.* still declares ^11.0.0 peers on some siblings, and
+# files-sdk's optional Nest integration has not widened its peer range yet.
+peerDependencyRules:
+  allowedVersions:
+    '@nestjs/common': '12'
+    '@nestjs/core': '12'
+    '@nestjs/platform-express': '12'
+    '@nestjs/platform-fastify': '12'
+
+overrides:
+  multer: '2.2.0'
+
+# @nestjs/core's postinstall is only a donation banner; never run it.
+allowBuilds:
+  '@nestjs/core': false
+
+# `changeset publish` shells out to `pnpm publish`, and pnpm ignores
+# package.json's publishConfig.provenance.
+provenance: true
+
+minimumReleaseAgeExclude:
+  - files-sdk@2.2.2

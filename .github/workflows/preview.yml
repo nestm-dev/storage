@@ -1,0 +1,17 @@
+name: Preview release
+
+# Dormant until the pkg.pr.new GitHub app is installed on nestm-dev.
+on:
+  workflow_dispatch:
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - run: pnpm dlx pkg-pr-new publish
