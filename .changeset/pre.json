@@ -5,6 +5,7 @@
     "@nestm/storage": "0.1.0-alpha.0"
   },
   "changesets": [
+    "framework-neutral-core",
     "initial-storage-release"
   ]
 }

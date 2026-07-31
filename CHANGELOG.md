@@ -1,5 +1,14 @@
 # @nestm/storage
 
+## 0.1.0-alpha.2
+
+### Minor Changes
+
+- c4b54e7: Add a framework-neutral `@nestm/storage/core` entry point for the storage
+  client, driver contract, errors, operation types, and upload controls. NestJS
+  peers are now optional so non-Nest consumers can install and use the core API
+  without pulling in the framework.
+
 ## 0.1.0-alpha.1
 
 ### Minor Changes
