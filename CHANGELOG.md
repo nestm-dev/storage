@@ -1,5 +1,12 @@
 # @nestm/storage
 
+## 0.1.0-alpha.1
+
+### Minor Changes
+
+- 368aa2a: Add the initial NestJS 12 storage integration with named stores, streaming I/O,
+  advanced cross-store operations, and an optional guarded HTTP gateway.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).

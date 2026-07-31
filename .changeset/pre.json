@@ -4,5 +4,7 @@
   "initialVersions": {
     "@nestm/storage": "0.1.0-alpha.0"
   },
-  "changesets": []
+  "changesets": [
+    "initial-storage-release"
+  ]
 }
