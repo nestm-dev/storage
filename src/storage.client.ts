@@ -1,5 +1,3 @@
-import type { OnApplicationShutdown } from '@nestjs/common';
-
 import { settleMany } from './internal/settle-many.js';
 import {
   StorageError,
@@ -227,7 +225,7 @@ export interface StorageFileHandle {
   ): Promise<void>;
 }
 
-export class StorageClient implements OnApplicationShutdown {
+export class StorageClient {
   readonly #driver: StorageDriver;
   readonly #plugins: readonly StoragePlugin[];
   #closed = false;

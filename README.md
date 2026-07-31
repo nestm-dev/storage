@@ -1,7 +1,8 @@
 # @nestm/storage
 
-NestJS 12 storage integration with named stores, explicit streaming I/O,
-cross-store workflows, and an optional guarded HTTP gateway.
+Framework-neutral storage clients with NestJS 12 integration, named stores,
+explicit streaming I/O, cross-store workflows, and an optional guarded HTTP
+gateway.
 
 The package uses [`files-sdk`](https://github.com/haydenbleasel/files-sdk) as
 its provider engine, but owns the API injected into Nest applications. Provider
@@ -13,8 +14,13 @@ SDK types, errors, and `files.raw` do not leak through the root package.
 ## Requirements
 
 - Node.js 22.12 or newer
-- NestJS `12.0.0-alpha.5` or newer in the Nest 12 prerelease line
 - ESM
+
+The framework-neutral `@nestm/storage/core` entry point does not require
+NestJS. The root entry point and HTTP gateway additionally require NestJS
+`12.0.0-alpha.5` or newer in the Nest 12 prerelease line, `reflect-metadata`,
+and RxJS. Those framework peers are optional at installation time so core-only
+consumers do not download NestJS.
 
 ## Install
 
@@ -45,6 +51,34 @@ NestJS 12 alpha also has prerelease peer declarations that npm may reject under
 its strict resolver. If npm reports an `ERESOLVE` error for Nest's own peers,
 install with `npm install --legacy-peer-deps`; pnpm works with the repository's
 checked-in peer-version policy.
+
+## Framework-neutral core
+
+Import storage primitives from `@nestm/storage/core` in workers, scripts, and
+applications that do not use NestJS:
+
+```ts
+import {
+  StorageClient,
+  type StorageDriver,
+  type StorageUploadOptions,
+} from '@nestm/storage/core';
+
+declare const driver: StorageDriver;
+
+const media = new StorageClient('media', driver);
+
+await media.upload('avatars/user.png', image, {
+  contentType: 'image/png',
+} satisfies StorageUploadOptions);
+
+await media.onApplicationShutdown();
+```
+
+The core entry point exports `StorageClient`, the `StorageDriver` contract,
+storage errors and operation types, and `StorageUploadControl`. It has no NestJS
+runtime or declaration imports. Provider adapters remain available through
+`@nestm/storage/files-sdk`.
 
 ## Configure named stores
 
