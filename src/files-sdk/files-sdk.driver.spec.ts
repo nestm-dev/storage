@@ -7,6 +7,43 @@ import { StorageError, StorageErrorCode } from '../storage.error.js';
 import { createFilesSdkDriver } from './files-sdk.driver.js';
 
 describe('FilesSdkStorageDriver', () => {
+  it('maps a not-found FilesError from another package copy', async () => {
+    class ForeignFilesError extends Error {
+      override readonly name = 'FilesError';
+      readonly code = 'NotFound';
+      readonly aborted = false;
+      readonly timedOut = false;
+      readonly permanent = true;
+    }
+
+    const adapter = memory();
+    adapter.head = async () => {
+      throw new ForeignFilesError('missing object');
+    };
+    const driver = createFilesSdkDriver({ adapter });
+
+    await expect(driver.head('missing.bin')).rejects.toMatchObject({
+      code: StorageErrorCode.NOT_FOUND,
+      message: 'missing object',
+      permanent: true,
+    });
+  });
+
+  it('does not classify an unrelated provider error from its code alone', async () => {
+    const adapter = memory();
+    adapter.head = async () => {
+      throw Object.assign(new Error('provider used a coincidental code'), {
+        code: 'NotFound',
+      });
+    };
+    const driver = createFilesSdkDriver({ adapter });
+
+    await expect(driver.head('unknown.bin')).rejects.toMatchObject({
+      code: StorageErrorCode.PROVIDER,
+      message: 'provider used a coincidental code',
+    });
+  });
+
   it('preserves owned storage errors raised while consuming upload streams', async () => {
     const expected = new StorageError('stream limit reached', {
       code: StorageErrorCode.LIMIT_EXCEEDED,

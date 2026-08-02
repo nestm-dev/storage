@@ -5,3 +5,7 @@ export const STORAGE_GATEWAY_OPTIONS = Symbol.for(
 export const STORAGE_GATEWAY_GUARDS = Symbol.for(
   '@nestm/storage/gateway/guards',
 );
+
+export const STORAGE_GATEWAY_KEY_POLICY = Symbol.for(
+  '@nestm/storage/gateway/key-policy',
+);

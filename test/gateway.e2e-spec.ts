@@ -17,11 +17,21 @@ import request from 'supertest';
 import {
   StorageGatewayModule,
   StorageGatewayOperation,
+  type StorageGatewayKeyPolicy,
+  type StorageGatewayKeyPolicyContext,
+  type StorageGatewayMode,
+  type StorageGatewayOperationName,
 } from '../src/gateway/index.js';
 import { StorageModule } from '../src/storage.module.js';
+import type { StorageDriver } from '../src/storage.driver.js';
+import { createS3StorageDriver } from '../src/files-sdk/s3/index.js';
 import { createMemoryStorageDriver } from '../src/testing/index.js';
 
 let guardCalls = 0;
+const keyPolicyCalls: Array<{
+  operation: StorageGatewayOperationName;
+  target: StorageGatewayKeyPolicyContext['target'];
+}> = [];
 
 @Injectable()
 class AllowGuard implements CanActivate {
@@ -37,6 +47,24 @@ class AllowGuard implements CanActivate {
 })
 class GuardModule {}
 
+@Injectable()
+class ScopedKeyPolicy implements StorageGatewayKeyPolicy {
+  resolve(context: StorageGatewayKeyPolicyContext): string {
+    keyPolicyCalls.push({
+      operation: context.operation,
+      target: context.target,
+    });
+    const input = context.input?.value ?? '';
+    return `scoped/${input}`;
+  }
+}
+
+@Module({
+  providers: [ScopedKeyPolicy],
+  exports: [ScopedKeyPolicy],
+})
+class KeyPolicyModule {}
+
 @Controller()
 class UnrelatedBinaryController {
   @Put('unrelated-binary')
@@ -50,11 +78,24 @@ type AdapterName = 'express' | 'fastify';
 async function createApp(
   adapterName: AdapterName,
   maxUploadBytes = 1024,
+  gateway: {
+    defaultSignedUrlExpiresIn?: number;
+    driver?: StorageDriver;
+    maxSignedUploadBytes?: number;
+    maxSignedUrlExpiresIn?: number;
+    mode?: StorageGatewayMode;
+    operations?: readonly StorageGatewayOperationName[];
+    signedUploadContentTypes?: readonly string[];
+  } = {},
 ): Promise<INestApplication> {
   const storage = StorageModule.forRoot({
     stores: [
       {
-        driver: createMemoryStorageDriver(),
+        driver:
+          gateway.driver ??
+          createMemoryStorageDriver({
+            adapter: { initial: { 'outside/secret.txt': 'secret' } },
+          }),
         name: 'gateway',
       },
     ],
@@ -63,11 +104,21 @@ async function createApp(
     controllers: [UnrelatedBinaryController],
     imports: [
       StorageGatewayModule.register({
+        ...(gateway.defaultSignedUrlExpiresIn !== undefined && {
+          defaultSignedUrlExpiresIn: gateway.defaultSignedUrlExpiresIn,
+        }),
         guards: [AllowGuard],
-        imports: [storage, GuardModule],
+        imports: [storage, GuardModule, KeyPolicyModule],
+        keyPolicy: ScopedKeyPolicy,
         maxUploadBytes,
-        mode: 'proxy',
-        operations: [
+        ...(gateway.maxSignedUploadBytes !== undefined && {
+          maxSignedUploadBytes: gateway.maxSignedUploadBytes,
+        }),
+        ...(gateway.maxSignedUrlExpiresIn !== undefined && {
+          maxSignedUrlExpiresIn: gateway.maxSignedUrlExpiresIn,
+        }),
+        mode: gateway.mode ?? 'proxy',
+        operations: gateway.operations ?? [
           StorageGatewayOperation.UPLOAD,
           StorageGatewayOperation.DOWNLOAD,
           StorageGatewayOperation.HEAD,
@@ -77,6 +128,9 @@ async function createApp(
           StorageGatewayOperation.MOVE,
           StorageGatewayOperation.DELETE,
         ],
+        ...(gateway.signedUploadContentTypes !== undefined && {
+          signedUploadContentTypes: gateway.signedUploadContentTypes,
+        }),
         store: 'gateway',
       }),
     ],
@@ -98,6 +152,7 @@ describe.each<AdapterName>(['express', 'fastify'])(
 
     beforeAll(async () => {
       guardCalls = 0;
+      keyPolicyCalls.length = 0;
       app = await createApp(adapterName);
     });
 
@@ -124,6 +179,12 @@ describe.each<AdapterName>(['express', 'fastify'])(
       expect(response.headers['content-disposition']).toBe('attachment');
       expect(response.headers['x-content-type-options']).toBe('nosniff');
       expect(guardCalls).toBeGreaterThanOrEqual(2);
+      expect(
+        keyPolicyCalls.some(
+          ({ operation, target }) =>
+            operation === StorageGatewayOperation.UPLOAD && target === 'key',
+        ),
+      ).toBe(true);
     });
 
     it('lists, searches, copies, moves, heads, and deletes allowed objects', async () => {
@@ -132,6 +193,12 @@ describe.each<AdapterName>(['express', 'fastify'])(
         .query({ prefix: 'folder/' })
         .expect(200);
       expect(list.body.data.items).toHaveLength(1);
+      expect(list.body.data.items[0].key).toBe('scoped/folder/hello.txt');
+      const tenantRoot = await request(app.getHttpServer())
+        .get('/storage/list')
+        .expect(200);
+      expect(tenantRoot.body.data.items).toHaveLength(1);
+      expect(tenantRoot.body.data.items[0].key).not.toContain('outside/');
 
       const search = await request(app.getHttpServer())
         .get('/storage/search')
@@ -156,6 +223,19 @@ describe.each<AdapterName>(['express', 'fastify'])(
         .delete('/storage/object')
         .query({ key: 'moved.txt' })
         .expect(200);
+      expect(keyPolicyCalls).toEqual(
+        expect.arrayContaining([
+          { operation: StorageGatewayOperation.LIST, target: 'prefix' },
+          { operation: StorageGatewayOperation.SEARCH, target: 'pattern' },
+          { operation: StorageGatewayOperation.SEARCH, target: 'prefix' },
+          { operation: StorageGatewayOperation.COPY, target: 'from' },
+          { operation: StorageGatewayOperation.COPY, target: 'to' },
+          { operation: StorageGatewayOperation.MOVE, target: 'from' },
+          { operation: StorageGatewayOperation.MOVE, target: 'to' },
+          { operation: StorageGatewayOperation.HEAD, target: 'key' },
+          { operation: StorageGatewayOperation.DELETE, target: 'key' },
+        ]),
+      );
     });
 
     it('returns 403 for operations outside the allowlist', async () => {
@@ -172,6 +252,17 @@ describe.each<AdapterName>(['express', 'fastify'])(
         .query({ key: 'ambiguous.txt' })
         .set('content-type', 'text/plain')
         .send('not an octet stream')
+        .expect(400);
+    });
+
+    it('rejects ambiguous object paths before the key policy runs', async () => {
+      await request(app.getHttpServer())
+        .get('/storage/object')
+        .query({ key: '../escape.txt' })
+        .expect(400);
+      await request(app.getHttpServer())
+        .get('/storage/list')
+        .query({ prefix: 'folder//nested' })
         .expect(400);
     });
 
@@ -211,6 +302,52 @@ describe.each<AdapterName>(['express', 'fastify'])(
   },
 );
 
+describe.each<AdapterName>(['express', 'fastify'])(
+  'StorageGatewayModule signed S3 policies (%s)',
+  (adapterName) => {
+    it('returns only provider-enforced upload and download policies', async () => {
+      const app = await createApp(adapterName, 1024, {
+        defaultSignedUrlExpiresIn: 60,
+        driver: createS3StorageDriver({
+          adapter: {
+            bucket: 'private-bucket',
+            credentials: {
+              accessKeyId: 'test',
+              secretAccessKey: 'test',
+            },
+            region: 'us-east-1',
+          },
+        }),
+        maxSignedUploadBytes: 8,
+        maxSignedUrlExpiresIn: 60,
+        mode: 'signed',
+        operations: [
+          StorageGatewayOperation.SIGN_DOWNLOAD,
+          StorageGatewayOperation.SIGN_UPLOAD,
+        ],
+        signedUploadContentTypes: ['image/png'],
+      });
+      try {
+        const upload = await request(app.getHttpServer())
+          .post('/storage/sign-upload')
+          .send({ contentType: 'image/png', key: 'image.png', maxSize: 8 })
+          .expect(201);
+        expect(upload.body.data.method).toBe('POST');
+        expect(upload.body.data.fields['Content-Type']).toBe('image/png');
+
+        const download = await request(app.getHttpServer())
+          .post('/storage/sign-download')
+          .send({ expiresIn: 60, key: 'image.png' })
+          .expect(201);
+        const url = new URL(download.body.data.url);
+        expect(url.searchParams.get('X-Amz-Expires')).toBe('60');
+      } finally {
+        await app.close();
+      }
+    });
+  },
+);
+
 describe('StorageGatewayModule security defaults', () => {
   it('rejects registration without a guard or explicit development override', () => {
     expect(() =>
@@ -226,8 +363,83 @@ describe('StorageGatewayModule security defaults', () => {
         allowUnauthenticated: true,
         mode: 'signned' as 'signed',
         operations: [StorageGatewayOperation.DOWNLOAD],
+        unsafeAllowUnscopedKeys: true,
       }),
     ).toThrow('Unknown storage gateway mode');
+  });
+
+  it('requires a key policy or the explicitly unsafe migration escape hatch', () => {
+    expect(() =>
+      StorageGatewayModule.register({
+        allowUnauthenticated: true,
+        operations: [StorageGatewayOperation.DOWNLOAD],
+      }),
+    ).toThrow('requires a keyPolicy');
+
+    expect(() =>
+      StorageGatewayModule.register({
+        allowUnauthenticated: true,
+        keyPolicy: ScopedKeyPolicy,
+        operations: [StorageGatewayOperation.DOWNLOAD],
+        unsafeAllowUnscopedKeys: true,
+      }),
+    ).toThrow('cannot combine keyPolicy');
+  });
+
+  it('hard-caps signed URL expiry, upload size, and upload MIME', async () => {
+    const app = await createApp('express', 1024, {
+      defaultSignedUrlExpiresIn: 60,
+      maxSignedUploadBytes: 8,
+      maxSignedUrlExpiresIn: 60,
+      mode: 'signed',
+      operations: [
+        StorageGatewayOperation.SIGN_DOWNLOAD,
+        StorageGatewayOperation.SIGN_UPLOAD,
+      ],
+      signedUploadContentTypes: ['image/png'],
+    });
+    try {
+      await request(app.getHttpServer())
+        .post('/storage/sign-download')
+        .send({ expiresIn: 61, key: 'image.png' })
+        .expect(400);
+      await request(app.getHttpServer())
+        .post('/storage/sign-download')
+        .send({
+          expiresIn: 60,
+          key: 'image.png',
+          responseContentDisposition: 'attachment\r\nx-injected: yes',
+        })
+        .expect(400);
+      const unsupportedDownload = await request(app.getHttpServer())
+        .post('/storage/sign-download')
+        .send({
+          expiresIn: 60,
+          key: 'image.png',
+          responseContentDisposition: 'attachment',
+        })
+        .expect(501);
+      expect(unsupportedDownload.body.error.code).toBe('NOT_SUPPORTED');
+      await request(app.getHttpServer())
+        .post('/storage/sign-upload')
+        .send({ contentType: 'text/html', key: 'image.png', maxSize: 8 })
+        .expect(400);
+      await request(app.getHttpServer())
+        .post('/storage/sign-upload')
+        .send({ contentType: 'image/png', key: 'image.png', maxSize: 9 })
+        .expect(413);
+      await request(app.getHttpServer())
+        .post('/storage/sign-upload')
+        .send({ key: 'image.png', maxSize: 8 })
+        .expect(400);
+      const unsupported = await request(app.getHttpServer())
+        .post('/storage/sign-upload')
+        .send({ contentType: 'image/png', key: 'image.png', maxSize: 8 })
+        .expect(501);
+      expect(unsupported.body.error.code).toBe('NOT_SUPPORTED');
+    } finally {
+      await app.close();
+    }
   });
 
   it('enforces the streaming upload limit', async () => {

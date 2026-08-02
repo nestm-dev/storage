@@ -22,6 +22,7 @@ import type {
   StorageOperationContext,
   StorageOperationOptions,
   StoragePlugin,
+  StoragePromotionOptions,
   StorageSearchOptions,
   StorageSignedDownloadOptions,
   StorageSignedUpload,
@@ -223,6 +224,11 @@ export interface StorageFileHandle {
     destinationKey: string,
     options?: StorageOperationOptions,
   ): Promise<void>;
+  /** Conditionally copies this staged object and deliberately retains it. */
+  promoteTo(
+    destinationKey: string,
+    options: StoragePromotionOptions,
+  ): Promise<void>;
 }
 
 export class StorageClient {
@@ -260,6 +266,8 @@ export class StorageClient {
       key,
       moveTo: (destinationKey, options) =>
         this.move(key, destinationKey, options),
+      promoteTo: (destinationKey, options) =>
+        this.promote(key, destinationKey, options),
       signDownload: (options) => this.signDownload(key, options),
       signUpload: (options) => this.signUpload(key, options),
       bytes: (options) => this.downloadBytes(key, options),
@@ -382,6 +390,60 @@ export class StorageClient {
         to: destinationKey,
       },
       () => this.#driver.move(sourceKey, destinationKey, options),
+    );
+  }
+
+  /**
+   * Conditionally copies a staged object to a final key. This operation does
+   * not delete the source; delete it after the application commit succeeds.
+   */
+  promote(
+    sourceKey: string,
+    destinationKey: string,
+    options: StoragePromotionOptions,
+  ): Promise<void> {
+    assertKey(sourceKey, 'source key');
+    assertKey(destinationKey, 'destination key');
+    const sourceEtag = options.sourceEtag;
+    const sourceVersion = options.sourceVersion;
+    if (sourceEtag !== undefined && sourceEtag.length === 0) {
+      invalidArgument('sourceEtag must be a non-empty string.');
+    }
+    if (sourceVersion !== undefined && sourceVersion.length === 0) {
+      invalidArgument('sourceVersion must be a non-empty string.');
+    }
+    if (sourceEtag === undefined && sourceVersion === undefined) {
+      invalidArgument('promote requires sourceEtag, sourceVersion, or both.');
+    }
+
+    const capability = this.#driver.capabilities.conditionalCopy;
+    const promote = this.#driver.promote;
+    if (
+      capability?.supported !== true ||
+      promote === undefined ||
+      (sourceEtag !== undefined && !capability.etag) ||
+      (sourceVersion !== undefined && !capability.version)
+    ) {
+      throw new StorageError(
+        `Store "${this.name}" does not support the requested conditional promotion.`,
+        {
+          code: StorageErrorCode.NOT_SUPPORTED,
+          key: sourceKey,
+          operation: 'promote',
+          permanent: true,
+          store: this.name,
+        },
+      );
+    }
+
+    return this.#execute(
+      {
+        from: sourceKey,
+        operation: 'promote',
+        store: this.name,
+        to: destinationKey,
+      },
+      () => promote.call(this.#driver, sourceKey, destinationKey, options),
     );
   }
 

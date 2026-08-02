@@ -87,6 +87,52 @@ describe('StorageClient', () => {
     await expect(client.exists('archive/one.txt')).resolves.toBe(true);
   });
 
+  it('promotes only through a driver-declared conditional copy capability', async () => {
+    const driver = createMemoryStorageDriver();
+    const promote = vi.fn(async () => undefined);
+    Object.defineProperty(driver, 'capabilities', {
+      value: {
+        ...driver.capabilities,
+        conditionalCopy: {
+          etag: true,
+          supported: true,
+          version: false,
+        },
+      },
+    });
+    driver.promote = promote;
+    const client = new StorageClient('media', driver);
+
+    await client.file('staging/image.png').promoteTo('final/image.png', {
+      sourceEtag: '"verified-etag"',
+    });
+    expect(promote).toHaveBeenCalledWith(
+      'staging/image.png',
+      'final/image.png',
+      { sourceEtag: '"verified-etag"' },
+    );
+    expect(() =>
+      client.promote('staging/image.png', 'final/image.png', {
+        sourceVersion: 'v1',
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.NOT_SUPPORTED }),
+    );
+  });
+
+  it('rejects unconditional promotion and unsupported drivers', async () => {
+    const client = new StorageClient('media', createMemoryStorageDriver());
+
+    expect(() => client.promote('staging.bin', 'final.bin', {})).toThrow(
+      'requires sourceEtag',
+    );
+    expect(() =>
+      client.promote('staging.bin', 'final.bin', { sourceEtag: 'etag' }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.NOT_SUPPORTED }),
+    );
+  });
+
   it('classifies invalid owned options before calling the provider', async () => {
     const client = new StorageClient('media', createMemoryStorageDriver());
 

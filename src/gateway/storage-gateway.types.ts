@@ -22,6 +22,32 @@ export type StorageGatewayOperation =
 
 export type StorageGatewayMode = 'proxy' | 'signed' | 'hybrid';
 
+export type StorageGatewayKeyTarget =
+  'key' | 'prefix' | 'pattern' | 'from' | 'to';
+
+/** A path parsed before it crosses the application's key policy boundary. */
+export interface ParsedStorageGatewayKey {
+  readonly value: string;
+  readonly segments: readonly string[];
+  readonly trailingSlash: boolean;
+}
+
+export interface StorageGatewayKeyPolicyContext {
+  readonly operation: StorageGatewayOperation;
+  readonly target: StorageGatewayKeyTarget;
+  readonly request: unknown;
+  /** Undefined only for an omitted list/search prefix. */
+  readonly input: ParsedStorageGatewayKey | undefined;
+}
+
+/**
+ * Resolves an untrusted, parsed gateway path to the exact provider key/prefix.
+ * Throw to deny. The returned value is parsed again before provider use.
+ */
+export interface StorageGatewayKeyPolicy {
+  resolve(context: StorageGatewayKeyPolicyContext): string | Promise<string>;
+}
+
 export interface StorageGatewayOptions {
   /**
    * Module exporting StorageService. Required when StorageModule is not global.
@@ -41,6 +67,16 @@ export interface StorageGatewayOptions {
    * gateway.
    */
   allowUnauthenticated?: boolean;
+  /**
+   * Existing provider implementing the mandatory key authorization/scope
+   * boundary. It may be request scoped.
+   */
+  keyPolicy?: InjectionToken<StorageGatewayKeyPolicy>;
+  /**
+   * Migration-only escape hatch preserving caller-controlled keys. It cannot
+   * be combined with keyPolicy and must never be used on an exposed gateway.
+   */
+  unsafeAllowUnscopedKeys?: boolean;
   /** Defaults to hybrid: prefer signed downloads, proxy when unavailable. */
   mode?: StorageGatewayMode;
   /** Proxy upload ceiling. Defaults to 100 MiB. */
@@ -59,6 +95,15 @@ export interface StorageGatewayOptions {
   proxyInlineContentTypes?: readonly string[];
   /** Default signed-download lifetime. Defaults to 300 seconds. */
   defaultSignedUrlExpiresIn?: number;
+  /** Hard ceiling for every signed URL. Defaults to 3,600 seconds. */
+  maxSignedUrlExpiresIn?: number;
+  /** Hard signed-upload ceiling. Defaults to maxUploadBytes. */
+  maxSignedUploadBytes?: number;
+  /**
+   * Exact MIME allowlist for direct uploads. Defaults to only
+   * application/octet-stream; signed-upload callers must always provide one.
+   */
+  signedUploadContentTypes?: readonly string[];
 }
 
 export interface ResolvedStorageGatewayOptions {
@@ -71,4 +116,7 @@ export interface ResolvedStorageGatewayOptions {
   maxSearchResults: number;
   proxyInlineContentTypes: ReadonlySet<string>;
   defaultSignedUrlExpiresIn: number;
+  maxSignedUrlExpiresIn: number;
+  maxSignedUploadBytes: number;
+  signedUploadContentTypes: ReadonlySet<string>;
 }
