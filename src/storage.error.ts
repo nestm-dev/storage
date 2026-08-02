@@ -14,6 +14,12 @@ export const StorageErrorCode = {
 export type StorageErrorCode =
   (typeof StorageErrorCode)[keyof typeof StorageErrorCode];
 
+const STORAGE_ERROR_BRAND = Symbol.for('@nestm/storage/StorageError');
+
+function isStorageErrorCode(value: unknown): value is StorageErrorCode {
+  return Object.values(StorageErrorCode).includes(value as StorageErrorCode);
+}
+
 export interface StorageErrorOptions {
   code: StorageErrorCode;
   store?: string;
@@ -26,6 +32,7 @@ export interface StorageErrorOptions {
 }
 
 export class StorageError extends Error {
+  declare readonly [STORAGE_ERROR_BRAND]: true;
   readonly code: StorageErrorCode;
   readonly store: string | undefined;
   readonly operation: string | undefined;
@@ -37,6 +44,12 @@ export class StorageError extends Error {
 
   constructor(message: string, options: StorageErrorOptions) {
     super(message, { cause: options.cause });
+    Object.defineProperty(this, STORAGE_ERROR_BRAND, {
+      configurable: false,
+      enumerable: false,
+      value: true,
+      writable: false,
+    });
     this.name = 'StorageError';
     this.code = options.code;
     this.store = options.store;
@@ -50,7 +63,41 @@ export class StorageError extends Error {
 }
 
 export function isStorageError(error: unknown): error is StorageError {
-  return error instanceof StorageError;
+  if (error instanceof StorageError) {
+    return true;
+  }
+  if (!(error instanceof Error) || error.name !== 'StorageError') {
+    return false;
+  }
+
+  try {
+    const candidate = error as Error & {
+      readonly [STORAGE_ERROR_BRAND]?: unknown;
+      readonly aborted?: unknown;
+      readonly code?: unknown;
+      readonly key?: unknown;
+      readonly operation?: unknown;
+      readonly permanent?: unknown;
+      readonly store?: unknown;
+      readonly timedOut?: unknown;
+    };
+    const hasCompatibleBrand =
+      candidate[STORAGE_ERROR_BRAND] === true ||
+      candidate[STORAGE_ERROR_BRAND] === undefined;
+    return (
+      hasCompatibleBrand &&
+      isStorageErrorCode(candidate.code) &&
+      typeof candidate.aborted === 'boolean' &&
+      typeof candidate.timedOut === 'boolean' &&
+      typeof candidate.permanent === 'boolean' &&
+      (candidate.store === undefined || typeof candidate.store === 'string') &&
+      (candidate.operation === undefined ||
+        typeof candidate.operation === 'string') &&
+      (candidate.key === undefined || typeof candidate.key === 'string')
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function normalizeStorageError(

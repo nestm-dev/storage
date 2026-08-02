@@ -1,6 +1,9 @@
 export {
   FilesSdkStorageDriver,
   createFilesSdkDriver,
+  type FilesSdkConditionalCopyAdapter,
+  type FilesSdkSignedUploadPolicyAdapter,
+  type FilesSdkSignedDownloadPolicyAdapter,
   type FilesSdkDriverOptions,
 } from './files-sdk.driver.js';
 

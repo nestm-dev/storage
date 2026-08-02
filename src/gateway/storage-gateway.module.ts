@@ -10,15 +10,24 @@ import { StorageGatewayFastifyParser } from './storage-gateway-fastify-parser.js
 import { StorageGatewayGuard } from './storage-gateway.guard.js';
 import {
   STORAGE_GATEWAY_GUARDS,
+  STORAGE_GATEWAY_KEY_POLICY,
   STORAGE_GATEWAY_OPTIONS,
 } from './storage-gateway.tokens.js';
 import {
   StorageGatewayOperation,
   type ResolvedStorageGatewayOptions,
+  type StorageGatewayKeyPolicy,
   type StorageGatewayOptions,
 } from './storage-gateway.types.js';
 
 const operations = new Set(Object.values(StorageGatewayOperation));
+
+function isExactContentType(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u.test(value)
+  );
+}
 
 function resolveOptions(
   options: StorageGatewayOptions,
@@ -41,6 +50,22 @@ function resolveOptions(
   ) {
     throw new TypeError(
       'StorageGatewayModule requires at least one Nest guard. Set allowUnauthenticated: true only for explicit development use.',
+    );
+  }
+  if (
+    options.keyPolicy === undefined &&
+    options.unsafeAllowUnscopedKeys !== true
+  ) {
+    throw new TypeError(
+      'StorageGatewayModule requires a keyPolicy. Set unsafeAllowUnscopedKeys: true only as an explicit migration escape hatch.',
+    );
+  }
+  if (
+    options.keyPolicy !== undefined &&
+    options.unsafeAllowUnscopedKeys === true
+  ) {
+    throw new TypeError(
+      'StorageGatewayModule cannot combine keyPolicy with unsafeAllowUnscopedKeys.',
     );
   }
   if (
@@ -70,6 +95,44 @@ function resolveOptions(
       'defaultSignedUrlExpiresIn must be a positive safe integer.',
     );
   }
+  const maxSignedUrlExpiresIn = options.maxSignedUrlExpiresIn ?? 3600;
+  if (
+    !Number.isSafeInteger(maxSignedUrlExpiresIn) ||
+    maxSignedUrlExpiresIn <= 0
+  ) {
+    throw new TypeError(
+      'maxSignedUrlExpiresIn must be a positive safe integer.',
+    );
+  }
+  if (defaultSignedUrlExpiresIn > maxSignedUrlExpiresIn) {
+    throw new TypeError(
+      'defaultSignedUrlExpiresIn cannot exceed maxSignedUrlExpiresIn.',
+    );
+  }
+  const maxSignedUploadBytes = options.maxSignedUploadBytes ?? maxUploadBytes;
+  if (
+    !Number.isSafeInteger(maxSignedUploadBytes) ||
+    maxSignedUploadBytes <= 0
+  ) {
+    throw new TypeError(
+      'maxSignedUploadBytes must be a positive safe integer.',
+    );
+  }
+  const signedUploadContentTypes = options.signedUploadContentTypes ?? [
+    'application/octet-stream',
+  ];
+  if (signedUploadContentTypes.length === 0) {
+    throw new TypeError(
+      'signedUploadContentTypes must contain at least one exact MIME type.',
+    );
+  }
+  for (const contentType of signedUploadContentTypes) {
+    if (!isExactContentType(contentType)) {
+      throw new TypeError(
+        'signedUploadContentTypes must contain lowercase exact MIME types without parameters.',
+      );
+    }
+  }
   const proxyInlineContentTypes = options.proxyInlineContentTypes ?? [];
   for (const contentType of proxyInlineContentTypes) {
     if (
@@ -89,12 +152,15 @@ function resolveOptions(
     defaultSignedUrlExpiresIn,
     maxListResults,
     maxSearchResults,
+    maxSignedUploadBytes,
+    maxSignedUrlExpiresIn,
     maxUploadBytes,
     mode: options.mode ?? 'hybrid',
     operations: new Set(options.operations),
     proxyInlineContentTypes: new Set(
       proxyInlineContentTypes.map((contentType) => contentType.toLowerCase()),
     ),
+    signedUploadContentTypes: new Set(signedUploadContentTypes),
     ...(options.store !== undefined && { store: options.store }),
   };
 }
@@ -112,6 +178,26 @@ export class StorageGatewayModule {
             inject: [...guardTokens],
             useFactory: (...guards: CanActivate[]) => guards,
           };
+    const keyPolicyProvider: Provider =
+      options.keyPolicy === undefined
+        ? {
+            provide: STORAGE_GATEWAY_KEY_POLICY,
+            useValue: {
+              resolve({ input, target }) {
+                if (input !== undefined) {
+                  return input.value;
+                }
+                if (target === 'prefix') {
+                  return '';
+                }
+                throw new TypeError(`${target} is required.`);
+              },
+            } satisfies StorageGatewayKeyPolicy,
+          }
+        : {
+            provide: STORAGE_GATEWAY_KEY_POLICY,
+            useExisting: options.keyPolicy,
+          };
 
     return {
       module: StorageGatewayModule,
@@ -120,6 +206,7 @@ export class StorageGatewayModule {
       providers: [
         { provide: STORAGE_GATEWAY_OPTIONS, useValue: resolved },
         guardsProvider,
+        keyPolicyProvider,
         StorageGatewayGuard,
         StorageGatewayFastifyParser,
       ],

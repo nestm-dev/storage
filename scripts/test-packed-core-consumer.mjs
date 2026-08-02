@@ -43,6 +43,14 @@ try {
         private: true,
         type: 'module',
         dependencies: {
+          '@aws-sdk/client-s3':
+            rootPackage.devDependencies['@aws-sdk/client-s3'],
+          '@aws-sdk/lib-storage':
+            rootPackage.devDependencies['@aws-sdk/lib-storage'],
+          '@aws-sdk/s3-presigned-post':
+            rootPackage.devDependencies['@aws-sdk/s3-presigned-post'],
+          '@aws-sdk/s3-request-presigner':
+            rootPackage.devDependencies['@aws-sdk/s3-request-presigner'],
           '@nestm/storage': `file:${tarballPath}`,
         },
         devDependencies: {
@@ -113,10 +121,12 @@ import {
   StorageClient,
   StorageErrorCode,
   StorageUploadControl,
+  isStorageError,
   type StorageCapabilities,
   type StorageDriver,
   type StorageObjectMetadata,
 } from '@nestm/storage/core';
+import { createS3StorageDriver } from '@nestm/storage/files-sdk/s3';
 
 const capabilities = {
   cacheControl: true,
@@ -249,6 +259,38 @@ assert.equal(nestResolved, false);
 assert.equal(DEFAULT_BUFFER_LIMIT, 10 * 1024 * 1024);
 assert.equal(StorageErrorCode.NOT_FOUND, 'NOT_FOUND');
 assert.equal(new StorageUploadControl().status, 'idle');
+const foreignStorageError = Object.assign(new Error('foreign'), {
+  [Symbol.for('@nestm/storage/StorageError')]: true,
+  aborted: false,
+  code: StorageErrorCode.NOT_FOUND,
+  key: 'missing.bin',
+  name: 'StorageError',
+  operation: 'head',
+  permanent: true,
+  store: 'foreign',
+  timedOut: false,
+});
+assert.equal(isStorageError(foreignStorageError), true);
+
+const s3Driver = createS3StorageDriver({
+  adapter: {
+    bucket: 'packed-test',
+    credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+    region: 'us-east-1',
+  },
+});
+assert.deepEqual(s3Driver.capabilities.conditionalCopy, {
+  etag: true,
+  supported: true,
+  version: true,
+});
+assert.deepEqual(s3Driver.capabilities.signedUploadPolicy, {
+  contentType: true,
+  sizeRange: true,
+});
+assert.deepEqual(s3Driver.capabilities.signedDownloadPolicy, {
+  expiresIn: true,
+});
 
 const client = new StorageClient('packed', driver);
 const uploaded = await client.upload('hello.txt', 'hello core', {

@@ -31,6 +31,17 @@ export interface StorageOperationOptions {
   retries?: StorageRetryOptions;
 }
 
+/**
+ * Preconditions for promoting a staged object to its final key. At least one
+ * source identity must be supplied; unsupported identities fail closed.
+ */
+export interface StoragePromotionOptions extends StorageOperationOptions {
+  /** Copy only the source object whose provider ETag exactly matches. */
+  sourceEtag?: string;
+  /** Copy this immutable provider version of the source object. */
+  sourceVersion?: string;
+}
+
 export interface StorageMultipartOptions {
   partSize?: number;
   concurrency?: number;
@@ -141,6 +152,24 @@ export interface StorageSignedUrlCapability {
   maxExpiresIn?: number;
 }
 
+export interface StorageConditionalCopyCapability {
+  supported: boolean;
+  etag: boolean;
+  version: boolean;
+}
+
+export interface StorageSignedUploadPolicyCapability {
+  /** The signed request fixes the exact declared content type. */
+  contentType: boolean;
+  /** The signed request enforces the requested min/max byte range. */
+  sizeRange: boolean;
+}
+
+export interface StorageSignedDownloadPolicyCapability {
+  /** Every generated URL honors the requested expiry. */
+  expiresIn: boolean;
+}
+
 export interface StorageCapabilities {
   rangeRead: boolean;
   /** True when the provider reports native byte-level upload progress. */
@@ -150,12 +179,25 @@ export interface StorageCapabilities {
   cacheControl: boolean;
   resumableUpload: boolean;
   serverSideCopy: boolean;
+  /**
+   * Conditional server-side copy used to promote an already verified staged
+   * object without a validation/copy race. Absent means unsupported for
+   * compatibility with drivers built against earlier package versions.
+   */
+  conditionalCopy?: StorageConditionalCopyCapability;
   signedDownload: StorageSignedUrlCapability;
+  /** Expiry guarantees enforced by the provider adapter. */
+  signedDownloadPolicy?: StorageSignedDownloadPolicyCapability;
   /**
    * Some providers decide support from credentials or requested constraints,
    * so direct-upload support can only be known when the call is attempted.
    */
   signedUpload: boolean | 'runtime';
+  /**
+   * Constraints cryptographically/provider-policy enforced by direct upload.
+   * Absent means callers must not assume request options are enforced.
+   */
+  signedUploadPolicy?: StorageSignedUploadPolicyCapability;
 }
 
 export interface StorageBulkOptions {
@@ -216,6 +258,7 @@ export type StorageOperationName =
   | 'delete'
   | 'copy'
   | 'move'
+  | 'promote'
   | 'list'
   | 'search'
   | 'signDownload'

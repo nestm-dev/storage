@@ -18,7 +18,11 @@ import {
   type UrlOptions,
 } from 'files-sdk';
 
-import { StorageError, StorageErrorCode } from '../storage.error.js';
+import {
+  StorageError,
+  StorageErrorCode,
+  isStorageError,
+} from '../storage.error.js';
 import type { StorageDriver } from '../storage.driver.js';
 import type {
   StorageBody,
@@ -28,8 +32,12 @@ import type {
   StorageObject,
   StorageObjectMetadata,
   StorageOperationOptions,
+  StorageConditionalCopyCapability,
+  StoragePromotionOptions,
   StorageRetryOptions,
   StorageSearchOptions,
+  StorageSignedUploadPolicyCapability,
+  StorageSignedDownloadPolicyCapability,
   StorageSignedDownloadOptions,
   StorageSignedUpload,
   StorageSignedUploadOptions,
@@ -41,11 +49,166 @@ import { getFilesSdkUploadControl } from '../storage-upload-control.js';
 export type FilesSdkDriverOptions<AdapterType extends Adapter> =
   FilesOptions<AdapterType>;
 
-function mapFilesError(error: unknown): StorageError {
-  if (error instanceof StorageError) {
+/**
+ * Optional adapter extension for providers that can conditionally copy an
+ * immutable source identity. Plain files-sdk adapters remain fully supported.
+ */
+export interface FilesSdkConditionalCopyAdapter {
+  readonly conditionalCopy: StorageConditionalCopyCapability;
+  promote(
+    sourceKey: string,
+    destinationKey: string,
+    options: StoragePromotionOptions,
+  ): Promise<void>;
+}
+
+export interface FilesSdkSignedUploadPolicyAdapter {
+  readonly signedUploadPolicy: StorageSignedUploadPolicyCapability;
+}
+
+export interface FilesSdkSignedDownloadPolicyAdapter {
+  readonly signedDownloadPolicy: StorageSignedDownloadPolicyCapability;
+}
+
+function conditionalCopyAdapterOf(
+  adapter: Adapter,
+): FilesSdkConditionalCopyAdapter | undefined {
+  if (
+    typeof adapter !== 'object' ||
+    adapter === null ||
+    !('conditionalCopy' in adapter) ||
+    !('promote' in adapter)
+  ) {
+    return undefined;
+  }
+  const candidate = adapter as Adapter &
+    Partial<FilesSdkConditionalCopyAdapter>;
+  const capability = candidate.conditionalCopy;
+  if (
+    capability === undefined ||
+    typeof capability.supported !== 'boolean' ||
+    typeof capability.etag !== 'boolean' ||
+    typeof capability.version !== 'boolean' ||
+    typeof candidate.promote !== 'function'
+  ) {
+    return undefined;
+  }
+  return candidate as Adapter & FilesSdkConditionalCopyAdapter;
+}
+
+function signedUploadPolicyAdapterOf(
+  adapter: Adapter,
+): FilesSdkSignedUploadPolicyAdapter | undefined {
+  if (
+    typeof adapter !== 'object' ||
+    adapter === null ||
+    !('signedUploadPolicy' in adapter)
+  ) {
+    return undefined;
+  }
+  const candidate = adapter as Adapter &
+    Partial<FilesSdkSignedUploadPolicyAdapter>;
+  const capability = candidate.signedUploadPolicy;
+  if (
+    capability === undefined ||
+    typeof capability.contentType !== 'boolean' ||
+    typeof capability.sizeRange !== 'boolean'
+  ) {
+    return undefined;
+  }
+  return candidate as Adapter & FilesSdkSignedUploadPolicyAdapter;
+}
+
+function signedDownloadPolicyAdapterOf(
+  adapter: Adapter,
+): FilesSdkSignedDownloadPolicyAdapter | undefined {
+  if (
+    typeof adapter !== 'object' ||
+    adapter === null ||
+    !('signedDownloadPolicy' in adapter)
+  ) {
+    return undefined;
+  }
+  const candidate = adapter as Adapter &
+    Partial<FilesSdkSignedDownloadPolicyAdapter>;
+  const capability = candidate.signedDownloadPolicy;
+  if (capability === undefined || typeof capability.expiresIn !== 'boolean') {
+    return undefined;
+  }
+  return candidate as Adapter & FilesSdkSignedDownloadPolicyAdapter;
+}
+
+interface FilesErrorLike {
+  readonly name: string;
+  readonly message: string;
+  readonly code: FilesError['code'];
+  readonly aborted: boolean;
+  readonly timedOut: boolean;
+  readonly permanent: boolean;
+  readonly cause?: unknown;
+}
+
+function isFilesErrorCode(value: unknown): value is FilesError['code'] {
+  return (
+    value === 'NotFound' ||
+    value === 'Unauthorized' ||
+    value === 'Conflict' ||
+    value === 'ReadOnly' ||
+    value === 'Provider'
+  );
+}
+
+function isFilesErrorLike(error: unknown): error is FilesErrorLike {
+  if (error instanceof FilesError) {
+    return true;
+  }
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  try {
+    return (
+      error.name === 'FilesError' &&
+      typeof error.message === 'string' &&
+      'code' in error &&
+      isFilesErrorCode(error.code) &&
+      'aborted' in error &&
+      typeof error.aborted === 'boolean' &&
+      'timedOut' in error &&
+      typeof error.timedOut === 'boolean' &&
+      'permanent' in error &&
+      typeof error.permanent === 'boolean'
+    );
+  } catch {
+    return false;
+  }
+}
+
+function unwrapFilesError(error: FilesErrorLike): FilesErrorLike {
+  const seen = new Set<FilesErrorLike>();
+  let current = error;
+
+  while (
+    current.code === 'Provider' &&
+    !current.aborted &&
+    !current.timedOut &&
+    !current.permanent &&
+    isFilesErrorLike(current.cause) &&
+    current.message === current.cause.message &&
+    !seen.has(current.cause)
+  ) {
+    seen.add(current);
+    current = current.cause;
+  }
+
+  return current;
+}
+
+export function mapFilesSdkError(error: unknown): StorageError {
+  if (isStorageError(error)) {
     return error;
   }
-  if (!(error instanceof FilesError)) {
+  if (!isFilesErrorLike(error)) {
     return new StorageError(
       error instanceof Error ? error.message : String(error),
       {
@@ -55,17 +218,19 @@ function mapFilesError(error: unknown): StorageError {
     );
   }
 
-  if (error.cause instanceof StorageError) {
-    return error.cause;
+  const filesError = unwrapFilesError(error);
+
+  if (isStorageError(filesError.cause)) {
+    return filesError.cause;
   }
 
   let code: StorageErrorCode;
-  if (error.timedOut) {
+  if (filesError.timedOut) {
     code = StorageErrorCode.TIMEOUT;
-  } else if (error.aborted) {
+  } else if (filesError.aborted) {
     code = StorageErrorCode.ABORTED;
   } else {
-    switch (error.code) {
+    switch (filesError.code) {
       case 'NotFound':
         code = StorageErrorCode.NOT_FOUND;
         break;
@@ -80,7 +245,7 @@ function mapFilesError(error: unknown): StorageError {
         break;
       case 'Provider':
         code = /(?:not supported|does not support|unsupported)/iu.test(
-          error.message,
+          filesError.message,
         )
           ? StorageErrorCode.NOT_SUPPORTED
           : StorageErrorCode.PROVIDER;
@@ -88,12 +253,12 @@ function mapFilesError(error: unknown): StorageError {
     }
   }
 
-  return new StorageError(error.message, {
-    aborted: error.aborted,
-    cause: error.cause ?? error,
+  return new StorageError(filesError.message, {
+    aborted: filesError.aborted,
+    cause: filesError.cause ?? error,
     code,
-    permanent: error.permanent,
-    timedOut: error.timedOut,
+    permanent: filesError.permanent,
+    timedOut: filesError.timedOut,
   });
 }
 
@@ -110,7 +275,7 @@ function mapRetryOptions(
       backoff: ({ attempt, error }) =>
         retries.backoff?.({
           attempt,
-          error: mapFilesError(error),
+          error: mapFilesSdkError(error),
         }) ?? 0,
     }),
   };
@@ -182,7 +347,7 @@ function normalizeDownloadStream(
       try {
         await activeReader.cancel(reason);
       } catch (error) {
-        throw mapFilesError(error);
+        throw mapFilesSdkError(error);
       } finally {
         release();
       }
@@ -203,7 +368,7 @@ function normalizeDownloadStream(
         controller.enqueue(result.value);
       } catch (error) {
         release();
-        controller.error(mapFilesError(error));
+        controller.error(mapFilesSdkError(error));
       }
     },
   });
@@ -341,10 +506,17 @@ export class FilesSdkStorageDriver<
 > implements StorageDriver {
   readonly #files: Files<AdapterType>;
   readonly #name: string;
+  readonly #conditionalCopy: FilesSdkConditionalCopyAdapter | undefined;
+  readonly #signedUploadPolicy: FilesSdkSignedUploadPolicyAdapter | undefined;
+  readonly #signedDownloadPolicy:
+    FilesSdkSignedDownloadPolicyAdapter | undefined;
 
   constructor(options: FilesSdkDriverOptions<AdapterType>) {
     this.#files = new Files(options);
     this.#name = options.adapter.name;
+    this.#conditionalCopy = conditionalCopyAdapterOf(options.adapter);
+    this.#signedUploadPolicy = signedUploadPolicyAdapterOf(options.adapter);
+    this.#signedDownloadPolicy = signedDownloadPolicyAdapterOf(options.adapter);
   }
 
   get name(): string {
@@ -360,8 +532,19 @@ export class FilesSdkStorageDriver<
       rangeRead: capabilities.rangeRead,
       resumableUpload: capabilities.multipart,
       serverSideCopy: capabilities.serverSideCopy,
+      ...(this.#conditionalCopy !== undefined && {
+        conditionalCopy: { ...this.#conditionalCopy.conditionalCopy },
+      }),
       signedDownload: { ...capabilities.signedUrl },
+      ...(this.#signedDownloadPolicy !== undefined && {
+        signedDownloadPolicy: {
+          ...this.#signedDownloadPolicy.signedDownloadPolicy,
+        },
+      }),
       signedUpload: 'runtime' as const,
+      ...(this.#signedUploadPolicy !== undefined && {
+        signedUploadPolicy: { ...this.#signedUploadPolicy.signedUploadPolicy },
+      }),
       nativeUploadProgress: capabilities.uploadProgress,
     };
   }
@@ -430,6 +613,30 @@ export class FilesSdkStorageDriver<
     );
   }
 
+  promote(
+    sourceKey: string,
+    destinationKey: string,
+    options: StoragePromotionOptions,
+  ): Promise<void> {
+    const adapter = this.#conditionalCopy;
+    if (adapter === undefined || !adapter.conditionalCopy.supported) {
+      return Promise.reject(
+        new StorageError(
+          `Storage adapter "${this.#name}" does not support conditional promotion.`,
+          {
+            code: StorageErrorCode.NOT_SUPPORTED,
+            key: sourceKey,
+            operation: 'promote',
+            permanent: true,
+          },
+        ),
+      );
+    }
+    return this.#call(() =>
+      adapter.promote(sourceKey, destinationKey, options),
+    );
+  }
+
   async list(options?: StorageListOptions): Promise<StorageListResult> {
     return this.#call(async () => {
       const result = await this.#files.list(listOptions(options));
@@ -462,7 +669,7 @@ export class FilesSdkStorageDriver<
         yield metadataOf(file);
       }
     } catch (error) {
-      throw mapFilesError(error);
+      throw mapFilesSdkError(error);
     }
   }
 
@@ -488,7 +695,7 @@ export class FilesSdkStorageDriver<
     try {
       return await operation();
     } catch (error) {
-      throw mapFilesError(error);
+      throw mapFilesSdkError(error);
     }
   }
 }

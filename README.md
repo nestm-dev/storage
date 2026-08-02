@@ -25,7 +25,15 @@ consumers do not download NestJS.
 ## Install
 
 ```sh
-pnpm add @nestm/storage@alpha files-sdk@2.2.2
+pnpm add @nestm/storage@alpha
+```
+
+The package-owned S3 factory needs no direct `files-sdk` import. Install the
+pinned engine explicitly only when the application imports another adapter
+such as `files-sdk/gcs`:
+
+```sh
+pnpm add files-sdk@2.2.2
 ```
 
 Install only the native SDKs required by the chosen provider. For example:
@@ -82,14 +90,15 @@ runtime or declaration imports. Provider adapters remain available through
 
 ## Configure named stores
 
-Create provider adapters with `files-sdk`, wrap them through the explicit
-bridge, and register the resulting drivers:
+Use the package-owned S3 factory when applicable. For other providers, create a
+`files-sdk` adapter, wrap it through the explicit bridge, and register the
+resulting driver:
 
 ```ts
 import { Module } from '@nestjs/common';
-import { s3 } from 'files-sdk/s3';
 import { gcs } from 'files-sdk/gcs';
 import { createFilesSdkDriver } from '@nestm/storage/files-sdk';
+import { createS3StorageDriver } from '@nestm/storage/files-sdk/s3';
 import { StorageModule } from '@nestm/storage';
 
 export const StorageKey = {
@@ -104,11 +113,11 @@ export const StorageKey = {
       stores: [
         {
           name: StorageKey.MEDIA,
-          driver: createFilesSdkDriver({
-            adapter: s3({
+          driver: createS3StorageDriver({
+            adapter: {
               bucket: 'media',
               region: 'us-east-1',
-            }),
+            },
           }),
         },
         {
@@ -194,11 +203,11 @@ StorageModule.forRootAsync({
       name: 'media',
       inject: [ConfigService],
       useFactory: (config: ConfigService) =>
-        createFilesSdkDriver({
-          adapter: s3({
+        createS3StorageDriver({
+          adapter: {
             bucket: config.getOrThrow('MEDIA_BUCKET'),
             region: config.getOrThrow('AWS_REGION'),
-          }),
+          },
         }),
     },
   ],
@@ -221,6 +230,7 @@ whitespace.
 `StorageClient` exposes:
 
 - `upload`, `downloadStream`, `head`, `exists`, `delete`, `copy`, and `move`;
+- conditional staged-object `promote` when the driver advertises it;
 - `list`, cursor-aware `listAll`, and lazy `search`;
 - `signDownload` and discriminated PUT/POST `signUpload`;
 - `uploadMany`, `downloadMany`, `headMany`, `existsMany`, and `deleteMany`;
@@ -249,6 +259,37 @@ const manifest = await storage
 Node `Readable` uploads are accepted and converted to Web streams without
 buffering. Provider capability gaps fail closed with `StorageError` rather than
 silently discarding a range, metadata, or cache-control request.
+
+### Race-free staged-object promotion
+
+The S3 bridge advertises ETag- and version-conditional server-side copy. This
+lets an application validate a staged object and copy that exact source to its
+final key instead of re-reading whichever bytes occupy the staging key later:
+
+```ts
+import { StorageError, StorageErrorCode } from '@nestm/storage';
+
+const staged = await media.head(stagingKey);
+if (staged.etag === undefined) {
+  throw new StorageError('Provider did not return a source ETag.', {
+    code: StorageErrorCode.NOT_SUPPORTED,
+  });
+}
+
+// Validate size, declared MIME, and magic bytes before this call.
+await media.file(stagingKey).promoteTo(finalKey, {
+  sourceEtag: staged.etag,
+});
+
+// Commit ready metadata first. Promotion deliberately retains the staged
+// object so a failed database commit remains recoverable.
+await media.delete(stagingKey);
+```
+
+`sourceVersion` can select an immutable S3 version and may be combined with
+`sourceEtag`. A promotion without either identity is rejected. Drivers that do
+not publish `capabilities.conditionalCopy` fail with `NOT_SUPPORTED` rather
+than falling back to an unsafe ordinary copy.
 
 ### Resumable uploads
 
@@ -301,20 +342,42 @@ The gateway lives at `@nestm/storage/gateway` and is never mounted by
 `StorageModule`.
 
 ```ts
-import { Module } from '@nestjs/common';
+import { Injectable, Module } from '@nestjs/common';
 import {
   StorageGatewayModule,
   StorageGatewayOperation,
+  type StorageGatewayKeyPolicy,
 } from '@nestm/storage/gateway';
+
+@Injectable()
+class TenantStorageKeyPolicy implements StorageGatewayKeyPolicy {
+  resolve({ input, request, target }) {
+    const tenantId = tenantIdFromAuthenticatedRequest(request);
+    const root = `tenants/${base64url(tenantId)}`;
+    if (target === 'pattern') {
+      // Search is already constrained by the separately resolved prefix.
+      return input?.value ?? '*';
+    }
+    return `${root}/${input?.value ?? ''}`;
+  }
+}
+
+@Module({
+  providers: [TenantStorageKeyPolicy],
+  exports: [TenantStorageKeyPolicy],
+})
+class StoragePolicyModule {}
 
 @Module({
   imports: [
     AppStorageModule,
     AuthModule,
+    StoragePolicyModule,
     StorageGatewayModule.register({
-      imports: [AppStorageModule, AuthModule],
+      imports: [AppStorageModule, AuthModule, StoragePolicyModule],
       store: 'media',
       guards: [JwtAuthGuard],
+      keyPolicy: TenantStorageKeyPolicy,
       mode: 'hybrid',
       operations: [
         StorageGatewayOperation.DOWNLOAD,
@@ -325,6 +388,9 @@ import {
         StorageGatewayOperation.SIGN_UPLOAD,
       ],
       maxUploadBytes: 100 * 1024 * 1024,
+      maxSignedUploadBytes: 10 * 1024 * 1024,
+      signedUploadContentTypes: ['image/jpeg', 'image/png'],
+      maxSignedUrlExpiresIn: 900,
       maxListResults: 1000,
       maxSearchResults: 1000,
       proxyInlineContentTypes: ['image/jpeg', 'image/png'],
@@ -338,11 +404,38 @@ Registration fails without at least one existing Nest guard. The only bypass is
 the explicit `allowUnauthenticated: true` development escape hatch. Operations
 are deny-by-default and must be allowlisted individually.
 
+Registration also fails without a `keyPolicy`. Guards answer whether a request
+may reach the gateway; the key policy independently resolves every parsed
+`key`, `prefix`, search `pattern`, `from`, and `to` value to the exact provider
+path. It runs even when a list/search prefix was omitted, so the policy can
+always impose a tenant root. Key-policy providers may be request scoped.
+Returned paths are parsed again and reject absolute paths, backslashes, control
+characters, empty segments, and dot/parent segments.
+
+Existing single-tenant applications can temporarily set
+`unsafeAllowUnscopedKeys: true` instead of `keyPolicy`. The name is intentional:
+it preserves caller-controlled provider keys and must not be used on an exposed
+or multi-tenant gateway. It cannot be combined with `keyPolicy`.
+
 Proxy downloads default to `Content-Disposition: attachment` and always send
 `X-Content-Type-Options: nosniff`. Add only trusted, non-active MIME types to
 `proxyInlineContentTypes` when browser rendering is required. Search responses
 are capped by `maxSearchResults`, and list pages by `maxListResults` (both
 1,000 by default).
+
+Every signed URL is capped by `maxSignedUrlExpiresIn` (3,600 seconds by
+default). Signed uploads always carry a provider-enforced maximum size, capped
+by `maxSignedUploadBytes`, and require an exact lowercase MIME type from
+`signedUploadContentTypes`. The default direct-upload allowlist contains only
+`application/octet-stream`. Gateway callers may request only the literal
+`attachment` or `inline` response disposition; arbitrary response-header text
+and filenames are rejected. A driver must also advertise
+`signedUploadPolicy.contentType` and `signedUploadPolicy.sizeRange`; otherwise
+the gateway refuses to mint the URL. `createS3StorageDriver()` advertises both
+and uses S3 POST policy conditions. Signed downloads similarly require
+`signedDownloadPolicy.expiresIn`. The S3 factory advertises it only when no
+permanent `publicBaseUrl` was configured, preventing a configured TTL from
+silently returning a non-expiring public link.
 
 The fixed gateway prefix is `/storage`:
 
@@ -394,9 +487,14 @@ try {
 }
 ```
 
+`files-sdk` `NotFound` failures retain `StorageErrorCode.NOT_FOUND`, including
+when a provider adapter and this driver resolve separate copies of `files-sdk`.
+`isStorageError()` likewise recognizes branded and exact legacy structural
+errors produced by a duplicated `@nestm/storage` package copy.
+
 Capability flags cover range reads, native byte-level upload progress,
 delimiter listing, metadata, cache control, resumable uploads, server-side
-copy, and signed transfers.
+copy, conditional promotion, and signed transfers.
 Provider-specific native clients are intentionally not exposed from the root
 package.
 

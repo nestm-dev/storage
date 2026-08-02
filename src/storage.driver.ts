@@ -7,6 +7,7 @@ import type {
   StorageObject,
   StorageObjectMetadata,
   StorageOperationOptions,
+  StoragePromotionOptions,
   StorageSearchOptions,
   StorageSignedDownloadOptions,
   StorageSignedUpload,
@@ -43,6 +44,15 @@ export interface StorageDriver {
     sourceKey: string,
     destinationKey: string,
     options?: StorageOperationOptions,
+  ): Promise<void>;
+  /**
+   * Conditionally copies a staged object to its final key. The source remains
+   * in place so applications can delete it only after their metadata commit.
+   */
+  promote?(
+    sourceKey: string,
+    destinationKey: string,
+    options: StoragePromotionOptions,
   ): Promise<void>;
   list(options?: StorageListOptions): Promise<StorageListResult>;
   search(

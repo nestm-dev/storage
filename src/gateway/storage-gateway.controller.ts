@@ -21,7 +21,11 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 
-import { StorageError, StorageErrorCode } from '../storage.error.js';
+import {
+  StorageError,
+  StorageErrorCode,
+  isStorageError,
+} from '../storage.error.js';
 import { StorageService } from '../storage.service.js';
 import type {
   StorageByteRange,
@@ -32,10 +36,16 @@ import type {
 } from '../storage.types.js';
 import { StorageGatewayGuard } from './storage-gateway.guard.js';
 import { FASTIFY_STORAGE_UPLOAD_CONFIG } from './storage-gateway-fastify-parser.js';
-import { STORAGE_GATEWAY_OPTIONS } from './storage-gateway.tokens.js';
+import {
+  STORAGE_GATEWAY_KEY_POLICY,
+  STORAGE_GATEWAY_OPTIONS,
+} from './storage-gateway.tokens.js';
 import {
   StorageGatewayOperation,
+  type ParsedStorageGatewayKey,
   type ResolvedStorageGatewayOptions,
+  type StorageGatewayKeyPolicy,
+  type StorageGatewayKeyTarget,
   type StorageGatewayOperation as StorageGatewayOperationName,
 } from './storage-gateway.types.js';
 
@@ -52,6 +62,106 @@ interface RequestWrapper {
   raw?: unknown;
   body?: unknown;
   headers?: Record<string, string | string[] | undefined>;
+}
+
+const MAX_GATEWAY_PATH_LENGTH = 1024;
+
+function parseGatewayPath(
+  value: string | undefined,
+  target: StorageGatewayKeyTarget,
+): ParsedStorageGatewayKey | undefined {
+  if (value === undefined) {
+    if (target === 'prefix') {
+      return undefined;
+    }
+    throw new BadRequestException(`${target} is required.`);
+  }
+  if (value.length > MAX_GATEWAY_PATH_LENGTH) {
+    throw new BadRequestException(
+      `${target} cannot exceed ${MAX_GATEWAY_PATH_LENGTH} characters.`,
+    );
+  }
+  if (value.length === 0) {
+    if (target === 'prefix') {
+      return Object.freeze({
+        segments: Object.freeze([]),
+        trailingSlash: false,
+        value,
+      });
+    }
+    throw new BadRequestException(`${target} must be a non-empty string.`);
+  }
+  if (
+    [...value].some((character) => {
+      const codePoint = character.codePointAt(0);
+      return (
+        character === '\\' ||
+        codePoint === undefined ||
+        codePoint <= 0x1f ||
+        codePoint === 0x7f
+      );
+    })
+  ) {
+    throw new BadRequestException(
+      `${target} cannot contain control characters or backslashes.`,
+    );
+  }
+  if (target === 'pattern') {
+    return Object.freeze({
+      segments: Object.freeze(value.split('/')),
+      trailingSlash: value.endsWith('/'),
+      value,
+    });
+  }
+  if (value.startsWith('/') || value.trim() !== value) {
+    throw new BadRequestException(
+      `${target} must be a relative object path without surrounding whitespace.`,
+    );
+  }
+  const trailingSlash = value.endsWith('/');
+  const segments = value.split('/');
+  if (trailingSlash) {
+    segments.pop();
+  }
+  if (
+    segments.some(
+      (segment) => segment.length === 0 || segment === '.' || segment === '..',
+    )
+  ) {
+    throw new BadRequestException(
+      `${target} cannot contain empty, dot, or parent path segments.`,
+    );
+  }
+  return Object.freeze({
+    segments: Object.freeze(segments),
+    trailingSlash,
+    value,
+  });
+}
+
+function exactContentType(value: string, field: string): string {
+  const normalized = value.toLowerCase();
+  if (
+    value !== normalized ||
+    !/^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u.test(value)
+  ) {
+    throw new BadRequestException(
+      `${field} must be a lowercase exact MIME type without parameters.`,
+    );
+  }
+  return normalized;
+}
+
+function safeContentDisposition(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value !== 'attachment' && value !== 'inline') {
+    throw new BadRequestException(
+      'responseContentDisposition must be either "attachment" or "inline".',
+    );
+  }
+  return value;
 }
 
 function recordOf(value: unknown, label: string): Record<string, unknown> {
@@ -273,7 +383,7 @@ function toHttpException(error: unknown): HttpException {
   if (error instanceof HttpException) {
     return error;
   }
-  if (error instanceof StorageError) {
+  if (isStorageError(error)) {
     return new HttpException(
       {
         error: {
@@ -304,6 +414,8 @@ export class StorageGatewayController {
     private readonly storage: StorageService,
     @Inject(STORAGE_GATEWAY_OPTIONS)
     private readonly options: ResolvedStorageGatewayOptions,
+    @Inject(STORAGE_GATEWAY_KEY_POLICY)
+    private readonly keyPolicy: StorageGatewayKeyPolicy,
   ) {}
 
   @Get('object')
@@ -313,23 +425,31 @@ export class StorageGatewayController {
     @Query('rangeStart') rangeStart: string | undefined,
     @Query('rangeEnd') rangeEnd: string | undefined,
     @Query('disposition') disposition: string | undefined,
+    @Req() request: unknown,
     @Res() response: unknown,
   ): Promise<void> {
     await this.#run(async () => {
       this.#assertAllowed(StorageGatewayOperation.DOWNLOAD);
-      const objectKey = this.#key(key);
+      const responseContentDisposition = safeContentDisposition(disposition);
       const client = this.storage.use(this.options.store);
       const forceProxy = proxy === 'true' || proxy === '1';
       const canSign =
         this.options.operations.has(StorageGatewayOperation.SIGN_DOWNLOAD) &&
-        client.capabilities.signedDownload.supported;
+        client.capabilities.signedDownload.supported &&
+        client.capabilities.signedDownloadPolicy?.expiresIn === true;
 
       if (!forceProxy && this.options.mode !== 'proxy' && canSign) {
         try {
-          const url = await client.signDownload(objectKey, {
+          const signedObjectKey = await this.#resolvePath(
+            request,
+            StorageGatewayOperation.SIGN_DOWNLOAD,
+            'key',
+            key,
+          );
+          const url = await client.signDownload(signedObjectKey, {
             expiresIn: this.options.defaultSignedUrlExpiresIn,
-            ...(disposition !== undefined && {
-              responseContentDisposition: disposition,
+            ...(responseContentDisposition !== undefined && {
+              responseContentDisposition,
             }),
           });
           const raw = rawResponseOf(response);
@@ -340,7 +460,7 @@ export class StorageGatewayController {
         } catch (error) {
           if (
             this.options.mode !== 'hybrid' ||
-            !(error instanceof StorageError) ||
+            !isStorageError(error) ||
             error.code !== StorageErrorCode.NOT_SUPPORTED
           ) {
             throw error;
@@ -353,11 +473,17 @@ export class StorageGatewayController {
           'Signed downloads are unavailable for this store.',
           {
             code: StorageErrorCode.NOT_SUPPORTED,
-            key: objectKey,
             permanent: true,
           },
         );
       }
+
+      const objectKey = await this.#resolvePath(
+        request,
+        StorageGatewayOperation.DOWNLOAD,
+        'key',
+        key,
+      );
 
       const start = queryInteger(rangeStart, 'rangeStart');
       const end = queryInteger(rangeEnd, 'rangeEnd');
@@ -435,7 +561,12 @@ export class StorageGatewayController {
           },
         );
       }
-      const objectKey = this.#key(key);
+      const objectKey = await this.#resolvePath(
+        request,
+        StorageGatewayOperation.UPLOAD,
+        'key',
+        key,
+      );
       const transportContentType = requestHeader(request, 'content-type')
         ?.split(';', 1)[0]
         ?.trim()
@@ -467,9 +598,11 @@ export class StorageGatewayController {
       const body = Readable.toWeb(
         Readable.from(enforceUploadLimit(source, this.options.maxUploadBytes)),
       ) as ReadableStream<Uint8Array>;
-      const contentType =
+      const contentType = exactContentType(
         requestHeader(request, 'x-storage-content-type') ??
-        'application/octet-stream';
+          'application/octet-stream',
+        'x-storage-content-type',
+      );
       const result = await this.storage
         .use(this.options.store)
         .upload(objectKey, body, { contentType, multipart: true });
@@ -480,13 +613,20 @@ export class StorageGatewayController {
   @Head('metadata')
   async head(
     @Query('key') key: string | undefined,
+    @Req() request: unknown,
     @Res() response: unknown,
   ): Promise<void> {
     await this.#run(async () => {
       this.#assertAllowed(StorageGatewayOperation.HEAD);
+      const objectKey = await this.#resolvePath(
+        request,
+        StorageGatewayOperation.HEAD,
+        'key',
+        key,
+      );
       const metadata = await this.storage
         .use(this.options.store)
-        .head(this.#key(key));
+        .head(objectKey);
       const raw = rawResponseOf(response);
       raw.statusCode = HttpStatus.OK;
       setObjectHeaders(raw, metadata);
@@ -497,10 +637,17 @@ export class StorageGatewayController {
   @Delete('object')
   async delete(
     @Query('key') key: string | undefined,
+    @Req() request: unknown,
   ): Promise<ResponseEnvelope<{ deleted: true }>> {
     return this.#run(async () => {
       this.#assertAllowed(StorageGatewayOperation.DELETE);
-      await this.storage.use(this.options.store).delete(this.#key(key));
+      const objectKey = await this.#resolvePath(
+        request,
+        StorageGatewayOperation.DELETE,
+        'key',
+        key,
+      );
+      await this.storage.use(this.options.store).delete(objectKey);
       return { data: { deleted: true } };
     });
   }
@@ -511,6 +658,7 @@ export class StorageGatewayController {
     @Query('cursor') cursor: string | undefined,
     @Query('limit') limit: string | undefined,
     @Query('delimiter') delimiter: string | undefined,
+    @Req() request: unknown,
   ): Promise<ResponseEnvelope<unknown>> {
     return this.#run(async () => {
       this.#assertAllowed(StorageGatewayOperation.LIST);
@@ -521,11 +669,17 @@ export class StorageGatewayController {
           `limit must be between 1 and ${this.options.maxListResults}.`,
         );
       }
+      const resolvedPrefix = await this.#resolvePath(
+        request,
+        StorageGatewayOperation.LIST,
+        'prefix',
+        prefix,
+      );
       const result = await this.storage.use(this.options.store).list({
         ...(cursor !== undefined && { cursor }),
         ...(delimiter !== undefined && { delimiter }),
         limit: parsedLimit,
-        ...(prefix !== undefined && { prefix }),
+        prefix: resolvedPrefix,
       });
       return { data: result };
     });
@@ -539,10 +693,22 @@ export class StorageGatewayController {
     @Query('maxResults') maxResults: string | undefined,
     @Query('match') match: string | undefined,
     @Query('caseInsensitive') caseInsensitive: string | undefined,
+    @Req() request: unknown,
   ): Promise<ResponseEnvelope<unknown>> {
     return this.#run(async () => {
       this.#assertAllowed(StorageGatewayOperation.SEARCH);
-      const searchPattern = this.#key(pattern, 'pattern');
+      const searchPattern = await this.#resolvePath(
+        request,
+        StorageGatewayOperation.SEARCH,
+        'pattern',
+        pattern,
+      );
+      const resolvedPrefix = await this.#resolvePath(
+        request,
+        StorageGatewayOperation.SEARCH,
+        'prefix',
+        prefix,
+      );
       if (
         match !== undefined &&
         !['glob', 'regex', 'substring', 'exact'].includes(match)
@@ -582,7 +748,7 @@ export class StorageGatewayController {
             match: match as 'glob' | 'regex' | 'substring' | 'exact',
           }),
           maxResults: parsedMaxResults,
-          ...(prefix !== undefined && { prefix }),
+          prefix: resolvedPrefix,
         })) {
         objects.push(object);
         if (objects.length === parsedMaxResults) {
@@ -596,6 +762,7 @@ export class StorageGatewayController {
   @Post('sign-download')
   async signDownload(
     @Body() body: unknown,
+    @Req() request: unknown,
   ): Promise<ResponseEnvelope<{ url: string }>> {
     return this.#run(async () => {
       this.#assertAllowed(StorageGatewayOperation.SIGN_DOWNLOAD);
@@ -609,27 +776,43 @@ export class StorageGatewayController {
         );
       }
       const input = recordOf(body, 'body');
-      const responseContentDisposition = optionalString(
-        input,
-        'responseContentDisposition',
+      const responseContentDisposition = safeContentDisposition(
+        optionalString(input, 'responseContentDisposition'),
       );
       const options: StorageSignedDownloadOptions = {
-        expiresIn:
-          optionalPositiveInteger(input, 'expiresIn') ??
-          this.options.defaultSignedUrlExpiresIn,
+        expiresIn: this.#signedExpiry(input),
         ...(responseContentDisposition !== undefined && {
           responseContentDisposition,
         }),
       };
-      const url = await this.storage
-        .use(this.options.store)
-        .signDownload(requiredString(input, 'key'), options);
+      const objectKey = await this.#resolvePath(
+        request,
+        StorageGatewayOperation.SIGN_DOWNLOAD,
+        'key',
+        requiredString(input, 'key'),
+      );
+      const client = this.storage.use(this.options.store);
+      if (client.capabilities.signedDownloadPolicy?.expiresIn !== true) {
+        throw new StorageError(
+          'This store cannot prove that signed-download expiry is provider-enforced.',
+          {
+            code: StorageErrorCode.NOT_SUPPORTED,
+            key: objectKey,
+            operation: 'signDownload',
+            permanent: true,
+          },
+        );
+      }
+      const url = await client.signDownload(objectKey, options);
       return { data: { url } };
     });
   }
 
   @Post('sign-upload')
-  async signUpload(@Body() body: unknown): Promise<ResponseEnvelope<unknown>> {
+  async signUpload(
+    @Body() body: unknown,
+    @Req() request: unknown,
+  ): Promise<ResponseEnvelope<unknown>> {
     return this.#run(async () => {
       this.#assertAllowed(StorageGatewayOperation.SIGN_UPLOAD);
       if (this.options.mode === 'proxy') {
@@ -642,8 +825,32 @@ export class StorageGatewayController {
         );
       }
       const input = recordOf(body, 'body');
-      const contentType = optionalString(input, 'contentType');
-      const maxSize = optionalPositiveInteger(input, 'maxSize');
+      const rawContentType = optionalString(input, 'contentType');
+      if (rawContentType === undefined) {
+        throw new BadRequestException(
+          'contentType is required for signed uploads.',
+        );
+      }
+      const contentType = exactContentType(rawContentType, 'contentType');
+      if (!this.options.signedUploadContentTypes.has(contentType)) {
+        throw new BadRequestException(
+          `contentType "${contentType}" is not allowed for signed uploads.`,
+        );
+      }
+      const requestedMaxSize = optionalPositiveInteger(input, 'maxSize');
+      if (
+        requestedMaxSize !== undefined &&
+        requestedMaxSize > this.options.maxSignedUploadBytes
+      ) {
+        throw new StorageError(
+          `Signed upload exceeds the ${this.options.maxSignedUploadBytes}-byte gateway limit.`,
+          {
+            code: StorageErrorCode.LIMIT_EXCEEDED,
+            permanent: true,
+          },
+        );
+      }
+      const maxSize = requestedMaxSize ?? this.options.maxSignedUploadBytes;
       const minSize = optionalNonNegativeInteger(input, 'minSize');
       if (maxSize !== undefined && minSize !== undefined && minSize > maxSize) {
         throw new BadRequestException(
@@ -651,16 +858,34 @@ export class StorageGatewayController {
         );
       }
       const options: StorageSignedUploadOptions = {
-        expiresIn:
-          optionalPositiveInteger(input, 'expiresIn') ??
-          this.options.defaultSignedUrlExpiresIn,
-        ...(contentType !== undefined && { contentType }),
-        ...(maxSize !== undefined && { maxSize }),
+        contentType,
+        expiresIn: this.#signedExpiry(input),
+        maxSize,
         ...(minSize !== undefined && { minSize }),
       };
-      const result = await this.storage
-        .use(this.options.store)
-        .signUpload(requiredString(input, 'key'), options);
+      const objectKey = await this.#resolvePath(
+        request,
+        StorageGatewayOperation.SIGN_UPLOAD,
+        'key',
+        requiredString(input, 'key'),
+      );
+      const client = this.storage.use(this.options.store);
+      const policyCapability = client.capabilities.signedUploadPolicy;
+      if (
+        policyCapability?.contentType !== true ||
+        policyCapability.sizeRange !== true
+      ) {
+        throw new StorageError(
+          'This store cannot prove that signed-upload MIME and size constraints are provider-enforced.',
+          {
+            code: StorageErrorCode.NOT_SUPPORTED,
+            key: objectKey,
+            operation: 'signUpload',
+            permanent: true,
+          },
+        );
+      }
+      const result = await client.signUpload(objectKey, options);
       return { data: result };
     });
   }
@@ -668,13 +893,26 @@ export class StorageGatewayController {
   @Post('copy')
   async copy(
     @Body() body: unknown,
+    @Req() request: unknown,
   ): Promise<ResponseEnvelope<{ copied: true }>> {
     return this.#run(async () => {
       this.#assertAllowed(StorageGatewayOperation.COPY);
       const input = recordOf(body, 'body');
-      await this.storage
-        .use(this.options.store)
-        .copy(requiredString(input, 'from'), requiredString(input, 'to'));
+      const [from, to] = await Promise.all([
+        this.#resolvePath(
+          request,
+          StorageGatewayOperation.COPY,
+          'from',
+          requiredString(input, 'from'),
+        ),
+        this.#resolvePath(
+          request,
+          StorageGatewayOperation.COPY,
+          'to',
+          requiredString(input, 'to'),
+        ),
+      ]);
+      await this.storage.use(this.options.store).copy(from, to);
       return { data: { copied: true } };
     });
   }
@@ -682,13 +920,26 @@ export class StorageGatewayController {
   @Post('move')
   async move(
     @Body() body: unknown,
+    @Req() request: unknown,
   ): Promise<ResponseEnvelope<{ moved: true }>> {
     return this.#run(async () => {
       this.#assertAllowed(StorageGatewayOperation.MOVE);
       const input = recordOf(body, 'body');
-      await this.storage
-        .use(this.options.store)
-        .move(requiredString(input, 'from'), requiredString(input, 'to'));
+      const [from, to] = await Promise.all([
+        this.#resolvePath(
+          request,
+          StorageGatewayOperation.MOVE,
+          'from',
+          requiredString(input, 'from'),
+        ),
+        this.#resolvePath(
+          request,
+          StorageGatewayOperation.MOVE,
+          'to',
+          requiredString(input, 'to'),
+        ),
+      ]);
+      await this.storage.use(this.options.store).move(from, to);
       return { data: { moved: true } };
     });
   }
@@ -707,11 +958,43 @@ export class StorageGatewayController {
     }
   }
 
-  #key(value: string | undefined, label = 'key'): string {
-    if (value === undefined || value.length === 0) {
-      throw new BadRequestException(`${label} is required.`);
+  async #resolvePath(
+    request: unknown,
+    operation: StorageGatewayOperationName,
+    target: StorageGatewayKeyTarget,
+    value: string | undefined,
+  ): Promise<string> {
+    const input = parseGatewayPath(value, target);
+    const resolved = await this.keyPolicy.resolve({
+      input,
+      operation,
+      request,
+      target,
+    });
+    const parsed = parseGatewayPath(resolved, target);
+    if (parsed === undefined) {
+      throw new StorageError(
+        `Storage gateway key policy did not resolve ${target}.`,
+        {
+          code: StorageErrorCode.UNAUTHORIZED,
+          operation,
+          permanent: true,
+        },
+      );
     }
-    return value;
+    return parsed.value;
+  }
+
+  #signedExpiry(input: Record<string, unknown>): number {
+    const expiresIn =
+      optionalPositiveInteger(input, 'expiresIn') ??
+      this.options.defaultSignedUrlExpiresIn;
+    if (expiresIn > this.options.maxSignedUrlExpiresIn) {
+      throw new BadRequestException(
+        `expiresIn cannot exceed ${this.options.maxSignedUrlExpiresIn} seconds.`,
+      );
+    }
+    return expiresIn;
   }
 
   async #run<Result>(operation: () => Promise<Result>): Promise<Result> {
