@@ -1,5 +1,20 @@
 # @nestm/storage
 
+## 0.1.0-alpha.3
+
+### Minor Changes
+
+- b947634: Harden storage integration boundaries with cross-copy-safe `StorageError`
+  detection, a package-owned S3 driver factory, conditional staged-object
+  promotion, and a mandatory parsed key policy plus signed-transfer limits for
+  the optional HTTP gateway.
+
+### Patch Changes
+
+- b947634: Map structurally branded `files-sdk` errors, including errors wrapped across
+  duplicate package copies, so missing objects retain the `NOT_FOUND` storage
+  error code.
+
 ## 0.1.0-alpha.2
 
 ### Minor Changes
