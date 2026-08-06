@@ -33,7 +33,7 @@ pinned engine explicitly only when the application imports another adapter
 such as `files-sdk/gcs`:
 
 ```sh
-pnpm add files-sdk@2.2.2
+pnpm add files-sdk@2.2.3
 ```
 
 Install only the native SDKs required by the chosen provider. For example:
