@@ -24,7 +24,7 @@ export interface S3StorageDriverOptions extends Omit<
   adapter: S3AdapterOptions;
 }
 
-type EnhancedS3Adapter = S3Adapter &
+export type S3StorageAdapter = S3Adapter &
   FilesSdkConditionalCopyAdapter &
   FilesSdkSignedDownloadPolicyAdapter &
   FilesSdkSignedUploadPolicyAdapter;
@@ -89,15 +89,20 @@ async function waitForRetry(
 }
 
 /**
- * Creates the files-sdk S3 driver from the storage package's own dependency
- * context and adds an ETag/version-conditional server-side promotion.
+ * Adds the S3-only capabilities to an adapter already built by `s3(...)`: an
+ * ETag/version-conditional server-side promotion, and the signed upload and
+ * download policies the bridge advertises through `capabilities`.
+ *
+ * Exported so the provider factory can apply them to the adapter `loadFiles`
+ * resolved for the `s3` slug instead of re-deriving {@link S3AdapterOptions}
+ * from flat provider config. It expects an adapter whose `raw` is an `S3Client`
+ * — pass one built by `s3(...)`, not an S3-compatible wrapper.
  */
-export function createS3StorageDriver(
-  options: S3StorageDriverOptions,
-): FilesSdkStorageDriver<EnhancedS3Adapter> {
-  const { adapter: adapterOptions, ...filesOptions } = options;
-  const base = s3(adapterOptions);
-  const adapter: EnhancedS3Adapter = Object.assign(base, {
+export function withS3Capabilities(
+  base: S3Adapter,
+  options: Pick<S3AdapterOptions, 'publicBaseUrl'> = {},
+): S3StorageAdapter {
+  return Object.assign(base, {
     conditionalCopy: Object.freeze({
       etag: true,
       supported: true,
@@ -108,7 +113,7 @@ export function createS3StorageDriver(
       sizeRange: true,
     }),
     signedDownloadPolicy: Object.freeze({
-      expiresIn: adapterOptions.publicBaseUrl === undefined,
+      expiresIn: options.publicBaseUrl === undefined,
     }),
     async promote(
       sourceKey: string,
@@ -162,10 +167,19 @@ export function createS3StorageDriver(
   } satisfies FilesSdkConditionalCopyAdapter &
     FilesSdkSignedDownloadPolicyAdapter &
     FilesSdkSignedUploadPolicyAdapter);
+}
 
+/**
+ * Creates the files-sdk S3 driver from the storage package's own dependency
+ * context and adds an ETag/version-conditional server-side promotion.
+ */
+export function createS3StorageDriver(
+  options: S3StorageDriverOptions,
+): FilesSdkStorageDriver<S3StorageAdapter> {
+  const { adapter: adapterOptions, ...filesOptions } = options;
   return createFilesSdkDriver({
     ...filesOptions,
-    adapter,
+    adapter: withS3Capabilities(s3(adapterOptions), adapterOptions),
   });
 }
 

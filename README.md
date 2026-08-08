@@ -225,6 +225,71 @@ modules retain their own DI scope rather than mutating an application-wide
 registry. Names are case-sensitive and cannot contain leading or trailing
 whitespace.
 
+### Select the provider at runtime
+
+An application that ships to more than one environment usually cannot name its
+provider at build time. `createProviderStorageDriver` takes the slug as data and
+imports that provider's adapter — and only that one — on demand, so a deployment
+picks its store with an environment variable and installs one native SDK:
+
+```ts
+import { createProviderStorageDriver } from '@nestm/storage/files-sdk/provider';
+
+StorageModule.forRootAsync({
+  imports: [ConfigModule],
+  stores: [
+    {
+      name: 'media',
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) =>
+        createProviderStorageDriver({
+          provider: config.getOrThrow('STORAGE_PROVIDER'),
+          prefix: config.get('STORAGE_PREFIX'),
+          config: {
+            bucket: config.get('STORAGE_BUCKET'),
+            region: config.get('STORAGE_REGION'),
+            root: config.get('STORAGE_ROOT'),
+          },
+        }),
+    },
+  ],
+});
+```
+
+`config` is one flat bag of provider settings — `bucket` and `region` for an
+object store, `root` for the filesystem, `accountName` and `container` for
+Azure. Each provider reads what it needs and ignores the rest, so the same shape
+survives a provider change. Credentials may be omitted wherever the provider's
+SDK resolves its own chain (an IAM role, Application Default Credentials, a
+shared profile).
+
+An unknown slug fails closed with `INVALID_ARGUMENT` before anything is
+imported. Validate untrusted input up front with `isStorageProvider`, and drive
+config validation from the catalog rather than a hand-kept list:
+
+```ts
+import {
+  getStorageProvider,
+  isStorageProvider,
+  listStorageProviders,
+  listStorageProviderSecretEnvVars,
+} from '@nestm/storage/files-sdk/provider';
+
+listStorageProviders().map((provider) => provider.slug); // 'akamai', 'alibaba', …
+getStorageProvider('gcs')?.peerDeps; // ['@google-cloud/storage', …]
+listStorageProviderSecretEnvVars('s3').map((variable) => variable.key);
+```
+
+The catalog is pure data and pulls in no adapter, so it is safe in config UIs,
+health checks, and startup validation.
+
+The `s3` slug additionally carries the conditional-promotion and signed-policy
+capabilities described under
+[Race-free staged-object promotion](#race-free-staged-object-promotion); every
+other provider exposes exactly what its adapter declares. When the provider _is_
+known at build time, import `@nestm/storage/files-sdk/s3` or
+`@nestm/storage/files-sdk/fs` directly and skip the indirection.
+
 ## Storage API
 
 `StorageClient` exposes:
@@ -510,8 +575,26 @@ StorageModule.forRoot({
 });
 ```
 
-For local filesystem storage, import `fs` from `files-sdk/fs` and pass it to
-`createFilesSdkDriver` exactly like a cloud adapter.
+For local filesystem storage, use the package-owned factory. The adapter reaches
+only `node:fs`, so it needs no native SDK:
+
+```ts
+import { createFsStorageDriver } from '@nestm/storage/files-sdk/fs';
+
+StorageModule.forRoot({
+  stores: [
+    {
+      name: 'artifacts',
+      driver: createFsStorageDriver({ adapter: { root: './var/artifacts' } }),
+    },
+  ],
+});
+```
+
+Bodies are written verbatim at `<root>/<key>`. A `<key>.meta.json` sidecar beside
+each one carries the content type, ETag, and custom metadata a filesystem has
+nowhere else to put; sidecars never surface as keys, and uploading a key ending
+in `.meta.json` fails closed rather than colliding with one.
 
 ## License
 
