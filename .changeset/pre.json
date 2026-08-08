@@ -8,6 +8,7 @@
     "framework-neutral-core",
     "harden-storage-boundaries",
     "initial-storage-release",
-    "map-foreign-files-not-found"
+    "map-foreign-files-not-found",
+    "runtime-provider-selection"
   ]
 }
