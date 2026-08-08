@@ -27,6 +27,14 @@
       "types": "./dist/files-sdk/index.d.ts",
       "import": "./dist/files-sdk/index.js"
     },
+    "./files-sdk/fs": {
+      "types": "./dist/files-sdk/fs/index.d.ts",
+      "import": "./dist/files-sdk/fs/index.js"
+    },
+    "./files-sdk/provider": {
+      "types": "./dist/files-sdk/provider/index.d.ts",
+      "import": "./dist/files-sdk/provider/index.js"
+    },
     "./files-sdk/s3": {
       "types": "./dist/files-sdk/s3/index.d.ts",
       "import": "./dist/files-sdk/s3/index.js"
