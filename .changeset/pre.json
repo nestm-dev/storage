@@ -5,6 +5,7 @@
     "@nestm/storage": "0.1.0-alpha.0"
   },
   "changesets": [
+    "add-agent-workspaces",
     "add-artifact-storage",
     "framework-neutral-core",
     "harden-storage-boundaries",
