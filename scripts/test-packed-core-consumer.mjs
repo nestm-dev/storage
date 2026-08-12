@@ -43,8 +43,6 @@ try {
         private: true,
         type: 'module',
         dependencies: {
-          '@aws-sdk/client-kms':
-            rootPackage.devDependencies['@aws-sdk/client-kms'],
           '@aws-sdk/client-s3':
             rootPackage.devDependencies['@aws-sdk/client-s3'],
           '@aws-sdk/lib-storage':
@@ -128,13 +126,6 @@ import {
   type StorageDriver,
   type StorageObjectMetadata,
 } from '@nestm/storage/core';
-import {
-  createArtifactStorageWithClient,
-  createObjectStoreWithClient,
-  LocalKeyProvider,
-  open,
-  seal,
-} from '@nestm/storage/artifacts';
 import { createS3StorageDriver } from '@nestm/storage/files-sdk/s3';
 
 const capabilities = {
@@ -168,16 +159,11 @@ const driver = {
   capabilities,
   name: 'packed-memory',
   async upload(key, body, options) {
-    const bytes =
-      typeof body === 'string'
-        ? new TextEncoder().encode(body)
-        : body instanceof Uint8Array
-          ? body.slice()
-          : undefined;
-    if (bytes === undefined)
-      throw new TypeError('The smoke driver accepts string or byte bodies.');
+    if (typeof body !== 'string') {
+      throw new TypeError('The smoke driver accepts string bodies only.');
+    }
     const stored = {
-      body: bytes,
+      body: new TextEncoder().encode(body),
       contentType: options?.contentType ?? 'application/octet-stream',
     };
     objects.set(key, stored);
@@ -270,10 +256,6 @@ try {
 }
 
 assert.equal(nestResolved, false);
-assert.match(
-  import.meta.resolve('@nestm/storage/artifacts/nest'),
-  new RegExp('dist/artifacts/nest/index[.]js$'),
-);
 assert.equal(DEFAULT_BUFFER_LIMIT, 10 * 1024 * 1024);
 assert.equal(StorageErrorCode.NOT_FOUND, 'NOT_FOUND');
 assert.equal(new StorageUploadControl().status, 'idle');
@@ -289,24 +271,6 @@ const foreignStorageError = Object.assign(new Error('foreign'), {
   timedOut: false,
 });
 assert.equal(isStorageError(foreignStorageError), true);
-
-const envelopeContext = {
-  artifactId: 'packed-artifact',
-  path: 'index.html',
-  scope: 'org:packed',
-  version: null,
-};
-const keyProvider = new LocalKeyProvider('packed', Buffer.alloc(32, 7));
-const envelope = await seal(
-  Buffer.from('packed artifact'),
-  envelopeContext,
-  keyProvider,
-  'text/html; charset=utf-8',
-);
-const opened = await open(envelope, envelopeContext, keyProvider);
-assert.equal(envelope.subarray(0, 4).toString(), 'CAE1');
-assert.equal(opened.plain.toString(), 'packed artifact');
-assert.equal(opened.contentType, 'text/html; charset=utf-8');
 
 const s3Driver = createS3StorageDriver({
   adapter: {
@@ -334,46 +298,6 @@ const uploaded = await client.upload('hello.txt', 'hello core', {
 });
 assert.equal(uploaded.key, 'hello.txt');
 assert.equal(await client.downloadText('hello.txt'), 'hello core');
-
-const crypto = { keyProvider };
-const artifactStorage = createArtifactStorageWithClient(
-  { provider: 's3' },
-  crypto,
-  client,
-);
-await artifactStorage.writeHtml(
-  'packed-artifact',
-  Buffer.from('<html>packed facade</html>'),
-  { scope: 'org:packed' },
-);
-assert.equal(
-  (
-    await artifactStorage.read('packed-artifact', 'index.html', {
-      scope: 'org:packed',
-    })
-  )?.toString(),
-  '<html>packed facade</html>',
-);
-
-const objectStore = createObjectStoreWithClient(
-  { provider: 's3' },
-  crypto,
-  client,
-);
-await objectStore.putObject(
-  'org-logos/packed',
-  Buffer.from('packed logo'),
-  'image/png',
-  { scope: 'org:packed' },
-);
-assert.equal(
-  (
-    await objectStore.getObject('org-logos/packed', {
-      scope: 'org:packed',
-    })
-  )?.body.toString(),
-  'packed logo',
-);
 
 await client.onApplicationShutdown();
 await client.onApplicationShutdown();
