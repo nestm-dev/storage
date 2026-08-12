@@ -89,4 +89,37 @@ describe('FilesSdkStorageDriver', () => {
       message: 'late provider failure',
     });
   });
+
+  it('rejects a conditional adapter result from the wrong physical key', async () => {
+    const adapter = Object.assign(memory(), {
+      conditionalMutation: {
+        create: true,
+        delete: true,
+        etag: true,
+        replace: true,
+      },
+      deleteConditional: vi.fn(async () => undefined),
+      uploadConditional: vi.fn(async () => ({
+        contentType: 'text/plain',
+        etag: 'etag',
+        key: 'scope/other.txt',
+        size: 4,
+      })),
+    });
+    const driver = createFilesSdkDriver({ adapter, prefix: 'scope' });
+
+    await expect(
+      driver.uploadConditional('requested.txt', 'body', {
+        condition: { type: 'create' },
+      }),
+    ).rejects.toMatchObject({
+      code: StorageErrorCode.PROVIDER,
+      key: 'requested.txt',
+    });
+    expect(adapter.uploadConditional).toHaveBeenCalledWith(
+      'scope/requested.txt',
+      'body',
+      { condition: { type: 'create' } },
+    );
+  });
 });

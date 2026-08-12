@@ -26,6 +26,9 @@ import {
 import type { StorageDriver } from '../storage.driver.js';
 import type {
   StorageBody,
+  StorageConditionalDeleteOptions,
+  StorageConditionalMutationCapability,
+  StorageConditionalUploadOptions,
   StorageDownloadOptions,
   StorageListOptions,
   StorageListResult,
@@ -62,6 +65,20 @@ export interface FilesSdkConditionalCopyAdapter {
   ): Promise<void>;
 }
 
+/** Optional adapter extension for native compare-and-set mutations. */
+export interface FilesSdkConditionalMutationAdapter {
+  readonly conditionalMutation: StorageConditionalMutationCapability;
+  uploadConditional(
+    key: string,
+    body: Body,
+    options: StorageConditionalUploadOptions,
+  ): Promise<StorageUploadResult>;
+  deleteConditional(
+    key: string,
+    options: StorageConditionalDeleteOptions,
+  ): Promise<void>;
+}
+
 export interface FilesSdkSignedUploadPolicyAdapter {
   readonly signedUploadPolicy: StorageSignedUploadPolicyCapability;
 }
@@ -94,6 +111,35 @@ function conditionalCopyAdapterOf(
     return undefined;
   }
   return candidate as Adapter & FilesSdkConditionalCopyAdapter;
+}
+
+function conditionalMutationAdapterOf(
+  adapter: Adapter,
+): FilesSdkConditionalMutationAdapter | undefined {
+  if (
+    typeof adapter !== 'object' ||
+    adapter === null ||
+    !('conditionalMutation' in adapter) ||
+    !('uploadConditional' in adapter) ||
+    !('deleteConditional' in adapter)
+  ) {
+    return undefined;
+  }
+  const candidate = adapter as Adapter &
+    Partial<FilesSdkConditionalMutationAdapter>;
+  const capability = candidate.conditionalMutation;
+  if (
+    capability === undefined ||
+    typeof capability.create !== 'boolean' ||
+    typeof capability.replace !== 'boolean' ||
+    typeof capability.delete !== 'boolean' ||
+    typeof capability.etag !== 'boolean' ||
+    typeof candidate.uploadConditional !== 'function' ||
+    typeof candidate.deleteConditional !== 'function'
+  ) {
+    return undefined;
+  }
+  return candidate as Adapter & FilesSdkConditionalMutationAdapter;
 }
 
 function signedUploadPolicyAdapterOf(
@@ -276,6 +322,41 @@ function mapRetryOptions(
         retries.backoff?.({
           attempt,
           error: mapFilesSdkError(error),
+        }) ?? 0,
+    }),
+  };
+}
+
+function storageRetryOptions(
+  retries: RetryOptions | undefined,
+): StorageRetryOptions | undefined {
+  if (retries === undefined || typeof retries === 'number') {
+    return retries;
+  }
+  return {
+    max: retries.max,
+    ...(retries.backoff !== undefined && {
+      backoff: ({ attempt, error }) =>
+        retries.backoff?.({
+          attempt,
+          error: new FilesError(
+            error.code === StorageErrorCode.NOT_FOUND
+              ? 'NotFound'
+              : error.code === StorageErrorCode.UNAUTHORIZED
+                ? 'Unauthorized'
+                : error.code === StorageErrorCode.CONFLICT
+                  ? 'Conflict'
+                  : error.code === StorageErrorCode.READ_ONLY
+                    ? 'ReadOnly'
+                    : 'Provider',
+            error.message,
+            error,
+            {
+              aborted: error.aborted,
+              permanent: error.permanent,
+              timedOut: error.timedOut,
+            },
+          ),
         }) ?? 0,
     }),
   };
@@ -507,6 +588,12 @@ export class FilesSdkStorageDriver<
   readonly #files: Files<AdapterType>;
   readonly #name: string;
   readonly #conditionalCopy: FilesSdkConditionalCopyAdapter | undefined;
+  readonly #conditionalMutation: FilesSdkConditionalMutationAdapter | undefined;
+  readonly #prefix: string;
+  readonly #readOnly: boolean;
+  readonly #retries: StorageRetryOptions | undefined;
+  readonly #signal: AbortSignal | undefined;
+  readonly #timeout: number | undefined;
   readonly #signedUploadPolicy: FilesSdkSignedUploadPolicyAdapter | undefined;
   readonly #signedDownloadPolicy:
     FilesSdkSignedDownloadPolicyAdapter | undefined;
@@ -515,6 +602,12 @@ export class FilesSdkStorageDriver<
     this.#files = new Files(options);
     this.#name = options.adapter.name;
     this.#conditionalCopy = conditionalCopyAdapterOf(options.adapter);
+    this.#conditionalMutation = conditionalMutationAdapterOf(options.adapter);
+    this.#prefix = this.#files.prefix;
+    this.#readOnly = options.readonly === true;
+    this.#retries = storageRetryOptions(options.retries);
+    this.#signal = options.signal;
+    this.#timeout = options.timeout;
     this.#signedUploadPolicy = signedUploadPolicyAdapterOf(options.adapter);
     this.#signedDownloadPolicy = signedDownloadPolicyAdapterOf(options.adapter);
   }
@@ -535,6 +628,12 @@ export class FilesSdkStorageDriver<
       ...(this.#conditionalCopy !== undefined && {
         conditionalCopy: { ...this.#conditionalCopy.conditionalCopy },
       }),
+      ...(this.#conditionalMutation !== undefined &&
+        !this.#readOnly && {
+          conditionalMutation: {
+            ...this.#conditionalMutation.conditionalMutation,
+          },
+        }),
       signedDownload: { ...capabilities.signedUrl },
       ...(this.#signedDownloadPolicy !== undefined && {
         signedDownloadPolicy: {
@@ -559,6 +658,61 @@ export class FilesSdkStorageDriver<
         await this.#files.upload(key, mapBody(body), uploadOptions(options)),
       ),
     );
+  }
+
+  uploadConditional(
+    key: string,
+    body: StorageBody,
+    options: StorageConditionalUploadOptions,
+  ): Promise<StorageUploadResult> {
+    if (this.#readOnly) {
+      return Promise.reject(
+        new StorageError(
+          `Cannot call uploadConditional() on a read-only storage adapter.`,
+          {
+            code: StorageErrorCode.READ_ONLY,
+            key,
+            operation: 'upload',
+            permanent: true,
+          },
+        ),
+      );
+    }
+    const adapter = this.#conditionalMutation;
+    if (adapter === undefined) {
+      return Promise.reject(
+        new StorageError(
+          `Storage adapter "${this.#name}" does not support conditional upload.`,
+          {
+            code: StorageErrorCode.NOT_SUPPORTED,
+            key,
+            operation: 'upload',
+            permanent: true,
+          },
+        ),
+      );
+    }
+    const mergedOptions = this.#conditionalOptions(options);
+    return this.#call(async () => {
+      const physicalKey = this.#path(key);
+      const result = await adapter.uploadConditional(
+        physicalKey,
+        mapBody(body),
+        mergedOptions,
+      );
+      if (result.key !== physicalKey) {
+        throw new StorageError(
+          'Storage adapter returned an unexpected conditional upload key.',
+          {
+            code: StorageErrorCode.PROVIDER,
+            key,
+            operation: 'upload',
+            permanent: true,
+          },
+        );
+      }
+      return { ...result, key };
+    });
   }
 
   async download(
@@ -591,6 +745,43 @@ export class FilesSdkStorageDriver<
     return this.#call(async () => {
       await this.#files.delete(key, operationOptions(options));
     });
+  }
+
+  deleteConditional(
+    key: string,
+    options: StorageConditionalDeleteOptions,
+  ): Promise<void> {
+    if (this.#readOnly) {
+      return Promise.reject(
+        new StorageError(
+          `Cannot call deleteConditional() on a read-only storage adapter.`,
+          {
+            code: StorageErrorCode.READ_ONLY,
+            key,
+            operation: 'delete',
+            permanent: true,
+          },
+        ),
+      );
+    }
+    const adapter = this.#conditionalMutation;
+    if (adapter === undefined) {
+      return Promise.reject(
+        new StorageError(
+          `Storage adapter "${this.#name}" does not support conditional delete.`,
+          {
+            code: StorageErrorCode.NOT_SUPPORTED,
+            key,
+            operation: 'delete',
+            permanent: true,
+          },
+        ),
+      );
+    }
+    const mergedOptions = this.#conditionalOptions(options);
+    return this.#call(() =>
+      adapter.deleteConditional(this.#path(key), mergedOptions),
+    );
   }
 
   copy(
@@ -697,6 +888,53 @@ export class FilesSdkStorageDriver<
     } catch (error) {
       throw mapFilesSdkError(error);
     }
+  }
+
+  #path(key: string): string {
+    if (typeof key !== 'string' || key.length === 0) {
+      throw new StorageError('key must be a non-empty string.', {
+        code: StorageErrorCode.INVALID_ARGUMENT,
+        permanent: true,
+      });
+    }
+    if (key.includes('\0')) {
+      throw new StorageError('key must not contain null bytes.', {
+        code: StorageErrorCode.INVALID_ARGUMENT,
+        key,
+        permanent: true,
+      });
+    }
+    if (this.#prefix.length === 0) {
+      return key;
+    }
+    const normalized = key.replace(/^\/+/u, '');
+    if (
+      normalized
+        .split('/')
+        .some((segment) => segment === '.' || segment === '..')
+    ) {
+      throw new StorageError('key must not contain . or .. path segments.', {
+        code: StorageErrorCode.INVALID_ARGUMENT,
+        key,
+        permanent: true,
+      });
+    }
+    return `${this.#prefix}/${normalized}`;
+  }
+
+  #conditionalOptions<
+    Options extends
+      StorageConditionalUploadOptions | StorageConditionalDeleteOptions,
+  >(options: Options): Options {
+    return {
+      ...options,
+      ...(options.retries === undefined &&
+        this.#retries !== undefined && { retries: this.#retries }),
+      ...(options.signal === undefined &&
+        this.#signal !== undefined && { signal: this.#signal }),
+      ...(options.timeout === undefined &&
+        this.#timeout !== undefined && { timeout: this.#timeout }),
+    };
   }
 }
 

@@ -61,6 +61,23 @@ export interface StorageUploadOptions extends StorageOperationOptions {
   control?: StorageUploadControl;
 }
 
+export type StorageConditionalUploadOptions = StorageUploadOptions &
+  (
+    | {
+        /** Atomically create the object only when its key does not exist. */
+        condition: { type: 'create' };
+      }
+    | {
+        /** Atomically replace the object only when its current ETag matches. */
+        condition: { type: 'replace'; etag: string };
+      }
+  );
+
+export interface StorageConditionalDeleteOptions extends StorageOperationOptions {
+  /** Atomically delete the object only when its current ETag matches. */
+  condition: { etag: string };
+}
+
 export interface StorageUploadResult {
   key: string;
   size: number;
@@ -158,6 +175,20 @@ export interface StorageConditionalCopyCapability {
   version: boolean;
 }
 
+export interface StorageConditionalMutationCapability {
+  /** Native create-if-absent support. */
+  create: boolean;
+  /** Native replace-if-current-ETag-matches support. */
+  replace: boolean;
+  /** Native delete-if-current-ETag-matches support. */
+  delete: boolean;
+  /**
+   * Successful conditional uploads return an ETag usable for CAS. A provider
+   * that commits without returning one must fail rather than report success.
+   */
+  etag: boolean;
+}
+
 export interface StorageSignedUploadPolicyCapability {
   /** The signed request fixes the exact declared content type. */
   contentType: boolean;
@@ -185,6 +216,11 @@ export interface StorageCapabilities {
    * compatibility with drivers built against earlier package versions.
    */
   conditionalCopy?: StorageConditionalCopyCapability;
+  /**
+   * Native conditional mutations. Absent means unsupported; callers must not
+   * emulate these operations with a separate `exists()` or `head()` request.
+   */
+  conditionalMutation?: StorageConditionalMutationCapability;
   signedDownload: StorageSignedUrlCapability;
   /** Expiry guarantees enforced by the provider adapter. */
   signedDownloadPolicy?: StorageSignedDownloadPolicyCapability;

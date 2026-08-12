@@ -1,8 +1,8 @@
 # @nestm/storage
 
 Framework-neutral storage clients with NestJS 12 integration, named stores,
-explicit streaming I/O, cross-store workflows, and an optional guarded HTTP
-gateway.
+explicit streaming I/O, capability-scoped agent workspaces, cross-store
+workflows, and an optional guarded HTTP gateway.
 
 The package uses [`files-sdk`](https://github.com/haydenbleasel/files-sdk) as
 its provider engine, but owns the API injected into Nest applications. Provider
@@ -87,6 +87,186 @@ The core entry point exports `StorageClient`, the `StorageDriver` contract,
 storage errors and operation types, and `StorageUploadControl`. It has no NestJS
 runtime or declaration imports. Provider adapters remain available through
 `@nestm/storage/files-sdk`.
+
+## Mounted agent workspaces
+
+`@nestm/storage/workspace` turns a `StorageClient` into a narrow capability for
+one logical directory. The mount is virtual: the same API works over S3, a
+filesystem driver, or another storage backend without exposing the provider,
+bucket, filesystem root, raw cursor, or internal prefix to its caller.
+
+```mermaid
+flowchart LR
+  A["Trusted application context"] -->|"store + opaque prefix + policy"| W["StorageWorkspace"]
+  W --> C["StorageClient"]
+  C --> D["S3 / filesystem / other driver"]
+  W --> T["AI SDK workspace tools"]
+  T --> G["ToolLoopAgent"]
+```
+
+Only trusted application code chooses the mount prefix. Every path accepted by
+the workspace is a canonical, relative POSIX path. Absolute paths, backslashes,
+control characters, repeated separators, and `.` or `..` segments are rejected
+rather than normalized. Keys and provider cursors returned by a driver are also
+checked before they are converted back to logical paths.
+
+```ts
+import { mountStorageWorkspace } from '@nestm/storage/workspace';
+
+const workspace = mountStorageWorkspace(agentFiles, {
+  // Use an opaque server-derived run id, never a value selected by the model.
+  prefix: `workspaces/${runId}`,
+  permissions: [
+    'list',
+    'read',
+    'search',
+    'create',
+    'replace',
+    'copy',
+    'move',
+    'delete',
+  ],
+  limits: {
+    maxReadBytes: 1024 * 1024,
+    maxWriteBytes: 1024 * 1024,
+    maxPageSize: 100,
+    maxSearchResults: 100,
+    maxSearchScan: 1000,
+  },
+});
+
+const created = await workspace.writeFile(
+  'src/main.ts',
+  'export const ready = true;\n',
+  { mode: 'create', contentType: 'text/typescript' },
+);
+
+if (created.etag === undefined) {
+  throw new Error('This backend cannot safely replace the object.');
+}
+
+await workspace.writeFile('src/main.ts', 'export const ready = false;\n', {
+  mode: 'replace',
+  etag: created.etag,
+  contentType: 'text/typescript',
+});
+```
+
+Create, replace, and delete are conditional operations. A driver that cannot
+enforce the requested not-exists or ETag precondition fails with
+`NOT_SUPPORTED`; the workspace never substitutes an `exists()`/`head()` check
+followed by an unconditional mutation. Reads enforce their byte ceiling while
+consuming the stream, and list/search results are bounded. Search supports
+exact, substring, and workspace-coordinate glob matching, but no caller-supplied
+regular expressions.
+
+Move is implemented as create-only copy followed by ETag-conditional source
+delete. If source deletion cannot be confirmed, the destination is retained and
+the call returns `CONFLICT`; inspect both logical paths before retrying. This
+preserves at least one copy across provider timeouts and post-operation hook
+failures, but does not pretend a multi-object move is transactionally atomic.
+
+A child mount may further restrict a directory, permissions, or limits, but it
+cannot widen any of them:
+
+```ts
+const readOnlySource = workspace.mount('src', {
+  permissions: ['list', 'read', 'search'],
+  limits: { maxReadBytes: 256 * 1024 },
+});
+```
+
+### AI SDK and NestJS composition
+
+Install AI SDK 7 and Zod only in applications that use the optional adapter:
+
+```sh
+pnpm add ai@^7 zod@^4
+```
+
+`files-sdk` 2.2.x still declares an optional `ai@^6` peer for its own adapter,
+so some package managers may print a peer warning when AI SDK 7 is installed.
+This package does not import that adapter; `@nestm/storage/ai-sdk` targets AI
+SDK 7 directly.
+
+`@nestm/storage/ai-sdk` converts an already-mounted workspace to an ordinary
+upstream `ToolSet`. It does not import NestJS or `@nestm/ai-sdk`; the application
+composes the tool set through the AI module's existing named-toolset factory.
+For a tenant or run selected per request, make both factories request-scoped and
+derive the mount coordinate from authenticated host context:
+
+```ts
+import { Module, Scope } from '@nestjs/common';
+import { AiSdkModule, AiSdkService, getAiToolsetToken } from '@nestm/ai-sdk';
+import { getStorageToken, type StorageClient } from '@nestm/storage';
+import { createAiSdkWorkspaceTools } from '@nestm/storage/ai-sdk';
+import { mountStorageWorkspace } from '@nestm/storage/workspace';
+import type { ToolSet } from 'ai';
+
+@Module({
+  imports: [
+    AppStorageModule,
+    WorkspaceContextModule,
+    AiSdkModule.forFeature({
+      imports: [AppStorageModule, WorkspaceContextModule],
+      toolsets: [
+        {
+          name: 'workspace',
+          scope: Scope.REQUEST,
+          inject: [getStorageToken('agent-files'), WorkspaceContext],
+          useFactory: (storage: StorageClient, context: WorkspaceContext) =>
+            createAiSdkWorkspaceTools({
+              workspace: mountStorageWorkspace(storage, {
+                // A validated, opaque coordinate from trusted auth/run state.
+                // It is never accepted from a prompt or tool input.
+                prefix: context.storagePrefix,
+                permissions: [
+                  'list',
+                  'read',
+                  'search',
+                  'create',
+                  'replace',
+                  'copy',
+                  'move',
+                  'delete',
+                ],
+              }),
+            }),
+        },
+      ],
+      agents: [
+        {
+          name: 'workspace-agent',
+          scope: Scope.REQUEST,
+          inject: [AiSdkService, getAiToolsetToken('workspace')],
+          useFactory: (ai: AiSdkService, tools: ToolSet) => ({
+            model: ai.languageModel(),
+            instructions:
+              'Use only the mounted workspace tools for file operations.',
+            tools,
+          }),
+        },
+      ],
+    }),
+  ],
+})
+export class WorkspaceAgentModule {}
+```
+
+The generated set contains only tools allowed by the workspace permissions:
+bounded list, stat, UTF-8 read, and search tools plus conditional create,
+replace, copy, move, and delete tools when granted. Mutation tools require AI
+SDK user approval by default; approval can be configured per tool, but the
+workspace capability remains the authorization boundary even when approval is
+disabled. The module's `AiSdkService.files()` API is the model provider's file
+upload facility and is unrelated to storage workspaces.
+
+This logical confinement is sufficient for a `ToolLoopAgent` whose only file
+capabilities are these tools. It cannot constrain a coding harness that already
+has shell, `node:fs`, or subprocess access. For Codex/Claude-style harnesses,
+materialize the workspace into a per-session container or VM, mount only that
+directory, run the harness there, and synchronize reviewed changes back through
+`StorageWorkspace`. A working directory alone is not a sandbox.
 
 ## Configure named stores
 

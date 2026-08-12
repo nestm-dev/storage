@@ -1,6 +1,8 @@
 import type {
   StorageBody,
   StorageCapabilities,
+  StorageConditionalDeleteOptions,
+  StorageConditionalUploadOptions,
   StorageDownloadOptions,
   StorageListOptions,
   StorageListResult,
@@ -25,6 +27,11 @@ export interface StorageDriver {
     body: StorageBody,
     options?: StorageUploadOptions,
   ): Promise<StorageUploadResult>;
+  uploadConditional?(
+    key: string,
+    body: StorageBody,
+    options: StorageConditionalUploadOptions,
+  ): Promise<StorageUploadResult>;
   download(
     key: string,
     options?: StorageDownloadOptions,
@@ -35,6 +42,10 @@ export interface StorageDriver {
   ): Promise<StorageObjectMetadata>;
   exists(key: string, options?: StorageOperationOptions): Promise<boolean>;
   delete(key: string, options?: StorageOperationOptions): Promise<void>;
+  deleteConditional?(
+    key: string,
+    options: StorageConditionalDeleteOptions,
+  ): Promise<void>;
   copy(
     sourceKey: string,
     destinationKey: string,

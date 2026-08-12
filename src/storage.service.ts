@@ -16,6 +16,39 @@ import type {
 
 const identity = (key: string): string => key;
 
+function joinStorageKey(prefix: string | undefined, key: string): string {
+  if (prefix === undefined || prefix.length === 0) {
+    return key;
+  }
+  const normalizedPrefix = prefix.replace(/\/+$/u, '');
+  for (const [label, value] of [
+    ['destinationPrefix', normalizedPrefix],
+    ['transformed destination key', key],
+  ] as const) {
+    if (
+      value.length === 0 ||
+      value.startsWith('/') ||
+      value.includes('\\') ||
+      value.includes('\0') ||
+      value
+        .split('/')
+        .some(
+          (segment) =>
+            segment.length === 0 || segment === '.' || segment === '..',
+        )
+    ) {
+      throw new StorageError(
+        `${label} must be a canonical relative POSIX storage key.`,
+        {
+          code: StorageErrorCode.INVALID_ARGUMENT,
+          permanent: true,
+        },
+      );
+    }
+  }
+  return `${normalizedPrefix}/${key}`;
+}
+
 function assertDifferentStores(from: string, to: string): void {
   if (from === to) {
     throw new StorageError(
@@ -200,6 +233,8 @@ export class StorageService {
     const source = this.use(fromName);
     const destination = this.use(toName);
     const transformKey = options.transformKey ?? identity;
+    const destinationKeyOf = (key: string): string =>
+      joinStorageKey(options.destinationPrefix, transformKey(key));
     const compare = options.compare ?? 'etag';
     const sourceObjects = await walk(source, options);
     const destinationObjects = await walk(destination, {
@@ -215,7 +250,7 @@ export class StorageService {
       destinationObjects.map((object) => [object.key, object]),
     );
     const desiredDestinationKeys = new Set(
-      sourceObjects.map((object) => transformKey(object.key)),
+      sourceObjects.map((object) => destinationKeyOf(object.key)),
     );
     const deleteKeys =
       (options.prune ?? false)
@@ -227,7 +262,7 @@ export class StorageService {
     const plannedUploads: string[] = [];
     const plannedSkips: string[] = [];
     for (const object of sourceObjects) {
-      const existing = destinationIndex.get(transformKey(object.key));
+      const existing = destinationIndex.get(destinationKeyOf(object.key));
       (existing && unchanged(object, existing, compare)
         ? plannedSkips
         : plannedUploads
@@ -258,7 +293,7 @@ export class StorageService {
       sourceObjects,
       (object) => object.key,
       async (object) => {
-        const destinationKey = transformKey(object.key);
+        const destinationKey = destinationKeyOf(object.key);
         const existing = destinationIndex.get(destinationKey);
         if (existing && unchanged(object, existing, compare)) {
           skipped.add(object.key);

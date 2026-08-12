@@ -46,3 +46,43 @@ the validated `head` or with an immutable provider version. Ordinary `copy`
 does not protect against a staging-key replay between validation and copy.
 Conditional promotion keeps the staging source; delete it only after the
 application's metadata transaction commits.
+
+## Workspace security boundary
+
+`StorageWorkspace` is a narrowing capability for storage operations. Construct
+it from trusted application context, keep the underlying `StorageClient` and
+mount prefix private, and pass only the workspace or its AI tool set to
+untrusted agent code. A tenant id, run id, prefix, provider cursor, snapshot id,
+or fork id supplied by a model is not a safe mount coordinate.
+
+The workspace accepts only canonical mount-relative POSIX paths and rechecks
+every key returned by a driver before unscoping it. Its cursors are opaque and
+bound to the mount and query. Permissions, byte limits, result limits, and
+conditional mutation preconditions are enforced inside the capability; tool
+omission and user approval are additional workflow controls, not the
+authorization boundary.
+
+Conditional mutations can still have an ambiguous outcome when a remote
+provider commits and then loses or violates its response, or when a configured
+post-operation plugin fails after the driver has committed. The API fails
+closed in that case: inspect the logical destination and reconcile it before
+retrying. Create-only and ETag preconditions prevent a blind retry from
+silently overwriting a different object, but they cannot make a multi-object
+move transactionally atomic.
+
+This guarantee covers calls made through `StorageWorkspace`. It does not
+confine arbitrary `node:fs`, shell, subprocess, or native-code access in the
+same process. A coding harness with built-in shell or filesystem tools must run
+inside an OS sandbox (container, VM, or equivalent) that exposes only a
+materialized workspace. Setting `cwd` to a workspace directory is not
+isolation.
+
+For local filesystem storage, use a dedicated service-owned root and do not let
+another untrusted process mutate its directory tree concurrently. High-level
+Node filesystem checks reject symlinks and hard-linked object files in existing
+workspace read and mutation paths, including metadata sidecars, but cannot
+provide a race-proof boundary against an actor that can replace path components
+between validation and use. For that threat model, mount only the workspace
+into a separate UID/container/VM and synchronize approved results back through
+storage. The local adapter also commits the body and metadata sidecar as two
+files; a process crash between their atomic renames can require reconciliation.
