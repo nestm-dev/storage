@@ -1,6 +1,6 @@
 {
   "name": "@nestm/storage",
-  "version": "0.1.0-alpha.5",
+  "version": "0.1.0-alpha.6",
   "description": "Framework-neutral storage clients with NestJS 12 integration, named stores, streaming I/O, and an optional guarded HTTP gateway.",
   "license": "MIT",
   "author": "Kauan Guesser",
