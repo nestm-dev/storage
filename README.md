@@ -43,9 +43,6 @@ Install only the native SDKs required by the chosen provider. For example:
 pnpm add @aws-sdk/client-s3 @aws-sdk/s3-presigned-post \
   @aws-sdk/s3-request-presigner @aws-sdk/lib-storage
 
-# Encrypted artifact storage with AWS KMS
-pnpm add @aws-sdk/client-kms
-
 # Google Cloud Storage
 pnpm add @google-cloud/storage google-auth-library
 
@@ -90,117 +87,6 @@ The core entry point exports `StorageClient`, the `StorageDriver` contract,
 storage errors and operation types, and `StorageUploadControl`. It has no NestJS
 runtime or declaration imports. Provider adapters remain available through
 `@nestm/storage/files-sdk`.
-
-## Encrypted artifact storage
-
-The optional `@nestm/storage/artifacts` entry point adds a framework-neutral
-artifact facade over the same provider drivers. Every write is a self-contained
-CAE1 AES-256-GCM envelope; plaintext mode does not exist. The authenticated
-context binds each object to its tenant scope, artifact id, version, path, and
-content type so moving ciphertext to another address fails closed.
-
-Install `@aws-sdk/client-kms` in every artifact-storage consumer. It is an
-optional peer so core-only applications do not download AWS KMS, while artifact
-applications can choose either the local key provider or KMS at runtime.
-
-Set `ARTIFACT_KEY_PROVIDER=local` with a base64-encoded 32-byte `ARTIFACT_KEK`
-(`ARTIFACT_KEK_NAME` is optional), or set `ARTIFACT_KEY_PROVIDER=kms` with
-`ARTIFACT_KMS_KEY_ID` (`ARTIFACT_KMS_REGION` is optional). Invalid or missing
-key configuration aborts startup. `ARTIFACT_ENCRYPTION_READ_LEGACY=true` is a
-temporary, explicit plaintext-read migration flag and never enables plaintext
-writes.
-
-```ts
-import {
-  artifactScope,
-  artifactStorageConfigFromEnv,
-  createArtifactStorage,
-  storageCryptoFromEnv,
-} from '@nestm/storage/artifacts';
-
-const storage = await createArtifactStorage(
-  artifactStorageConfigFromEnv(process.env),
-  storageCryptoFromEnv(process.env),
-);
-
-const ref = artifactScope({
-  organizationId: 'org-1',
-  ownerUserId: 'user-1',
-});
-
-await storage.writeHtml('artifact-1', Buffer.from('<h1>Encrypted</h1>'), {
-  scope: ref,
-});
-
-const html = await storage.read('artifact-1', 'index.html', {
-  scope: ref,
-});
-```
-
-`writeBundle()` expands a zip into separately authenticated objects, skips
-traversal and reserved-namespace entries, and rejects case-folded duplicate
-paths, more than 1,000 entries, entries larger than 64 MiB, or more than 256 MiB
-total expanded data. Callers may lower those limits per write. `read()` and
-`readWithInfo()` support directory-to-`index.html` resolution, optional
-plaintext-size limits, and version-bound paths.
-
-`ObjectStore` exposes the same encryption guarantees for non-artifact objects
-such as upload staging and organization media. Keys must begin with a configured
-top-level namespace; the defaults are `_staging` and `org-logos`. Those names
-are reserved as artifact ids, case-insensitively, so artifact and object
-operations cannot address one another even when an object-store provider uses a
-shared bucket root. Override the top-level
-`ArtifactStorageConfig.objectNamespaces` field when an application owns
-different object families.
-
-Keep `objectNamespaces` identical across every reader and writer for a deployed
-store; changing the set is a storage-protocol migration, not a per-process
-preference. On case-insensitive filesystems, use case-stable artifact ids,
-version ids, and object keys (Concepta's lowercase UUID ids satisfy this).
-
-The CAE1 framing and its `{ scope, artifactId, version, path }` context are a
-compatibility contract. Existing envelopes remain readable. Filesystems retain
-the layouts `<root>/<artifactId>/<path>` and `<root>/_objects/<key>`; S3 and
-other object-store providers retain their deployed unprefixed object keys, so a
-rolling upgrade does not split old and new writers across keyspaces. Artifact
-and version ids must each be one safe storage segment. Legacy plaintext reads
-are available only through the explicit
-`ARTIFACT_ENCRYPTION_READ_LEGACY=true` migration flag; writes are always
-encrypted.
-
-The convenience `createArtifactStorage()` and `createObjectStore()` factories
-are ideal for scripts. Long-running framework-neutral processes that need an
-explicit shutdown path should create the raw clients with
-`createArtifactStorageClient()` / `createObjectStorageClient()`, compose them
-with the corresponding `create*WithClient()` function, call each client's
-`onApplicationShutdown()`, and finally call `crypto.keyProvider.clear()`. The
-Nest module owns that lifecycle automatically.
-
-Nest applications can register both adapters with one dynamic module:
-
-```ts
-import { Module } from '@nestjs/common';
-import {
-  artifactStorageConfigFromEnv,
-  storageCryptoFromEnv,
-} from '@nestm/storage/artifacts';
-import { ArtifactStorageModule } from '@nestm/storage/artifacts/nest';
-
-@Module({
-  imports: [
-    ArtifactStorageModule.forRoot({
-      config: artifactStorageConfigFromEnv(process.env),
-      crypto: storageCryptoFromEnv(process.env),
-    }),
-  ],
-})
-export class AppModule {}
-```
-
-Inject `ArtifactStorage` with `@InjectArtifactStorage()` and `ObjectStore` with
-`@InjectObjectStore()`. The module owns named raw clients (`artifacts` and
-`objects`) and clears cached data keys during application shutdown. Set
-`isGlobal: true` only when both adapters are intentionally application-wide.
 
 ## Configure named stores
 
