@@ -88,10 +88,31 @@ describe('createProviderStorageDriver', () => {
       supported: true,
       version: true,
     });
+    expect(driver.capabilities.conditionalMutation).toEqual({
+      create: true,
+      delete: true,
+      etag: true,
+      replace: true,
+    });
     expect(driver.capabilities.signedUploadPolicy).toEqual({
       contentType: true,
       sizeRange: true,
     });
+  });
+
+  it('does not advertise conditional mutation for an unverified S3-compatible endpoint', async () => {
+    const driver = await createProviderStorageDriver({
+      config: {
+        accessKeyId: 'test',
+        bucket: 'artifacts',
+        endpoint: 'https://objects.example.test',
+        region: 'us-east-1',
+        secretAccessKey: 'test',
+      },
+      provider: 's3',
+    });
+
+    expect(driver.capabilities.conditionalMutation).toBeUndefined();
   });
 
   it('claims no conditional copy for a provider that does not declare it', async () => {
@@ -101,6 +122,12 @@ describe('createProviderStorageDriver', () => {
     });
 
     expect(driver.capabilities.conditionalCopy).toBeUndefined();
+    expect(driver.capabilities.conditionalMutation).toEqual({
+      create: true,
+      delete: true,
+      etag: true,
+      replace: true,
+    });
   });
 
   it('rejects an unknown slug before importing anything', async () => {

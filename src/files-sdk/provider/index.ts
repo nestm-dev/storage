@@ -83,6 +83,12 @@ async function resolveAdapter(
     throw mapFilesSdkError(error);
   }
   const { adapter } = resolved.files;
+  if (provider === 'fs') {
+    const { withFsConditionalMutation } = await import('../fs/index.js');
+    return withFsConditionalMutation(
+      adapter as Parameters<typeof withFsConditionalMutation>[0],
+    );
+  }
   if (provider !== 's3') {
     return adapter;
   }
@@ -92,6 +98,9 @@ async function resolveAdapter(
   return withS3Capabilities(
     adapter as Parameters<typeof withS3Capabilities>[0],
     {
+      ...(typeof config?.endpoint === 'string' && {
+        endpoint: config.endpoint,
+      }),
       ...(config?.publicBaseUrl !== undefined && {
         publicBaseUrl: config.publicBaseUrl,
       }),

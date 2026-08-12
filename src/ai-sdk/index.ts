@@ -1,0 +1,16 @@
+export {
+  AI_SDK_WORKSPACE_TOOL_NAMES,
+  AiSdkWorkspaceToolError,
+  createAiSdkWorkspaceTools,
+  isAiSdkWorkspaceMutationToolName,
+  type AiSdkWorkspaceApprovalConfig,
+  type AiSdkWorkspaceDirectoryResult,
+  type AiSdkWorkspaceEntryResult,
+  type AiSdkWorkspaceFileResult,
+  type AiSdkWorkspaceMutationToolName,
+  type AiSdkWorkspacePageResult,
+  type AiSdkWorkspaceTextFileResult,
+  type AiSdkWorkspaceToolErrorCode,
+  type AiSdkWorkspaceToolName,
+  type CreateAiSdkWorkspaceToolsOptions,
+} from './ai-sdk-workspace-tools.js';

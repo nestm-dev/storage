@@ -2,6 +2,7 @@ export {
   FilesSdkStorageDriver,
   createFilesSdkDriver,
   type FilesSdkConditionalCopyAdapter,
+  type FilesSdkConditionalMutationAdapter,
   type FilesSdkSignedUploadPolicyAdapter,
   type FilesSdkSignedDownloadPolicyAdapter,
   type FilesSdkDriverOptions,

@@ -10,6 +10,8 @@ import type {
   StorageBufferedDownloadOptions,
   StorageBulkOptions,
   StorageCapabilities,
+  StorageConditionalDeleteOptions,
+  StorageConditionalUploadOptions,
   StorageDeleteManyResult,
   StorageDownloadManyResult,
   StorageDownloadOptions,
@@ -208,12 +210,17 @@ export interface StorageFileHandle {
     body: StorageBody,
     options?: StorageUploadOptions,
   ): Promise<StorageUploadResult>;
+  uploadConditional(
+    body: StorageBody,
+    options: StorageConditionalUploadOptions,
+  ): Promise<StorageUploadResult>;
   download(options?: StorageDownloadOptions): Promise<StorageObject>;
   bytes(options?: StorageBufferedDownloadOptions): Promise<Uint8Array>;
   text(options?: StorageBufferedDownloadOptions): Promise<string>;
   head(options?: StorageOperationOptions): Promise<StorageObjectMetadata>;
   exists(options?: StorageOperationOptions): Promise<boolean>;
   delete(options?: StorageOperationOptions): Promise<void>;
+  deleteConditional(options: StorageConditionalDeleteOptions): Promise<void>;
   signDownload(options?: StorageSignedDownloadOptions): Promise<string>;
   signUpload(options: StorageSignedUploadOptions): Promise<StorageSignedUpload>;
   copyTo(
@@ -260,6 +267,7 @@ export class StorageClient {
       copyTo: (destinationKey, options) =>
         this.copy(key, destinationKey, options),
       delete: (options) => this.delete(key, options),
+      deleteConditional: (options) => this.deleteConditional(key, options),
       download: (options) => this.downloadStream(key, options),
       exists: (options) => this.exists(key, options),
       head: (options) => this.head(key, options),
@@ -273,6 +281,8 @@ export class StorageClient {
       bytes: (options) => this.downloadBytes(key, options),
       text: (options) => this.downloadText(key, options),
       upload: (body, options) => this.upload(key, body, options),
+      uploadConditional: (body, options) =>
+        this.uploadConditional(key, body, options),
     };
   }
 
@@ -284,6 +294,50 @@ export class StorageClient {
     assertKey(key);
     return this.#execute({ key, operation: 'upload', store: this.name }, () =>
       this.#driver.upload(key, body, options),
+    );
+  }
+
+  uploadConditional(
+    key: string,
+    body: StorageBody,
+    options: StorageConditionalUploadOptions,
+  ): Promise<StorageUploadResult> {
+    assertKey(key);
+    const condition = options.condition;
+    if (
+      condition === undefined ||
+      (condition.type !== 'create' && condition.type !== 'replace')
+    ) {
+      invalidArgument('condition.type must be "create" or "replace".');
+    }
+    if (
+      condition.type === 'replace' &&
+      (typeof condition.etag !== 'string' || condition.etag.length === 0)
+    ) {
+      invalidArgument('condition.etag must be a non-empty string.');
+    }
+
+    const capability = this.#driver.capabilities.conditionalMutation;
+    const uploadConditional = this.#driver.uploadConditional;
+    const supported =
+      condition.type === 'create'
+        ? capability?.create === true
+        : capability?.replace === true;
+    if (!supported || uploadConditional === undefined) {
+      throw new StorageError(
+        `Store "${this.name}" does not support the requested conditional upload.`,
+        {
+          code: StorageErrorCode.NOT_SUPPORTED,
+          key,
+          operation: 'upload',
+          permanent: true,
+          store: this.name,
+        },
+      );
+    }
+
+    return this.#execute({ key, operation: 'upload', store: this.name }, () =>
+      uploadConditional.call(this.#driver, key, body, options),
     );
   }
 
@@ -354,6 +408,39 @@ export class StorageClient {
     assertKey(key);
     return this.#execute({ key, operation: 'delete', store: this.name }, () =>
       this.#driver.delete(key, options),
+    );
+  }
+
+  deleteConditional(
+    key: string,
+    options: StorageConditionalDeleteOptions,
+  ): Promise<void> {
+    assertKey(key);
+    if (
+      options.condition === undefined ||
+      typeof options.condition.etag !== 'string' ||
+      options.condition.etag.length === 0
+    ) {
+      invalidArgument('condition.etag must be a non-empty string.');
+    }
+
+    const capability = this.#driver.capabilities.conditionalMutation;
+    const deleteConditional = this.#driver.deleteConditional;
+    if (capability?.delete !== true || deleteConditional === undefined) {
+      throw new StorageError(
+        `Store "${this.name}" does not support conditional delete.`,
+        {
+          code: StorageErrorCode.NOT_SUPPORTED,
+          key,
+          operation: 'delete',
+          permanent: true,
+          store: this.name,
+        },
+      );
+    }
+
+    return this.#execute({ key, operation: 'delete', store: this.name }, () =>
+      deleteConditional.call(this.#driver, key, options),
     );
   }
 

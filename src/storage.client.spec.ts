@@ -133,6 +133,95 @@ describe('StorageClient', () => {
     );
   });
 
+  it('fails conditional mutations closed unless the exact primitive is declared', () => {
+    const client = new StorageClient('media', createMemoryStorageDriver());
+
+    expect(() =>
+      client.uploadConditional('new.txt', 'new', {
+        condition: { type: 'create' },
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.NOT_SUPPORTED }),
+    );
+    expect(() =>
+      client.deleteConditional('old.txt', {
+        condition: { etag: 'old-etag' },
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.NOT_SUPPORTED }),
+    );
+  });
+
+  it('delegates only driver-declared conditional mutations', async () => {
+    const driver = createMemoryStorageDriver();
+    const uploadConditional = vi.fn(async (key: string) => ({
+      contentType: 'text/plain',
+      etag: 'next-etag',
+      key,
+      size: 4,
+    }));
+    const deleteConditional = vi.fn(async () => undefined);
+    Object.defineProperty(driver, 'capabilities', {
+      value: {
+        ...driver.capabilities,
+        conditionalMutation: {
+          create: true,
+          delete: true,
+          etag: true,
+          replace: true,
+        },
+      },
+    });
+    driver.uploadConditional = uploadConditional;
+    driver.deleteConditional = deleteConditional;
+    const client = new StorageClient('media', driver);
+
+    await client.file('note.txt').uploadConditional('next', {
+      condition: { etag: 'old-etag', type: 'replace' },
+    });
+    await client.file('note.txt').deleteConditional({
+      condition: { etag: 'next-etag' },
+    });
+
+    expect(uploadConditional).toHaveBeenCalledWith('note.txt', 'next', {
+      condition: { etag: 'old-etag', type: 'replace' },
+    });
+    expect(deleteConditional).toHaveBeenCalledWith('note.txt', {
+      condition: { etag: 'next-etag' },
+    });
+  });
+
+  it('rejects invalid conditional ETags before calling a driver', () => {
+    const driver = createMemoryStorageDriver();
+    Object.defineProperty(driver, 'capabilities', {
+      value: {
+        ...driver.capabilities,
+        conditionalMutation: {
+          create: true,
+          delete: true,
+          etag: true,
+          replace: true,
+        },
+      },
+    });
+    driver.uploadConditional = vi.fn();
+    driver.deleteConditional = vi.fn();
+    const client = new StorageClient('media', driver);
+
+    expect(() =>
+      client.uploadConditional('note.txt', 'next', {
+        condition: { etag: '', type: 'replace' },
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+    );
+    expect(() =>
+      client.deleteConditional('note.txt', { condition: { etag: '' } }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+    );
+  });
+
   it('classifies invalid owned options before calling the provider', async () => {
     const client = new StorageClient('media', createMemoryStorageDriver());
 
