@@ -10,6 +10,7 @@
     "harden-storage-boundaries",
     "initial-storage-release",
     "map-foreign-files-not-found",
+    "restore-generic-storage-boundary",
     "runtime-provider-selection"
   ]
 }

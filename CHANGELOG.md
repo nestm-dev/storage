@@ -1,5 +1,13 @@
 # @nestm/storage
 
+## 0.1.0-alpha.6
+
+### Minor Changes
+
+- 5bb646e: Remove the product-specific artifact protocol, encryption codec, and Nest composition entry
+  points. `@nestm/storage` remains a generic storage library; applications should compose domain
+  protocols over its clients and provider drivers in their own packages.
+
 ## 0.1.0-alpha.5
 
 ### Minor Changes
