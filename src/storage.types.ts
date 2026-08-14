@@ -88,6 +88,7 @@ export interface StorageUploadResult {
   key: string;
   size: number;
   contentType: string;
+  /** Canonical bare provider ETag; pass it back unchanged as a condition. */
   etag?: string;
   lastModified?: Date;
 }
@@ -97,6 +98,7 @@ export interface StorageObjectMetadata {
   name: string;
   size: number;
   contentType: string;
+  /** Canonical bare provider ETag; pass it back unchanged as a condition. */
   etag?: string;
   lastModified?: Date;
   metadata?: Record<string, string>;
@@ -139,6 +141,11 @@ export interface StorageBufferedDownloadOptions extends StorageDownloadOptions {
 
 export interface StorageListOptions extends StorageOperationOptions {
   prefix?: string;
+  /**
+   * Opaque, non-consuming continuation token returned by `list`. Replaying a
+   * cursor with the same options against unchanged provider state must return
+   * an equivalent page and continuation cursor.
+   */
   cursor?: string;
   limit?: number;
   delimiter?: string;
@@ -147,6 +154,7 @@ export interface StorageListOptions extends StorageOperationOptions {
 export interface StorageListResult {
   items: StorageObjectMetadata[];
   prefixes?: string[];
+  /** Opaque replayable continuation token for the next page, when present. */
   cursor?: string;
 }
 

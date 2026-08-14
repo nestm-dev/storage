@@ -15,6 +15,10 @@ import type {
 import { fs, type FsAdapter, type FsAdapterOptions } from 'files-sdk/fs';
 
 import { StorageError, StorageErrorCode } from '../../storage.error.js';
+import {
+  isCanonicalStorageEtag,
+  normalizeProviderStorageEtag,
+} from '../../storage-etag.js';
 import type {
   StorageConditionalDeleteOptions,
   StorageConditionalReadOptions,
@@ -92,7 +96,6 @@ function storageFsError(
           ? StorageErrorCode.UNAUTHORIZED
           : StorageErrorCode.PROVIDER;
   return new StorageError(`Filesystem ${operation} failed for "${key}".`, {
-    cause: error,
     code,
     key,
     operation,
@@ -202,7 +205,6 @@ function assertActive(runtime: OperationRuntime, key: string): void {
       : `Filesystem mutation was aborted for "${key}".`,
     {
       aborted: true,
-      cause: runtime.signal.reason,
       code: timedOut ? StorageErrorCode.TIMEOUT : StorageErrorCode.ABORTED,
       key,
       permanent: true,
@@ -374,7 +376,16 @@ async function readSidecar(target: string, key: string): Promise<FsSidecar> {
         permanent: true,
       });
     }
-    return parsed as FsSidecar;
+    const sidecar = parsed as FsSidecar;
+    const etag = normalizeProviderStorageEtag(sidecar.etag);
+    if (etag === undefined) {
+      throw new StorageError(`Filesystem metadata is invalid for "${key}".`, {
+        code: StorageErrorCode.PROVIDER,
+        key,
+        permanent: true,
+      });
+    }
+    return { ...sidecar, etag };
   } finally {
     await handle.close();
   }
@@ -512,7 +523,7 @@ async function stageBody(
     await staged.handle.sync();
     await staged.handle.close();
     return {
-      etag: `"${hash.digest('hex')}"`,
+      etag: hash.digest('hex'),
       path: staged.path,
       size,
     };
@@ -626,6 +637,21 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
     }
     return serialize(headKey, () => serialize(tailKey, operation));
   };
+  const assertEtag = (
+    value: unknown,
+    label: string,
+    key: string,
+    operation: 'copy' | 'delete' | 'download' | 'upload',
+  ): void => {
+    if (!isCanonicalStorageEtag(value)) {
+      throw new StorageError(`${label} must be a canonical storage ETag.`, {
+        code: StorageErrorCode.INVALID_ARGUMENT,
+        key,
+        operation,
+        permanent: true,
+      });
+    }
+  };
 
   return Object.assign(base, {
     conditionalCreate: Object.freeze({ resultEtag: true }),
@@ -650,6 +676,9 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
       key: string,
       options: StorageConditionalReadOptions,
     ): Promise<StorageObject> {
+      if (options.condition.etag !== undefined) {
+        assertEtag(options.condition.etag, 'condition.etag', key, 'download');
+      }
       if (options.condition.version !== undefined) {
         throw new StorageError(
           'The filesystem provider has no immutable object versions.',
@@ -762,6 +791,7 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
       key: string,
       options: StorageConditionalDeleteOptions,
     ): Promise<void> {
+      assertEtag(options.condition.etag, 'condition.etag', key, 'delete');
       return serialize(key, async () => {
         const runtime = runtimeOf(options);
         try {
@@ -826,6 +856,17 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
             operation: 'copy',
             permanent: true,
           },
+        );
+      }
+      if (options.sourceEtag !== undefined) {
+        assertEtag(options.sourceEtag, 'sourceEtag', sourceKey, 'copy');
+      }
+      if (destination?.type === 'replace') {
+        assertEtag(
+          destination.etag,
+          'destination.etag',
+          destinationKey,
+          'copy',
         );
       }
       if (options.sourceVersion !== undefined) {
@@ -945,6 +986,9 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
       body: Body,
       options: StorageConditionalUploadOptions,
     ): Promise<StorageUploadResult> {
+      if (options.condition.type === 'replace') {
+        assertEtag(options.condition.etag, 'condition.etag', key, 'upload');
+      }
       return serialize(key, async () => {
         let bodyTemp: string | undefined;
         let sidecarTemp: string | undefined;

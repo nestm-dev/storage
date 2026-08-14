@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { StorageClient } from '../src/storage.client.js';
+import type { StorageDriver } from '../src/storage.driver.js';
 import { createFsStorageDriver } from '../src/files-sdk/fs/index.js';
 import {
   AWS_S3_PROVIDER_PROFILE,
@@ -133,17 +134,34 @@ describe('custom provider conformance declarations', () => {
       },
     });
   });
+
+  it('disables ambient endpoint overrides for version and cleanup helpers', () => {
+    const configuration: S3LiveConfiguration = {
+      accessKeyId: 'test-access-key',
+      bucket: 'test-bucket',
+      endpoint: 'https://explicit-endpoint.example.test',
+      forcePathStyle: true,
+      region: 'us-east-1',
+      secretAccessKey: 'test-secret-key',
+    };
+
+    expect(sdkConfiguration(configuration)).toMatchObject({
+      endpoint: configuration.endpoint,
+      ignoreConfiguredEndpointUrls: true,
+    });
+  });
 });
 
 registerConformanceSuite('Filesystem provider conformance', {
   async createFixture(): Promise<StorageProviderConformanceFixture> {
     const root = await mkdtemp(join(tmpdir(), 'nestm-storage-conformance-'));
+    const observed = observeDispatches(
+      createFsStorageDriver({ adapter: { root } }),
+    );
     return {
-      client: new StorageClient(
-        'filesystem-conformance',
-        createFsStorageDriver({ adapter: { root } }),
-      ),
+      client: new StorageClient('filesystem-conformance', observed.driver),
       close: () => rm(root, { force: true, recursive: true }),
+      dispatchCount: observed.dispatchCount,
     };
   },
   expected: FILESYSTEM_CAPABILITIES,
@@ -235,15 +253,18 @@ async function createS3Fixture(
   profile: Readonly<S3ProviderProfile>,
   versionAwareCleanup: boolean,
 ): Promise<StorageProviderConformanceFixture> {
-  const client = new StorageClient(
-    `${profile.name}-conformance`,
+  const observed = observeDispatches(
     createS3StorageDriver({
       adapter: adapterConfiguration(configuration),
       providerProfile: profile,
     }),
   );
+  const client = new StorageClient(
+    `${profile.name}-conformance`,
+    observed.driver,
+  );
   if (!versionAwareCleanup) {
-    return { client };
+    return { client, dispatchCount: observed.dispatchCount };
   }
 
   const raw = new S3Client(sdkConfiguration(configuration));
@@ -251,6 +272,7 @@ async function createS3Fixture(
     client,
     cleanup: (keys) => deleteS3ObjectVersions(raw, configuration.bucket, keys),
     close: () => raw.destroy(),
+    dispatchCount: observed.dispatchCount,
     async resolveVersion(key): Promise<string | undefined> {
       const result = await raw.send(
         new HeadObjectCommand({ Bucket: configuration.bucket, Key: key }),
@@ -276,6 +298,7 @@ function sdkConfiguration(configuration: S3LiveConfiguration) {
   return {
     credentials: credentials(configuration),
     forcePathStyle: configuration.forcePathStyle,
+    ignoreConfiguredEndpointUrls: true,
     region: configuration.region,
     ...(configuration.endpoint === undefined
       ? {}
@@ -291,6 +314,24 @@ function credentials(configuration: S3LiveConfiguration) {
       ? {}
       : { sessionToken: configuration.sessionToken }),
   };
+}
+
+function observeDispatches(driver: StorageDriver): {
+  readonly dispatchCount: () => number;
+  readonly driver: StorageDriver;
+} {
+  let dispatches = 0;
+  const observed = new Proxy(driver, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target) as unknown;
+      if (typeof value !== 'function') return value;
+      return (...args: unknown[]) => {
+        dispatches += 1;
+        return Reflect.apply(value, target, args);
+      };
+    },
+  });
+  return { dispatchCount: () => dispatches, driver: observed };
 }
 
 async function deleteS3ObjectVersions(

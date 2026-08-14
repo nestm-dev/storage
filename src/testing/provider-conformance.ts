@@ -1,7 +1,9 @@
 import { deepStrictEqual, equal, fail, match, ok } from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { inspect } from 'node:util';
 
 import type { StorageClient } from '../storage.client.js';
+import { isCanonicalStorageEtag } from '../storage-etag.js';
 import {
   isStorageError,
   StorageErrorCode,
@@ -16,6 +18,7 @@ import type {
   StorageConditionalReadCapability,
   StorageConditionalWriteCapability,
   StorageObject,
+  StorageListResult,
   StoragePhysicalKeyCapability,
   StorageUploadResult,
 } from '../storage.types.js';
@@ -45,6 +48,11 @@ export interface StorageProviderConformanceCapabilities {
 
 export interface StorageProviderConformanceFixture {
   readonly client: StorageClient;
+  /**
+   * Returns the number of operations dispatched to the provider driver. When
+   * supplied, the contract proves invalid inputs fail before provider I/O.
+   */
+  readonly dispatchCount?: () => number;
   /**
    * Resolves the current immutable version for a logical key. Providers that
    * advertise version predicates should supply this for a version-enabled
@@ -80,6 +88,7 @@ export interface StorageProviderConformanceCase {
 
 interface CaseContext {
   readonly client: StorageClient;
+  readonly dispatchCount?: () => number;
   key(label: string): string;
   resolveVersion(key: string): Promise<string | undefined>;
   track(key: string): string;
@@ -128,12 +137,17 @@ export function createStorageProviderConformanceCases(
       'performs baseline upload, read, and delete operations',
       async (context) => {
         const key = context.key('baseline.txt');
-        await context.client.upload(key, 'baseline');
+        await seed(context, key, 'baseline');
+        assertOptionalResultEtag(
+          await context.client.head(key),
+          'provider head returned a non-canonical ETag',
+        );
         equal(await readText(context.client, key), 'baseline');
         await context.client.delete(key);
         equal(await context.client.exists(key), false);
       },
     ),
+    listCursorReplayCase(options),
     providerCase(
       options,
       'rejects an over-budget physical key before dispatch',
@@ -147,6 +161,7 @@ export function createStorageProviderConformanceCases(
         equal(error.permanent, true);
       },
     ),
+    invalidPreconditionEtagCase(options),
     conditionalCreateCase(options),
     conditionalReplaceCase(options),
     conditionalDeleteCase(options),
@@ -156,7 +171,7 @@ export function createStorageProviderConformanceCases(
     conditionalCopySourceVersionCase(options),
     conditionalCopyDestinationCreateCase(options),
     conditionalCopyDestinationReplaceCase(options),
-    conditionalCopyAtomicityCase(options),
+    ...conditionalCopyAtomicityCases(options),
     conditionalMultipartCreateCase(options),
     conditionalMultipartReplaceCase(options),
     providerCase(
@@ -171,6 +186,128 @@ export function createStorageProviderConformanceCases(
       },
     ),
   ]);
+}
+
+function listCursorReplayCase(
+  options: StorageProviderConformanceOptions,
+): StorageProviderConformanceCase {
+  return providerCase(
+    options,
+    'replays list cursors without consuming or changing the page',
+    async (context) => {
+      const firstKey = context.key('cursor-replay/01.txt');
+      const prefix = firstKey.slice(0, -'01.txt'.length);
+      await seed(context, firstKey, '01.txt');
+      for (const name of ['02.txt', '03.txt']) {
+        await seed(context, context.track(`${prefix}${name}`), name);
+      }
+
+      const request = { limit: 1, prefix } as const;
+      const first = await context.client.list(request);
+      equal(first.items.length, 1, 'provider ignored the list page limit');
+      ok(
+        first.cursor !== undefined && first.cursor.length > 0,
+        'provider did not return a continuation cursor for a partial page',
+      );
+
+      const replayRequest = { ...request, cursor: first.cursor };
+      const expected = await context.client.list(replayRequest);
+      equal(expected.items.length, 1, 'provider ignored the replay page limit');
+      ok(
+        expected.cursor !== undefined && expected.cursor.length > 0,
+        'provider did not return a continuation cursor before the final page',
+      );
+
+      // Advance beyond the page before replaying its input token. A consuming
+      // cursor implementation will now fail or return a different page.
+      await context.client.list({ ...request, cursor: expected.cursor });
+      const replayed = await context.client.list(replayRequest);
+      deepStrictEqual(
+        comparableListPage(replayed),
+        comparableListPage(expected),
+        'reusing the same provider cursor changed its page or continuation state',
+      );
+    },
+  );
+}
+
+function comparableListPage(page: StorageListResult): unknown {
+  return {
+    cursor: page.cursor,
+    items: page.items.map((item) => ({
+      contentType: item.contentType,
+      etag: item.etag,
+      key: item.key,
+      lastModified: item.lastModified?.toISOString(),
+      metadata: item.metadata,
+      name: item.name,
+      size: item.size,
+    })),
+    prefixes: page.prefixes,
+  };
+}
+
+function invalidPreconditionEtagCase(
+  options: StorageProviderConformanceOptions,
+): StorageProviderConformanceCase {
+  return providerCase(
+    options,
+    'rejects invalid conditional ETags before dispatch or mutation',
+    async (context) => {
+      const source = context.key('invalid-etag-source.txt');
+      const destination = context.key('invalid-etag-destination.txt');
+      await seed(context, source, 'source-original');
+      await seed(context, destination, 'destination-original');
+
+      const countDispatches = context.dispatchCount;
+      const dispatchedBefore = countDispatches?.();
+      const invalidEtag = '"stale","current"';
+      const operations = [
+        () =>
+          context.client.uploadConditional(source, 'must-not-replace', {
+            condition: { etag: invalidEtag, type: 'replace' },
+          }),
+        () =>
+          context.client.downloadConditional(source, {
+            condition: { etag: invalidEtag },
+          }),
+        () =>
+          context.client.deleteConditional(source, {
+            condition: { etag: invalidEtag },
+          }),
+        () =>
+          context.client.promote(source, destination, {
+            sourceEtag: invalidEtag,
+          }),
+        () =>
+          context.client.promote(source, destination, {
+            destination: { etag: invalidEtag, type: 'replace' },
+          }),
+      ] as const;
+
+      for (const operation of operations) {
+        const error = await expectStorageError(
+          operation,
+          StorageErrorCode.INVALID_ARGUMENT,
+          options,
+        );
+        equal(error.permanent, true);
+      }
+
+      if (countDispatches !== undefined && dispatchedBefore !== undefined) {
+        equal(
+          countDispatches(),
+          dispatchedBefore,
+          'invalid conditional ETags reached the provider driver',
+        );
+      }
+      equal(await readText(context.client, source), 'source-original');
+      equal(
+        await readText(context.client, destination),
+        'destination-original',
+      );
+    },
+  );
 }
 
 function conditionalCreateCase(
@@ -331,7 +468,7 @@ function conditionalReadEtagCase(
         ),
         'observed',
       );
-      await context.client.upload(key, 'changed');
+      await seed(context, key, 'changed');
       await expectStorageError(
         () =>
           context.client.downloadConditional(key, {
@@ -372,7 +509,7 @@ function conditionalReadVersionCase(
       if (version === undefined) {
         return skippedVersion(options.provider);
       }
-      await context.client.upload(key, 'version-two');
+      await seed(context, key, 'version-two');
       equal(
         await objectText(
           await context.client.downloadConditional(key, {
@@ -413,7 +550,7 @@ function conditionalCopySourceEtagCase(
       await context.client.promote(source, destination, { sourceEtag: etag });
       equal(await readText(context.client, destination), 'source-one');
       const staleDestination = context.key('copy-source-etag-stale.txt');
-      await context.client.upload(source, 'source-two');
+      await seed(context, source, 'source-two');
       await expectStorageError(
         () =>
           context.client.promote(source, staleDestination, {
@@ -457,7 +594,7 @@ function conditionalCopySourceVersionCase(
       if (version === undefined) {
         return skippedVersion(options.provider);
       }
-      await context.client.upload(source, 'source-version-two');
+      await seed(context, source, 'source-version-two');
       await context.client.promote(source, destination, {
         sourceVersion: version,
       });
@@ -554,43 +691,317 @@ function conditionalCopyDestinationReplaceCase(
   );
 }
 
-function conditionalCopyAtomicityCase(
+type SourceCopyPredicate = 'etag' | 'version';
+type DestinationCopyPredicate = 'create' | 'replace';
+
+function conditionalCopyAtomicityCases(
   options: StorageProviderConformanceOptions,
-): StorageProviderConformanceCase {
+): readonly StorageProviderConformanceCase[] {
   const destination = options.expected.conditionalCopyDestination;
   const source = options.expected.conditionalCopySource;
-  const sourcePredicate =
-    source?.etag === true
-      ? 'etag'
-      : source?.version === true
-        ? 'version'
-        : undefined;
-  const destinationPredicate =
-    destination?.create === true
-      ? 'create'
-      : destination?.replace === true
-        ? 'replace'
-        : undefined;
-  const supported =
-    destination?.atomicWithSource === true &&
-    sourcePredicate !== undefined &&
-    destinationPredicate !== undefined;
+  const sources: SourceCopyPredicate[] = [
+    ...(source?.etag === true ? (['etag'] as const) : []),
+    ...(source?.version === true ? (['version'] as const) : []),
+  ];
+  const destinations: DestinationCopyPredicate[] = [
+    ...(destination?.create === true ? (['create'] as const) : []),
+    ...(destination?.replace === true ? (['replace'] as const) : []),
+  ];
+  if (sources.length === 0 || destinations.length === 0) {
+    return [conditionalCopyNonAtomicCase(options, 'etag', 'create')];
+  }
+  if (destination?.atomicWithSource !== true) {
+    return sources.flatMap((sourcePredicate) =>
+      destinations.map((destinationPredicate) =>
+        conditionalCopyNonAtomicCase(
+          options,
+          sourcePredicate,
+          destinationPredicate,
+        ),
+      ),
+    );
+  }
+
+  return sources.flatMap((sourcePredicate) =>
+    destinations.map((destinationPredicate) =>
+      providerCase(
+        options,
+        `combines ${sourcePredicate} source and ${destinationPredicate} destination copy predicates atomically`,
+        (context) =>
+          verifyAtomicCopyCombination(
+            context,
+            options,
+            sourcePredicate,
+            destinationPredicate,
+          ),
+      ),
+    ),
+  );
+}
+
+async function verifyAtomicCopyCombination(
+  context: CaseContext,
+  options: StorageProviderConformanceOptions,
+  sourcePredicate: SourceCopyPredicate,
+  destinationPredicate: DestinationCopyPredicate,
+): Promise<StorageProviderConformanceCaseResult | void> {
+  const label = `${sourcePredicate}-${destinationPredicate}`;
+  const sourceKey = context.key(`copy-atomic-${label}-source.txt`);
+  const destinationKey = context.key(`copy-atomic-${label}-result.txt`);
+  const original = await seed(context, sourceKey, 'source-original');
+  const originalSource = await sourceCopyCondition(
+    context,
+    sourceKey,
+    original,
+    sourcePredicate,
+  );
+  if (originalSource === undefined) return skippedVersion(options.provider);
+
+  const validDestination = await destinationCopyCondition(
+    context,
+    destinationKey,
+    destinationPredicate,
+    'destination-original',
+  );
+
+  const staleSource =
+    sourcePredicate === 'etag'
+      ? originalSource
+      : { sourceVersion: `missing-${randomUUID()}` };
+  if (sourcePredicate === 'etag') {
+    await seed(context, sourceKey, 'source-current');
+  }
+  await expectAnyStorageError(
+    () =>
+      context.client.promote(sourceKey, destinationKey, {
+        ...staleSource,
+        ...validDestination,
+      }),
+    options,
+  );
+  await assertDestinationContent(
+    context,
+    destinationKey,
+    destinationPredicate,
+    'destination-original',
+  );
+
+  const currentSource = await sourceCopyCondition(
+    context,
+    sourceKey,
+    await context.client.head(sourceKey),
+    sourcePredicate,
+  );
+  if (currentSource === undefined) return skippedVersion(options.provider);
+  const staleDestination = await staleDestinationCopyCondition(
+    context,
+    destinationKey,
+    destinationPredicate,
+  );
+  await expectStorageError(
+    () =>
+      context.client.promote(sourceKey, destinationKey, {
+        ...currentSource,
+        ...staleDestination,
+      }),
+    StorageErrorCode.CONFLICT,
+    options,
+  );
+  equal(await readText(context.client, destinationKey), 'destination-raced');
+
+  const successDestination = await currentDestinationCopyCondition(
+    context,
+    destinationKey,
+    destinationPredicate,
+  );
+  await context.client.promote(sourceKey, destinationKey, {
+    ...currentSource,
+    ...successDestination,
+  });
+  equal(
+    await readText(context.client, destinationKey),
+    sourcePredicate === 'etag' ? 'source-current' : 'source-original',
+  );
+
+  await verifyAtomicCopyRace(
+    context,
+    options,
+    sourcePredicate,
+    destinationPredicate,
+    label,
+  );
+}
+
+async function verifyAtomicCopyRace(
+  context: CaseContext,
+  options: StorageProviderConformanceOptions,
+  sourcePredicate: SourceCopyPredicate,
+  destinationPredicate: DestinationCopyPredicate,
+  label: string,
+): Promise<void> {
+  const staleSourceKey = context.key(`copy-race-${label}-stale.txt`);
+  const validSourceKey = context.key(`copy-race-${label}-valid.txt`);
+  const destinationKey = context.key(`copy-race-${label}-destination.txt`);
+  const staleResult = await seed(context, staleSourceKey, 'stale-original');
+  const observedStale = await sourceCopyCondition(
+    context,
+    staleSourceKey,
+    staleResult,
+    sourcePredicate,
+  );
+  ok(
+    observedStale !== undefined,
+    'versioned provider stopped resolving versions during the atomicity race',
+  );
+  const staleCondition =
+    sourcePredicate === 'etag'
+      ? observedStale
+      : { sourceVersion: `missing-${randomUUID()}` };
+  if (sourcePredicate === 'etag') {
+    await seed(context, staleSourceKey, 'stale-current');
+  }
+
+  const validResult = await seed(context, validSourceKey, 'race-winner');
+  const validCondition = await sourceCopyCondition(
+    context,
+    validSourceKey,
+    validResult,
+    sourcePredicate,
+  );
+  ok(
+    validCondition !== undefined,
+    'versioned provider did not resolve the valid race source version',
+  );
+  const destinationCondition = await destinationCopyCondition(
+    context,
+    destinationKey,
+    destinationPredicate,
+    'race-destination',
+  );
+
+  const staleAttempt = expectAnyStorageError(
+    () =>
+      context.client.promote(staleSourceKey, destinationKey, {
+        ...staleCondition,
+        ...destinationCondition,
+      }),
+    options,
+  );
+  await Promise.resolve();
+  const validAttempt = context.client.promote(validSourceKey, destinationKey, {
+    ...validCondition,
+    ...destinationCondition,
+  });
+  await Promise.all([staleAttempt, validAttempt]);
+  equal(await readText(context.client, destinationKey), 'race-winner');
+}
+
+async function sourceCopyCondition(
+  context: CaseContext,
+  key: string,
+  result: StorageUploadResult | { readonly etag?: string },
+  predicate: SourceCopyPredicate,
+): Promise<
+  | { readonly sourceEtag: string }
+  | { readonly sourceVersion: string }
+  | undefined
+> {
+  if (predicate === 'etag') {
+    return {
+      sourceEtag: await resultEtag(context.client, key, result),
+    };
+  }
+  const version = await context.resolveVersion(key);
+  return version === undefined ? undefined : { sourceVersion: version };
+}
+
+async function destinationCopyCondition(
+  context: CaseContext,
+  key: string,
+  predicate: DestinationCopyPredicate,
+  body: string,
+): Promise<
+  | { readonly destination: { readonly type: 'create' } }
+  | {
+      readonly destination: {
+        readonly etag: string;
+        readonly type: 'replace';
+      };
+    }
+> {
+  if (predicate === 'create') {
+    return { destination: { type: 'create' } };
+  }
+  const result = await seed(context, key, body);
+  return {
+    destination: {
+      etag: await resultEtag(context.client, key, result),
+      type: 'replace',
+    },
+  };
+}
+
+async function staleDestinationCopyCondition(
+  context: CaseContext,
+  key: string,
+  predicate: DestinationCopyPredicate,
+): ReturnType<typeof destinationCopyCondition> {
+  if (predicate === 'create') {
+    await seed(context, key, 'destination-raced');
+    return { destination: { type: 'create' } };
+  }
+  const observed = await context.client.head(key);
+  const etag = await resultEtag(context.client, key, observed);
+  await seed(context, key, 'destination-raced');
+  return { destination: { etag, type: 'replace' } };
+}
+
+async function currentDestinationCopyCondition(
+  context: CaseContext,
+  key: string,
+  predicate: DestinationCopyPredicate,
+): ReturnType<typeof destinationCopyCondition> {
+  if (predicate === 'create') {
+    await context.client.delete(key);
+    return { destination: { type: 'create' } };
+  }
+  const current = await context.client.head(key);
+  return {
+    destination: {
+      etag: await resultEtag(context.client, key, current),
+      type: 'replace',
+    },
+  };
+}
+
+async function assertDestinationContent(
+  context: CaseContext,
+  key: string,
+  predicate: DestinationCopyPredicate,
+  expected: string,
+): Promise<void> {
+  if (predicate === 'create') {
+    equal(await context.client.exists(key), false);
+  } else {
+    equal(await readText(context.client, key), expected);
+  }
+}
+
+function conditionalCopyNonAtomicCase(
+  options: StorageProviderConformanceOptions,
+  sourcePredicate: SourceCopyPredicate,
+  destinationPredicate: DestinationCopyPredicate,
+): StorageProviderConformanceCase {
   return providerCase(
     options,
-    supported
-      ? 'combines source and destination copy predicates atomically'
-      : 'fails closed when combined copy predicates are not atomic',
+    `fails closed for combined ${sourcePredicate} source and ${destinationPredicate} destination when copy predicates are not atomic`,
     async (context) => {
       const sourceKey = context.key('copy-atomic-source.txt');
       const destinationKey = context.key('copy-atomic-result.txt');
       const original = await seed(context, sourceKey, 'atomic-copy');
       let sourceCondition: { sourceEtag: string } | { sourceVersion: string };
       if (sourcePredicate === 'version') {
-        const version = supported
-          ? await context.resolveVersion(sourceKey)
-          : 'unsupported-version';
-        if (version === undefined) return skippedVersion(options.provider);
-        sourceCondition = { sourceVersion: version };
+        sourceCondition = { sourceVersion: 'unsupported-version' };
       } else {
         sourceCondition = {
           sourceEtag: await resultEtag(context.client, sourceKey, original),
@@ -610,25 +1021,27 @@ function conditionalCopyAtomicityCase(
             }
           : { destination: { type: 'create' as const } };
       const promotion = { ...sourceCondition, ...destinationCondition };
-      if (!supported) {
-        await expectStorageError(
-          () => context.client.promote(sourceKey, destinationKey, promotion),
-          StorageErrorCode.NOT_SUPPORTED,
-          options,
+      const dispatchedBefore = context.dispatchCount?.();
+      await expectStorageError(
+        () => context.client.promote(sourceKey, destinationKey, promotion),
+        StorageErrorCode.NOT_SUPPORTED,
+        options,
+      );
+      if (dispatchedBefore !== undefined) {
+        equal(
+          context.dispatchCount?.(),
+          dispatchedBefore,
+          'non-atomic combined promotion reached the provider driver',
         );
-        if (destinationPredicate === 'replace') {
-          equal(
-            await readText(context.client, destinationKey),
-            'destination-old',
-          );
-        } else {
-          equal(await context.client.exists(destinationKey), false);
-        }
-        return;
       }
-
-      await context.client.promote(sourceKey, destinationKey, promotion);
-      equal(await readText(context.client, destinationKey), 'atomic-copy');
+      if (destinationPredicate === 'replace') {
+        equal(
+          await readText(context.client, destinationKey),
+          'destination-old',
+        );
+      } else {
+        equal(await context.client.exists(destinationKey), false);
+      }
     },
   );
 }
@@ -660,10 +1073,14 @@ function conditionalMultipartCreateCase(
       }
 
       const body = multipartBody(options);
-      await context.client.uploadConditional(key, body, {
+      const result = await context.client.uploadConditional(key, body, {
         condition: { type: 'create' },
         multipart: { concurrency: 1, partSize: 5 * 1024 * 1024 },
       });
+      assertResultEtag(
+        result,
+        options.expected.conditionalCreate?.resultEtag === true,
+      );
       await expectStorageError(
         () =>
           context.client.uploadConditional(key, body, {
@@ -706,10 +1123,14 @@ function conditionalMultipartReplaceCase(
       }
 
       const body = multipartBody(options);
-      await context.client.uploadConditional(key, body, {
+      const result = await context.client.uploadConditional(key, body, {
         condition: { etag, type: 'replace' },
         multipart: { concurrency: 1, partSize: 5 * 1024 * 1024 },
       });
+      assertResultEtag(
+        result,
+        options.expected.conditionalReplace?.resultEtag === true,
+      );
       await expectStorageError(
         () =>
           context.client.uploadConditional(key, body, {
@@ -745,6 +1166,9 @@ async function withFixture(
   const namespace = `nestm-conformance/${safeSegment(options.provider)}/${randomUUID()}`;
   const context: CaseContext = {
     client: fixture.client,
+    ...(fixture.dispatchCount === undefined
+      ? {}
+      : { dispatchCount: fixture.dispatchCount }),
     key(label) {
       const key = `${namespace}/${label}`;
       keys.add(key);
@@ -835,16 +1259,24 @@ async function seed(
   body: string | Uint8Array,
 ): Promise<StorageUploadResult> {
   context.track(key);
-  return context.client.upload(key, body);
+  const result = await context.client.upload(key, body);
+  assertOptionalResultEtag(
+    result,
+    'provider upload returned a non-canonical ETag',
+  );
+  return result;
 }
 
 async function resultEtag(
   client: StorageClient,
   key: string,
-  result: StorageUploadResult,
+  result: { readonly etag?: string },
 ): Promise<string> {
   const etag = result.etag ?? (await client.head(key)).etag;
-  ok(etag !== undefined && etag.length > 0, 'provider did not return an ETag');
+  ok(
+    isCanonicalStorageEtag(etag),
+    'provider did not return a canonical bare strong ETag',
+  );
   return etag;
 }
 
@@ -852,12 +1284,23 @@ function assertResultEtag(
   result: StorageUploadResult,
   required: boolean,
 ): void {
+  assertOptionalResultEtag(
+    result,
+    'conditional write returned a non-canonical ETag',
+  );
   if (required) {
     ok(
-      result.etag !== undefined && result.etag.length > 0,
+      isCanonicalStorageEtag(result.etag),
       'conditional write committed without the advertised result ETag',
     );
   }
+}
+
+function assertOptionalResultEtag(
+  result: { readonly etag?: string },
+  message: string,
+): void {
+  ok(result.etag === undefined || isCanonicalStorageEtag(result.etag), message);
 }
 
 async function readText(client: StorageClient, key: string): Promise<string> {
@@ -865,6 +1308,10 @@ async function readText(client: StorageClient, key: string): Promise<string> {
 }
 
 async function objectText(object: StorageObject): Promise<string> {
+  assertOptionalResultEtag(
+    object,
+    'provider download returned a non-canonical ETag',
+  );
   return new Response(object.body).text();
 }
 
@@ -884,10 +1331,25 @@ async function expectStorageError(
   fail(`provider operation unexpectedly succeeded; expected ${code}`);
 }
 
+async function expectAnyStorageError(
+  operation: () => Promise<unknown>,
+  options: StorageProviderConformanceOptions,
+): Promise<StorageError> {
+  try {
+    await operation();
+  } catch (error: unknown) {
+    ok(isStorageError(error), 'provider operation did not return StorageError');
+    assertSanitizedError(error, options.forbiddenErrorValues ?? []);
+    return error;
+  }
+  fail('provider operation unexpectedly succeeded');
+}
+
 function assertSanitizedError(
   error: StorageError,
   forbiddenValues: readonly string[],
 ): void {
+  equal(error.cause, undefined, 'public storage error retained a raw cause');
   ok(error.message.length <= 512, 'public storage error is unexpectedly large');
   match(
     error.message,
@@ -898,11 +1360,16 @@ function assertSanitizedError(
     !/<(?:Error|Code|Message|RequestId|HostId)>/iu.test(error.message),
     'public storage error contains a serialized provider response',
   );
+  const serialized = `${inspect(error, { depth: null })}\n${JSON.stringify({ error })}`;
+  ok(
+    !/(?:\$metadata|request.?id|host.?id|<Error>|<Message>)/iu.test(serialized),
+    'public storage error serialization contains provider response metadata',
+  );
   for (const value of forbiddenValues) {
     if (value.length > 0) {
       ok(
-        !error.message.includes(value),
-        'public storage error contains a forbidden provider configuration value',
+        !serialized.includes(value),
+        'public storage error serialization contains a forbidden provider value',
       );
     }
   }

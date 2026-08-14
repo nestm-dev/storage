@@ -29,6 +29,10 @@ const tarballPath = join(temporaryRoot, 'nestm-storage.tgz');
 const rootPackage = JSON.parse(
   readFileSync(join(projectRoot, 'package.json'), 'utf8'),
 );
+const minimumS3PeerVersion = caretMinimum(
+  rootPackage.peerDependencies?.['@aws-sdk/client-s3'],
+  '@aws-sdk/client-s3',
+);
 
 try {
   run('pnpm', ['pack', '--out', tarballPath], projectRoot);
@@ -43,14 +47,10 @@ try {
         private: true,
         type: 'module',
         dependencies: {
-          '@aws-sdk/client-s3':
-            rootPackage.devDependencies['@aws-sdk/client-s3'],
-          '@aws-sdk/lib-storage':
-            rootPackage.devDependencies['@aws-sdk/lib-storage'],
-          '@aws-sdk/s3-presigned-post':
-            rootPackage.devDependencies['@aws-sdk/s3-presigned-post'],
-          '@aws-sdk/s3-request-presigner':
-            rootPackage.devDependencies['@aws-sdk/s3-request-presigner'],
+          '@aws-sdk/client-s3': minimumS3PeerVersion,
+          '@aws-sdk/lib-storage': minimumS3PeerVersion,
+          '@aws-sdk/s3-presigned-post': minimumS3PeerVersion,
+          '@aws-sdk/s3-request-presigner': minimumS3PeerVersion,
           '@nestm/storage': `file:${tarballPath}`,
         },
         devDependencies: {
@@ -88,6 +88,10 @@ try {
     )}\n`,
   );
   writeFileSync(join(consumerRoot, 'src', 'smoke.ts'), getConsumerSource());
+  writeFileSync(
+    join(consumerRoot, 's3-minimum-peer.mjs'),
+    getS3MinimumPeerSource(minimumS3PeerVersion),
+  );
 
   run(
     'npm',
@@ -101,6 +105,7 @@ try {
 
   run('npm', ['exec', '--', 'tsc', '-p', '.'], consumerRoot);
   run(process.execPath, ['dist/smoke.js'], consumerRoot);
+  run(process.execPath, ['s3-minimum-peer.mjs'], consumerRoot);
 } finally {
   rmSync(temporaryRoot, { force: true, recursive: true });
 }
@@ -111,6 +116,16 @@ function run(command, arguments_, cwd) {
     env: process.env,
     stdio: 'inherit',
   });
+}
+
+function caretMinimum(range, packageName) {
+  const match = /^\^(\d+\.\d+\.\d+)$/.exec(range ?? '');
+  if (match?.[1] === undefined) {
+    throw new Error(
+      `${packageName} must use one exact caret peer range for the packed minimum-peer test.`,
+    );
+  }
+  return match[1];
 }
 
 function getConsumerSource() {
@@ -324,5 +339,101 @@ assert.equal(await client.downloadText('hello.txt'), 'hello core');
 await client.onApplicationShutdown();
 await client.onApplicationShutdown();
 assert.equal(closeCalls, 1);
+`;
+}
+
+function getS3MinimumPeerSource(minimumVersion) {
+  return `import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+
+import { S3Client } from '@aws-sdk/client-s3';
+import { StorageClient } from '@nestm/storage/core';
+import { createS3StorageDriver } from '@nestm/storage/files-sdk/s3';
+
+const require = createRequire(import.meta.url);
+const clientS3Package = require('@aws-sdk/client-s3/package.json');
+assert.equal(clientS3Package.version, '${minimumVersion}');
+
+const serializedRequests = [];
+const instrumentedClients = new WeakSet();
+const originalSend = S3Client.prototype.send;
+process.env.AWS_ENDPOINT_URL_S3 = 'https://minimum-peer-redirect.invalid';
+process.env.AWS_IGNORE_CONFIGURED_ENDPOINT_URLS = 'false';
+
+S3Client.prototype.send = function (...arguments_) {
+  if (!instrumentedClients.has(this)) {
+    this.middlewareStack.add(
+      () => async (middlewareArguments) => {
+        serializedRequests.push(middlewareArguments.request);
+        return {
+          output: { $metadata: { httpStatusCode: 200 } },
+          response: { headers: {}, statusCode: 200 },
+        };
+      },
+      {
+        name: 'captureSerializedCopyDestinationConditions',
+        priority: 'high',
+        step: 'finalizeRequest',
+      },
+    );
+    instrumentedClients.add(this);
+  }
+  return Reflect.apply(originalSend, this, arguments_);
+};
+
+try {
+  const client = new StorageClient(
+    'minimum-peer',
+    createS3StorageDriver({
+      adapter: {
+        bucket: 'minimum-peer-bucket',
+        credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+        region: 'us-east-1',
+      },
+    }),
+  );
+
+  await client.promote('source.txt', 'create.txt', {
+    destination: { type: 'create' },
+    sourceEtag: 'source-etag',
+  });
+  await client.promote('source.txt', 'replace.txt', {
+    destination: { etag: 'destination-etag', type: 'replace' },
+    sourceEtag: 'source-etag',
+  });
+
+  assert.equal(serializedRequests.length, 2);
+  const [createRequest, replaceRequest] = serializedRequests;
+  assert.ok(createRequest);
+  assert.ok(replaceRequest);
+  assert.equal(
+    createRequest.hostname,
+    'minimum-peer-bucket.s3.us-east-1.amazonaws.com',
+  );
+  assert.equal(
+    replaceRequest.hostname,
+    'minimum-peer-bucket.s3.us-east-1.amazonaws.com',
+  );
+
+  assert.equal(createRequest.headers['if-none-match'], '*');
+  assert.equal(createRequest.headers['if-match'], undefined);
+  assert.equal(
+    createRequest.headers['x-amz-copy-source-if-match'],
+    '"source-etag"',
+  );
+
+  assert.equal(replaceRequest.headers['if-match'], '"destination-etag"');
+  assert.equal(replaceRequest.headers['if-none-match'], undefined);
+  assert.equal(
+    replaceRequest.headers['x-amz-copy-source-if-match'],
+    '"source-etag"',
+  );
+
+  await client.onApplicationShutdown();
+} finally {
+  S3Client.prototype.send = originalSend;
+  delete process.env.AWS_ENDPOINT_URL_S3;
+  delete process.env.AWS_IGNORE_CONFIGURED_ENDPOINT_URLS;
+}
 `;
 }

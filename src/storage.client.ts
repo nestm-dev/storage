@@ -1,4 +1,5 @@
 import { settleMany } from './internal/settle-many.js';
+import { isCanonicalStorageEtag } from './storage-etag.js';
 import {
   StorageError,
   StorageErrorCode,
@@ -317,9 +318,9 @@ export class StorageClient {
     }
     if (
       condition.type === 'replace' &&
-      (typeof condition.etag !== 'string' || condition.etag.length === 0)
+      !isCanonicalStorageEtag(condition.etag)
     ) {
-      invalidArgument('condition.etag must be a non-empty string.');
+      invalidArgument('condition.etag must be a canonical storage ETag.');
     }
 
     const capability =
@@ -384,8 +385,8 @@ export class StorageClient {
       invalidArgument('conditional read requires a condition object.');
     }
     const { etag, version } = options.condition;
-    if (etag !== undefined && (typeof etag !== 'string' || etag.length === 0)) {
-      invalidArgument('condition.etag must be a non-empty string.');
+    if (etag !== undefined && !isCanonicalStorageEtag(etag)) {
+      invalidArgument('condition.etag must be a canonical storage ETag.');
     }
     if (
       version !== undefined &&
@@ -488,10 +489,9 @@ export class StorageClient {
     assertKey(key);
     if (
       options.condition === undefined ||
-      typeof options.condition.etag !== 'string' ||
-      options.condition.etag.length === 0
+      !isCanonicalStorageEtag(options.condition.etag)
     ) {
-      invalidArgument('condition.etag must be a non-empty string.');
+      invalidArgument('condition.etag must be a canonical storage ETag.');
     }
 
     const capability = this.#driver.capabilities.conditionalDelete;
@@ -563,11 +563,8 @@ export class StorageClient {
     assertKey(destinationKey, 'destination key');
     const sourceEtag = options.sourceEtag;
     const sourceVersion = options.sourceVersion;
-    if (
-      sourceEtag !== undefined &&
-      (typeof sourceEtag !== 'string' || sourceEtag.length === 0)
-    ) {
-      invalidArgument('sourceEtag must be a non-empty string.');
+    if (sourceEtag !== undefined && !isCanonicalStorageEtag(sourceEtag)) {
+      invalidArgument('sourceEtag must be a canonical storage ETag.');
     }
     if (
       sourceVersion !== undefined &&
@@ -593,9 +590,9 @@ export class StorageClient {
     }
     if (
       destination?.type === 'replace' &&
-      (typeof destination.etag !== 'string' || destination.etag.length === 0)
+      !isCanonicalStorageEtag(destination.etag)
     ) {
-      invalidArgument('destination.etag must be a non-empty string.');
+      invalidArgument('destination.etag must be a canonical storage ETag.');
     }
 
     const sourceCapability = this.#driver.capabilities.conditionalCopySource;

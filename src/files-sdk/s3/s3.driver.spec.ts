@@ -4,10 +4,14 @@ import {
   CreateMultipartUploadCommand,
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   PutObjectCommand,
   S3Client,
   UploadPartCommand,
 } from '@aws-sdk/client-s3';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { inspect } from 'node:util';
 
@@ -22,6 +26,8 @@ import {
   CLOUDFLARE_R2_PROVIDER_PROFILE,
   createS3StorageDriver,
   defineS3ProviderProfile,
+  s3,
+  withS3Capabilities,
 } from './index.js';
 
 const adapter = {
@@ -33,6 +39,10 @@ const adapter = {
   region: 'us-east-1',
 } as const;
 
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 async function rejectedStorageError(
   operation: () => Promise<unknown>,
 ): Promise<StorageError> {
@@ -43,6 +53,53 @@ async function rejectedStorageError(
     throw error;
   }
   throw new Error('Expected the storage operation to reject.');
+}
+
+async function resolvedHeadHostname(client: S3Client): Promise<string> {
+  let hostname: string | undefined;
+  client.middlewareStack.add(
+    () => async (arguments_) => {
+      const request = arguments_.request as { readonly hostname?: unknown };
+      if (typeof request.hostname !== 'string') {
+        throw new TypeError('S3 request did not resolve a hostname.');
+      }
+      hostname = request.hostname;
+      return {
+        output: { $metadata: {} },
+        response: { headers: {}, statusCode: 200 },
+      } as never;
+    },
+    {
+      name: 'captureEndpointWithoutDispatch',
+      priority: 'high',
+      step: 'finalizeRequest',
+    },
+  );
+  await client.send(
+    new HeadObjectCommand({ Bucket: adapter.bucket, Key: 'endpoint-probe' }),
+  );
+  if (hostname === undefined) {
+    throw new TypeError('S3 request did not reach endpoint resolution.');
+  }
+  return hostname;
+}
+
+async function expectFactoryIgnoresConfiguredEndpoints(): Promise<void> {
+  const send = vi
+    .spyOn(S3Client.prototype, 'send')
+    .mockResolvedValue({ ContentLength: 0 } as never);
+  const client = new StorageClient(
+    'endpoint-provenance',
+    createS3StorageDriver({ adapter }),
+  );
+  try {
+    await client.head('endpoint-probe');
+    const sdkClient = send.mock.instances[0] as S3Client | undefined;
+    expect(sdkClient?.config.ignoreConfiguredEndpointUrls).toBe(true);
+  } finally {
+    await client.onApplicationShutdown();
+    send.mockRestore();
+  }
 }
 
 describe('createS3StorageDriver', () => {
@@ -68,6 +125,149 @@ describe('createS3StorageDriver', () => {
       signedDownloadPolicy: { expiresIn: true },
       signedUploadPolicy: { contentType: true, sizeRange: true },
     });
+  });
+
+  it.each([
+    ['AWS_ENDPOINT_URL', 'https://global-redirect.invalid'],
+    ['AWS_ENDPOINT_URL_S3', 'https://service-redirect.invalid'],
+  ] as const)(
+    'ignores the configured %s endpoint for inferred native AWS',
+    async (variable, redirect) => {
+      vi.stubEnv('AWS_ENDPOINT_URL', '');
+      vi.stubEnv('AWS_ENDPOINT_URL_S3', '');
+      vi.stubEnv('AWS_IGNORE_CONFIGURED_ENDPOINT_URLS', 'false');
+      vi.stubEnv(variable, redirect);
+
+      const base = s3(adapter);
+      try {
+        withS3Capabilities(base);
+        expect(base.raw.config.ignoreConfiguredEndpointUrls).toBe(true);
+        expect(await resolvedHeadHostname(base.raw)).toBe(
+          'private-bucket.s3.us-east-1.amazonaws.com',
+        );
+      } finally {
+        base.raw.destroy();
+      }
+      await expectFactoryIgnoresConfiguredEndpoints();
+    },
+  );
+
+  it.each([
+    [
+      'profile endpoint_url',
+      '[profile endpoint-provenance]\nendpoint_url = https://shared-profile-redirect.invalid\n',
+    ],
+    [
+      'service-specific endpoint_url',
+      '[profile endpoint-provenance]\nservices = endpoint-provenance-services\n\n[services endpoint-provenance-services]\ns3 =\n  endpoint_url = https://shared-service-redirect.invalid\n',
+    ],
+  ] as const)(
+    'ignores a shared-config %s for inferred native AWS',
+    async (_description, contents) => {
+      const directory = await mkdtemp(
+        join(tmpdir(), 'nestm-s3-endpoint-provenance-'),
+      );
+      const configFile = join(directory, 'config');
+      await writeFile(configFile, contents, 'utf8');
+      vi.stubEnv('AWS_CONFIG_FILE', configFile);
+      vi.stubEnv('AWS_PROFILE', 'endpoint-provenance');
+      vi.stubEnv('AWS_ENDPOINT_URL', '');
+      vi.stubEnv('AWS_ENDPOINT_URL_S3', '');
+      vi.stubEnv('AWS_IGNORE_CONFIGURED_ENDPOINT_URLS', 'false');
+
+      const base = s3(adapter);
+      try {
+        withS3Capabilities(base);
+        expect(base.raw.config.ignoreConfiguredEndpointUrls).toBe(true);
+        expect(await resolvedHeadHostname(base.raw)).toBe(
+          'private-bucket.s3.us-east-1.amazonaws.com',
+        );
+        await expectFactoryIgnoresConfiguredEndpoints();
+      } finally {
+        base.raw.destroy();
+        await rm(directory, { force: true, recursive: true });
+      }
+    },
+  );
+
+  it('derives direct-helper endpoint provenance and rejects a declared mismatch', async () => {
+    const unverifiedCustom = s3({
+      ...adapter,
+      endpoint: 'https://audited.objects.example.test',
+    });
+    const verified = defineS3ProviderProfile({
+      name: 'audited-endpoint',
+      physicalKey: { maxBytes: 1024 },
+      conditionalRead: { etag: true, version: false },
+    });
+    try {
+      const unverified = withS3Capabilities(unverifiedCustom);
+      expect(unverified.conditionalCreate).toBeUndefined();
+      expect(unverified.conditionalRead).toBeUndefined();
+    } finally {
+      unverifiedCustom.raw.destroy();
+    }
+
+    const auditedCustom = s3({
+      ...adapter,
+      endpoint: 'https://audited.objects.example.test',
+    });
+    try {
+      const audited = withS3Capabilities(auditedCustom, {
+        providerProfile: verified,
+      });
+      expect(audited.conditionalRead).toEqual({ etag: true, version: false });
+      expect(await resolvedHeadHostname(auditedCustom.raw)).toBe(
+        'private-bucket.audited.objects.example.test',
+      );
+    } finally {
+      auditedCustom.raw.destroy();
+    }
+
+    const native = s3(adapter);
+    try {
+      expect(() =>
+        withS3Capabilities(native, {
+          endpoint: 'https://undeclared-on-client.invalid',
+        }),
+      ).toThrow(/does not match the SDK client endpoint provenance/u);
+    } finally {
+      native.raw.destroy();
+    }
+  });
+
+  it('rejects capability decoration reapplication instead of retaining a broader profile', () => {
+    const custom = s3({
+      ...adapter,
+      endpoint: 'https://audited.objects.example.test',
+    });
+    const narrow = defineS3ProviderProfile({
+      name: 'read-only-audited-endpoint',
+      physicalKey: { maxBytes: 1024 },
+      conditionalRead: { etag: true, version: false },
+    });
+    try {
+      const broad = withS3Capabilities(custom, {
+        providerProfile: AWS_S3_PROVIDER_PROFILE,
+      });
+      expect(broad.conditionalCreate).toEqual({ resultEtag: true });
+      expect(() => withS3Capabilities(custom)).toThrow(
+        /may only be applied once/u,
+      );
+      expect(() =>
+        withS3Capabilities(custom, { providerProfile: narrow }),
+      ).toThrow(/may only be applied once/u);
+      expect(() =>
+        withS3Capabilities(new Proxy(custom, {}), {
+          providerProfile: narrow,
+        }),
+      ).toThrow(/may only be applied once/u);
+      expect(() =>
+        withS3Capabilities({ ...custom }, { providerProfile: narrow }),
+      ).toThrow(/may only be applied once/u);
+    } finally {
+      custom.raw.destroy();
+    }
   });
 
   it('puts source and destination predicates in one prefixed copy request', async () => {
@@ -229,7 +429,7 @@ describe('createS3StorageDriver', () => {
 
     await expect(
       client.uploadConditional('large.bin', new Uint8Array([1, 2, 3]), {
-        condition: { type: 'create' },
+        condition: { etag: 'previous', type: 'replace' },
         multipart: true,
       }),
     ).resolves.toMatchObject({ etag: 'complete', key: 'large.bin', size: 3 });
@@ -242,28 +442,95 @@ describe('createS3StorageDriver', () => {
     expect(complete).toBeInstanceOf(CompleteMultipartUploadCommand);
     expect((complete as CompleteMultipartUploadCommand).input).toMatchObject({
       Bucket: 'private-bucket',
-      IfNoneMatch: '*',
+      IfMatch: '"previous"',
       Key: 'large.bin',
       UploadId: 'upload-1',
     });
   });
 
-  it('fails closed when S3 omits the advertised result ETag', async () => {
-    vi.spyOn(S3Client.prototype, 'send').mockResolvedValue({} as never);
+  it('fails closed when S3 omits or returns a malformed result ETag', async () => {
+    const send = vi.spyOn(S3Client.prototype, 'send');
     const client = new StorageClient(
       'objects',
       createS3StorageDriver({ adapter }),
     );
 
-    await expect(
-      client.uploadConditional('ambiguous.txt', 'body', {
-        condition: { type: 'create' },
-      }),
-    ).rejects.toMatchObject({
-      code: StorageErrorCode.PROVIDER,
-      key: 'ambiguous.txt',
-      permanent: true,
-    });
+    const invalidProviderEtags = [
+      undefined,
+      '"stale","current"',
+      'W/"weak"',
+      '"*"',
+      '"etag\\value"',
+      '"etag\r\ninjected"',
+      '""etag""',
+      '"café"',
+    ];
+    for (const ETag of invalidProviderEtags) {
+      send.mockResolvedValueOnce({ ETag } as never);
+      await expect(
+        client.uploadConditional('ambiguous.txt', 'body', {
+          condition: { type: 'create' },
+        }),
+      ).rejects.toMatchObject({
+        code: StorageErrorCode.PROVIDER,
+        permanent: true,
+      });
+    }
+  });
+
+  it('rejects every non-canonical precondition before any S3 request', async () => {
+    const send = vi.spyOn(S3Client.prototype, 'send');
+    const driver = createS3StorageDriver({ adapter });
+    const invalidEtags = [
+      '*',
+      'W/"etag"',
+      'w/etag',
+      '"etag"',
+      '"stale","current"',
+      'stale,current',
+      'etag\\value',
+      ' etag',
+      'etag\r\nif-match:*',
+      'café',
+    ];
+
+    for (const etag of invalidEtags) {
+      const operations: Array<() => Promise<unknown>> = [
+        () =>
+          driver.uploadConditional!('single.txt', 'body', {
+            condition: { etag, type: 'replace' },
+          }),
+        () =>
+          driver.uploadConditional!('multipart.txt', 'body', {
+            condition: { etag, type: 'replace' },
+            multipart: true,
+          }),
+        () =>
+          driver.downloadConditional!('read.txt', {
+            condition: { etag },
+          }),
+        () =>
+          driver.deleteConditional!('delete.txt', {
+            condition: { etag },
+          }),
+        () =>
+          driver.promote!('source.txt', 'destination.txt', {
+            sourceEtag: etag,
+          }),
+        () =>
+          driver.promote!('source.txt', 'destination.txt', {
+            destination: { etag, type: 'replace' },
+          }),
+      ];
+      for (const operation of operations) {
+        await expect(operation()).rejects.toMatchObject({
+          code: StorageErrorCode.INVALID_ARGUMENT,
+          permanent: true,
+        });
+      }
+    }
+
+    expect(send).not.toHaveBeenCalled();
   });
 
   it('keeps unverified endpoints fail-closed and gives R2 its own profile', async () => {
@@ -420,7 +687,7 @@ describe('createS3StorageDriver', () => {
     );
     expect(precondition).toMatchObject({
       code: StorageErrorCode.CONFLICT,
-      message: 'Conditional S3 upload failed.',
+      message: 'Storage provider operation conflicted with current state.',
       permanent: true,
     });
     const concurrent = await rejectedStorageError(() =>
@@ -430,7 +697,7 @@ describe('createS3StorageDriver', () => {
     );
     expect(concurrent).toMatchObject({
       code: StorageErrorCode.CONFLICT,
-      message: 'Conditional S3 copy failed.',
+      message: 'Storage provider operation conflicted with current state.',
       permanent: false,
     });
     const missing = await rejectedStorageError(() =>
@@ -440,7 +707,7 @@ describe('createS3StorageDriver', () => {
     );
     expect(missing).toMatchObject({
       code: StorageErrorCode.NOT_FOUND,
-      message: 'Conditional S3 download failed.',
+      message: 'Storage provider object was not found.',
       permanent: true,
     });
 

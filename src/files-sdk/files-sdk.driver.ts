@@ -23,6 +23,10 @@ import {
   StorageErrorCode,
   isStorageError,
 } from '../storage.error.js';
+import {
+  isCanonicalStorageEtag,
+  normalizeProviderStorageEtag,
+} from '../storage-etag.js';
 import type { StorageDriver } from '../storage.driver.js';
 import type {
   StorageBody,
@@ -347,24 +351,54 @@ function unwrapFilesError(error: FilesErrorLike): FilesErrorLike {
   return current;
 }
 
+const PUBLIC_PROVIDER_ERROR_MESSAGES: Readonly<
+  Record<StorageErrorCode, string>
+> = Object.freeze({
+  [StorageErrorCode.NOT_FOUND]: 'Storage provider object was not found.',
+  [StorageErrorCode.UNAUTHORIZED]:
+    'Storage provider operation was unauthorized.',
+  [StorageErrorCode.CONFLICT]:
+    'Storage provider operation conflicted with current state.',
+  [StorageErrorCode.READ_ONLY]: 'Storage provider is read-only.',
+  [StorageErrorCode.INVALID_ARGUMENT]:
+    'Storage provider rejected an invalid argument.',
+  [StorageErrorCode.NOT_SUPPORTED]:
+    'Storage provider operation is not supported.',
+  [StorageErrorCode.ABORTED]: 'Storage provider operation was aborted.',
+  [StorageErrorCode.TIMEOUT]: 'Storage provider operation timed out.',
+  [StorageErrorCode.LIMIT_EXCEEDED]:
+    'Storage provider operation exceeded a limit.',
+  [StorageErrorCode.PROVIDER]: 'Storage provider operation failed.',
+});
+
+function sanitizedStorageError(error: StorageError): StorageError {
+  return new StorageError(PUBLIC_PROVIDER_ERROR_MESSAGES[error.code], {
+    aborted: error.aborted,
+    code: error.code,
+    permanent: error.permanent,
+    timedOut: error.timedOut,
+  });
+}
+
 export function mapFilesSdkError(error: unknown): StorageError {
-  if (isStorageError(error)) {
-    return error;
-  }
+  if (isStorageError(error)) return sanitizedStorageError(error);
   if (!isFilesErrorLike(error)) {
-    return new StorageError(
-      error instanceof Error ? error.message : String(error),
-      {
-        cause: error,
-        code: StorageErrorCode.PROVIDER,
-      },
-    );
+    return new StorageError('Storage provider operation failed.', {
+      code: StorageErrorCode.PROVIDER,
+    });
   }
 
   const filesError = unwrapFilesError(error);
 
-  if (isStorageError(filesError.cause)) {
-    return filesError.cause;
+  if (
+    filesError.code === 'Provider' &&
+    !filesError.aborted &&
+    !filesError.timedOut &&
+    !filesError.permanent &&
+    isStorageError(filesError.cause) &&
+    filesError.message === filesError.cause.message
+  ) {
+    return sanitizedStorageError(filesError.cause);
   }
 
   let code: StorageErrorCode;
@@ -396,9 +430,8 @@ export function mapFilesSdkError(error: unknown): StorageError {
     }
   }
 
-  return new StorageError(filesError.message, {
+  return new StorageError(PUBLIC_PROVIDER_ERROR_MESSAGES[code], {
     aborted: filesError.aborted,
-    cause: filesError.cause ?? error,
     code,
     permanent: filesError.permanent,
     timedOut: filesError.timedOut,
@@ -651,10 +684,47 @@ function signedUploadOptions(
   };
 }
 
-function metadataOf(file: StoredFile): StorageObjectMetadata {
+function providerEtag(
+  value: unknown,
+  key: string,
+  operation: 'download' | 'head' | 'list' | 'search' | 'upload',
+): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const etag = normalizeProviderStorageEtag(value);
+  if (etag === undefined) {
+    throw new StorageError('Storage adapter returned an invalid ETag.', {
+      code: StorageErrorCode.PROVIDER,
+      key,
+      operation,
+      permanent: true,
+    });
+  }
+  return etag;
+}
+
+function invalidConditionalEtag(
+  label: string,
+  key: string,
+  operation: 'delete' | 'download' | 'promote' | 'upload',
+): StorageError {
+  return new StorageError(`${label} must be a canonical storage ETag.`, {
+    code: StorageErrorCode.INVALID_ARGUMENT,
+    key,
+    operation,
+    permanent: true,
+  });
+}
+
+function metadataOf(
+  file: StoredFile,
+  operation: 'download' | 'head' | 'list' | 'search',
+): StorageObjectMetadata {
+  const etag = providerEtag(file.etag, file.key, operation);
   return {
     contentType: file.type,
-    ...(file.etag !== undefined && { etag: file.etag }),
+    ...(etag !== undefined && { etag }),
     key: file.key,
     ...(file.lastModified !== undefined && {
       lastModified: new Date(file.lastModified),
@@ -668,9 +738,10 @@ function metadataOf(file: StoredFile): StorageObjectMetadata {
 }
 
 function uploadResultOf(result: UploadResult): StorageUploadResult {
+  const etag = providerEtag(result.etag, result.key, 'upload');
   return {
     contentType: result.contentType,
-    ...(result.etag !== undefined && { etag: result.etag }),
+    ...(etag !== undefined && { etag }),
     key: result.key,
     ...(result.lastModified !== undefined && {
       lastModified: new Date(result.lastModified),
@@ -809,6 +880,14 @@ export class FilesSdkStorageDriver<
     body: StorageBody,
     options: StorageConditionalUploadOptions,
   ): Promise<StorageUploadResult> {
+    if (
+      options.condition.type === 'replace' &&
+      !isCanonicalStorageEtag(options.condition.etag)
+    ) {
+      return Promise.reject(
+        invalidConditionalEtag('condition.etag', key, 'upload'),
+      );
+    }
     if (this.#readOnly) {
       return Promise.reject(
         new StorageError(
@@ -870,7 +949,12 @@ export class FilesSdkStorageDriver<
           },
         );
       }
-      return { ...result, key };
+      const etag = providerEtag(result.etag, key, 'upload');
+      return {
+        ...result,
+        ...(etag === undefined ? {} : { etag }),
+        key,
+      };
     });
   }
 
@@ -882,7 +966,7 @@ export class FilesSdkStorageDriver<
     return this.#call(async () => {
       const file = await this.#files.download(key, downloadOptions(options));
       return {
-        ...metadataOf(file),
+        ...metadataOf(file, 'download'),
         body: normalizeDownloadStream(file.stream()),
       };
     });
@@ -892,6 +976,14 @@ export class FilesSdkStorageDriver<
     key: string,
     options: StorageConditionalReadOptions,
   ): Promise<StorageObject> {
+    if (
+      options.condition.etag !== undefined &&
+      !isCanonicalStorageEtag(options.condition.etag)
+    ) {
+      return Promise.reject(
+        invalidConditionalEtag('condition.etag', key, 'download'),
+      );
+    }
     const adapter = this.#conditionalRead;
     if (
       adapter === undefined ||
@@ -929,9 +1021,17 @@ export class FilesSdkStorageDriver<
           },
         );
       }
+      let etag: string | undefined;
+      try {
+        etag = providerEtag(object.etag, key, 'download');
+      } catch (error) {
+        await object.body.cancel(error).catch(() => undefined);
+        throw error;
+      }
       return {
         ...object,
         body: normalizeDownloadStream(object.body),
+        ...(etag === undefined ? {} : { etag }),
         key,
         name: key.split('/').at(-1) ?? key,
       };
@@ -944,7 +1044,10 @@ export class FilesSdkStorageDriver<
   ): Promise<StorageObjectMetadata> {
     this.#assertLogicalKey(key);
     return this.#call(async () =>
-      metadataOf(await this.#files.head(key, operationOptions(options))),
+      metadataOf(
+        await this.#files.head(key, operationOptions(options)),
+        'head',
+      ),
     );
   }
 
@@ -964,6 +1067,11 @@ export class FilesSdkStorageDriver<
     key: string,
     options: StorageConditionalDeleteOptions,
   ): Promise<void> {
+    if (!isCanonicalStorageEtag(options.condition.etag)) {
+      return Promise.reject(
+        invalidConditionalEtag('condition.etag', key, 'delete'),
+      );
+    }
     if (this.#readOnly) {
       return Promise.reject(
         new StorageError(
@@ -1042,6 +1150,22 @@ export class FilesSdkStorageDriver<
         }),
       );
     }
+    if (
+      options.sourceEtag !== undefined &&
+      !isCanonicalStorageEtag(options.sourceEtag)
+    ) {
+      return Promise.reject(
+        invalidConditionalEtag('sourceEtag', sourceKey, 'promote'),
+      );
+    }
+    if (
+      destination?.type === 'replace' &&
+      !isCanonicalStorageEtag(destination.etag)
+    ) {
+      return Promise.reject(
+        invalidConditionalEtag('destination.etag', destinationKey, 'promote'),
+      );
+    }
     if (this.#readOnly) {
       return Promise.reject(
         new StorageError(
@@ -1099,7 +1223,7 @@ export class FilesSdkStorageDriver<
     return this.#call(async () => {
       const result = await this.#files.list(listOptions(options));
       return {
-        items: result.items.map(metadataOf),
+        items: result.items.map((file) => metadataOf(file, 'list')),
         ...(result.cursor !== undefined && { cursor: result.cursor }),
         ...(result.prefixes !== undefined && {
           prefixes: [...result.prefixes],
@@ -1127,7 +1251,7 @@ export class FilesSdkStorageDriver<
         pattern,
         searchOptions(options),
       )) {
-        yield metadataOf(file);
+        yield metadataOf(file, 'search');
       }
     } catch (error) {
       throw mapFilesSdkError(error);

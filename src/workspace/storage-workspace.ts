@@ -1,4 +1,5 @@
 import { StorageClient } from '../storage.client.js';
+import { isCanonicalStorageEtag } from '../storage-etag.js';
 import { StorageErrorCode } from '../storage.error.js';
 import type {
   StorageObjectMetadata,
@@ -102,16 +103,11 @@ function positiveSafeInteger(value: number, label: string): number {
   return value;
 }
 
-function assertEtag(etag: string, maxBytes: number, operation: string): void {
-  if (
-    typeof etag !== 'string' ||
-    etag.length === 0 ||
-    containsControlCharacter(etag) ||
-    encoder.encode(etag).byteLength > maxBytes
-  ) {
+function assertEtag(etag: string, operation: string): void {
+  if (!isCanonicalStorageEtag(etag)) {
     throw workspaceError(
       StorageErrorCode.INVALID_ARGUMENT,
-      `${operation} requires a valid non-empty etag.`,
+      `${operation} requires a canonical bare etag of at most 1,024 bytes.`,
       { permanent: true },
     );
   }
@@ -181,8 +177,7 @@ function logicalFile(
     metadata.size < 0 ||
     typeof metadata.contentType !== 'string' ||
     metadata.contentType.length === 0 ||
-    (metadata.etag !== undefined &&
-      (typeof metadata.etag !== 'string' || metadata.etag.length === 0)) ||
+    (metadata.etag !== undefined && !isCanonicalStorageEtag(metadata.etag)) ||
     (metadata.lastModified !== undefined &&
       !Number.isFinite(new Date(metadata.lastModified).getTime()))
   ) {
@@ -728,7 +723,7 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
       );
     }
     if (options.mode === 'replace') {
-      assertEtag(options.etag, this.#limits.maxPathBytes, 'Replace');
+      assertEtag(options.etag, 'Replace');
     }
     try {
       const common = {
@@ -780,7 +775,7 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
         { path: destinationPath, permanent: true },
       );
     }
-    assertEtag(options.etag, this.#limits.maxPathBytes, 'Copy');
+    assertEtag(options.etag, 'Copy');
     const capabilities = this.#state.client.capabilities;
     if (
       capabilities.conditionalCreate?.resultEtag !== true ||
@@ -825,7 +820,7 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
         { path: destinationPath, permanent: true },
       );
     }
-    assertEtag(options.etag, this.#limits.maxPathBytes, 'Move');
+    assertEtag(options.etag, 'Move');
     const copied = await this.#copyCreate(sourcePath, destinationPath, options);
     if (copied.etag === undefined) {
       throw workspaceError(
@@ -859,7 +854,7 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
   ): Promise<void> {
     this.#require('delete');
     const logicalPath = this.#filePath(path);
-    assertEtag(options.etag, this.#limits.maxPathBytes, 'Delete');
+    assertEtag(options.etag, 'Delete');
     try {
       await this.#state.client.deleteConditional(this.#scope(logicalPath), {
         condition: { etag: options.etag },

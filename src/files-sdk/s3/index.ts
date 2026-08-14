@@ -33,6 +33,10 @@ import {
   isStorageError,
 } from '../../storage.error.js';
 import {
+  normalizeProviderStorageEtag,
+  storageEtagHeader,
+} from '../../storage-etag.js';
+import {
   createFilesSdkDriver,
   type FilesSdkConditionalCopyAdapter,
   type FilesSdkConditionalDeleteAdapter,
@@ -338,12 +342,42 @@ function maxRetries(options: StorageOperationOptions): number {
   return Math.max(0, Math.floor(configured ?? 0));
 }
 
-function etagHeader(etag: string): string {
-  return etag.startsWith('"') && etag.endsWith('"') ? etag : `"${etag}"`;
+function etagHeader(
+  etag: string,
+  key: string,
+  operation: 'copy' | 'delete' | 'download' | 'upload',
+  label: string,
+): string {
+  const header = storageEtagHeader(etag);
+  if (header === undefined) {
+    throw new StorageError(`${label} must be a canonical storage ETag.`, {
+      code: StorageErrorCode.INVALID_ARGUMENT,
+      key,
+      operation,
+      permanent: true,
+    });
+  }
+  return header;
 }
 
-function stripEtag(etag: string | undefined): string | undefined {
-  return etag?.replace(/^"+|"+$/gu, '');
+function providerEtag(
+  etag: unknown,
+  key: string,
+  operation: 'download' | 'upload',
+): string | undefined {
+  if (etag === undefined) {
+    return undefined;
+  }
+  const normalized = normalizeProviderStorageEtag(etag);
+  if (normalized === undefined) {
+    throw new StorageError('S3 returned an invalid ETag.', {
+      code: StorageErrorCode.PROVIDER,
+      key,
+      operation,
+      permanent: true,
+    });
+  }
+  return normalized;
 }
 
 function contentTypeOf(
@@ -545,10 +579,13 @@ const S3_MAX_MULTIPART_PARTS = 10_000;
 
 function conditionalHeaders(
   condition: StorageConditionalUploadOptions['condition'],
+  key: string,
 ): { IfMatch?: string; IfNoneMatch?: string } {
   return condition.type === 'create'
     ? { IfNoneMatch: '*' }
-    : { IfMatch: etagHeader(condition.etag) };
+    : {
+        IfMatch: etagHeader(condition.etag, key, 'upload', 'condition.etag'),
+      };
 }
 
 function rangeHeader(
@@ -683,7 +720,7 @@ async function uploadConditionalSingle(
           ContentLength: normalized.contentLength,
         }),
         ContentType: contentType,
-        ...conditionalHeaders(conditional.condition),
+        ...conditionalHeaders(conditional.condition, key),
         Key: key,
         ...(conditional.metadata !== undefined && {
           Metadata: conditional.metadata,
@@ -699,8 +736,8 @@ async function uploadConditionalSingle(
       total: normalized.contentLength,
     }),
   });
-  const etag = stripEtag(result.ETag);
-  if (etag === undefined || etag.length === 0) throw missingResultEtag(key);
+  const etag = providerEtag(result.ETag, key, 'upload');
+  if (etag === undefined) throw missingResultEtag(key);
   return { contentType, etag, key, size };
 }
 
@@ -797,7 +834,8 @@ async function uploadConditionalMultipart(
           signal === undefined ? undefined : { abortSignal: signal },
         ),
       );
-      if (uploaded.ETag === undefined || uploaded.ETag.length === 0) {
+      const partEtag = providerEtag(uploaded.ETag, key, 'upload');
+      if (partEtag === undefined) {
         throw new StorageError('S3 upload part returned no ETag.', {
           code: StorageErrorCode.PROVIDER,
           key,
@@ -805,7 +843,10 @@ async function uploadConditionalMultipart(
           permanent: true,
         });
       }
-      completedParts.push({ ETag: uploaded.ETag, PartNumber: partNumber });
+      completedParts.push({
+        ETag: storageEtagHeader(partEtag)!,
+        PartNumber: partNumber,
+      });
       size += part.byteLength;
       conditional.onProgress?.({
         loaded: size,
@@ -833,7 +874,7 @@ async function uploadConditionalMultipart(
       base.raw.send(
         new CompleteMultipartUploadCommand({
           Bucket: base.bucket,
-          ...conditionalHeaders(conditional.condition),
+          ...conditionalHeaders(conditional.condition, key),
           Key: key,
           MultipartUpload: { Parts: completedParts },
           UploadId: uploadId,
@@ -841,8 +882,8 @@ async function uploadConditionalMultipart(
         signal === undefined ? undefined : { abortSignal: signal },
       ),
     );
-    const etag = stripEtag(completed.ETag);
-    if (etag === undefined || etag.length === 0) throw missingResultEtag(key);
+    const etag = providerEtag(completed.ETag, key, 'upload');
+    if (etag === undefined) throw missingResultEtag(key);
     uploadId = undefined;
     return { contentType, etag, key, size };
   } catch (error) {
@@ -861,19 +902,43 @@ async function uploadConditionalMultipart(
   }
 }
 
-/** Adds only the exact operations declared by one verified provider profile. */
+const configuredS3Clients = new WeakSet<S3Adapter['raw']>();
+
+/**
+ * Adds only the exact operations declared by one verified provider profile.
+ * Each raw adapter may be decorated once so capability state cannot depend on
+ * profile application order.
+ */
 export function withS3Capabilities(
   base: S3Adapter,
   options: Pick<S3AdapterOptions, 'endpoint' | 'publicBaseUrl'> & {
     providerProfile?: S3ProviderProfile;
   } = {},
 ): S3StorageAdapter {
+  if (configuredS3Clients.has(base.raw)) {
+    throw new TypeError(
+      'withS3Capabilities may only be applied once to an S3 adapter.',
+    );
+  }
+  const sdkHasCustomEndpoint = base.raw.config.isCustomEndpoint === true;
+  if (options.endpoint !== undefined && !sdkHasCustomEndpoint) {
+    throw new TypeError(
+      'The declared S3 endpoint does not match the SDK client endpoint provenance.',
+    );
+  }
+  if (!sdkHasCustomEndpoint) {
+    // files-sdk does not expose this S3Client constructor option. Endpoint
+    // resolution is lazy, so fixing the resolved SDK config before the adapter
+    // is exposed prevents environment and shared-config endpoint redirection.
+    base.raw.config.ignoreConfiguredEndpointUrls = true;
+  }
   const profile =
     options.providerProfile ??
-    (options.endpoint === undefined
-      ? AWS_S3_PROVIDER_PROFILE
-      : UNVERIFIED_S3_PROVIDER_PROFILE);
+    (sdkHasCustomEndpoint
+      ? UNVERIFIED_S3_PROVIDER_PROFILE
+      : AWS_S3_PROVIDER_PROFILE);
   assertVerifiedS3ProviderProfile(profile);
+  configuredS3Clients.add(base.raw);
   const adapter = Object.assign(base, {
     physicalKey: profile.physicalKey,
     signedUploadPolicy: Object.freeze({ contentType: true, sizeRange: true }),
@@ -951,12 +1016,24 @@ export function withS3Capabilities(
                 promotion.sourceVersion,
               ),
               ...(promotion.sourceEtag !== undefined && {
-                CopySourceIfMatch: etagHeader(promotion.sourceEtag),
+                CopySourceIfMatch: etagHeader(
+                  promotion.sourceEtag,
+                  sourceKey,
+                  'copy',
+                  'sourceEtag',
+                ),
               }),
               ...(promotion.destination?.type === 'create'
                 ? { IfNoneMatch: '*' }
                 : promotion.destination?.type === 'replace'
-                  ? { IfMatch: etagHeader(promotion.destination.etag) }
+                  ? {
+                      IfMatch: etagHeader(
+                        promotion.destination.etag,
+                        destinationKey,
+                        'copy',
+                        'destination.etag',
+                      ),
+                    }
                   : {}),
               Key: destinationKey,
             }),
@@ -995,7 +1072,12 @@ export function withS3Capabilities(
             new GetObjectCommand({
               Bucket: base.bucket,
               ...(options.condition.etag !== undefined && {
-                IfMatch: etagHeader(options.condition.etag),
+                IfMatch: etagHeader(
+                  options.condition.etag,
+                  key,
+                  'download',
+                  'condition.etag',
+                ),
               }),
               Key: key,
               ...(rangeHeader(options.range) !== undefined && {
@@ -1008,7 +1090,7 @@ export function withS3Capabilities(
             signal === undefined ? undefined : { abortSignal: signal },
           ),
         );
-        const etag = stripEtag(result.ETag);
+        const etag = providerEtag(result.ETag, key, 'download');
         return {
           body: s3ResponseStream(result.Body),
           contentType: result.ContentType ?? 'application/octet-stream',
@@ -1036,7 +1118,12 @@ export function withS3Capabilities(
           await base.raw.send(
             new DeleteObjectCommand({
               Bucket: base.bucket,
-              IfMatch: etagHeader(options.condition.etag),
+              IfMatch: etagHeader(
+                options.condition.etag,
+                key,
+                'delete',
+                'condition.etag',
+              ),
               Key: key,
             }),
             signal === undefined ? undefined : { abortSignal: signal },
@@ -1065,6 +1152,14 @@ export function withS3Capabilities(
         body: StorageBody,
         conditional: StorageConditionalUploadOptions,
       ): Promise<StorageUploadResult> {
+        if (conditional.condition.type === 'replace') {
+          etagHeader(
+            conditional.condition.etag,
+            key,
+            'upload',
+            'condition.etag',
+          );
+        }
         const supported =
           conditional.condition.type === 'create'
             ? profile.conditionalCreate !== undefined

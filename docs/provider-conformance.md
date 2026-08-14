@@ -7,6 +7,12 @@ capability matrix, supported operations, fail-closed unsupported operations,
 the complete physical-key byte budget, conflict normalization, and public
 error sanitation.
 
+Every failure observed by the harness must be log-safe as a nested object, via
+`util.inspect`, and via JSON serialization. Provider bodies, request/host IDs,
+SDK metadata, credentials, and raw `cause` chains must not cross the storage
+boundary. Adapters preserve normalized error codes plus aborted, timed-out, and
+permanent flags while using stable public messages.
+
 The repository registers the harness with Vitest for four providers in
 `test/provider-conformance.e2e-spec.ts`:
 
@@ -15,6 +21,69 @@ The repository registers the harness with Vitest for four providers in
 - Cloudflare R2;
 - a custom S3-compatible or MinIO-style endpoint with an explicit candidate
   profile.
+
+## Canonical ETag contract
+
+Provider fixtures must return ETags in the package's canonical bare form, not
+as an HTTP field value. A canonical ETag is a case-sensitive opaque token of
+1–1024 visible ASCII bytes. It excludes quotes, commas, backslashes,
+whitespace, control characters, `DEL`, non-ASCII text, the `*` wildcard, and
+case-insensitive `W/` weak-tag prefixes. The harness passes result ETags back to
+conditional operations without altering them, so provider adapters must
+normalize their output before it crosses the storage boundary.
+
+An HTTP provider response may contain exactly one surrounding quote pair. The
+adapter removes that pair only after validating the whole value as one strong
+entity tag; it must not trim repeated quotes or accept an entity-tag list. When
+an S3-compatible adapter sends a condition, it restores exactly one quote pair
+for `If-Match` or the corresponding copy-source header. Bare values and HTTP
+header values are separate representations; application and conformance code
+must never quote or unquote ETags itself.
+
+This restriction is intentionally narrower than the full HTTP `etagc` grammar.
+It fails closed on legacy backslash handling and on values that could be
+interpreted as a wildcard, weak validator, header injection, or a list matching
+more than one object state. A provider that returns an unsafe ETag cannot claim
+an exact ETag-conditioned capability until its adapter can normalize a verified
+single strong value. Persisted quoted ETags from an older integration must be
+discarded and refreshed from provider metadata before mutation tests run.
+
+## List cursor replay contract
+
+Provider list cursors are opaque and non-consuming. Reusing the same cursor
+with the same prefix, delimiter, and page limit against unchanged provider
+state must return an equivalent page and the same continuation state. The
+conformance harness creates three objects, advances beyond a cursor-backed
+page, then replays the original cursor and compares the full page metadata and
+next cursor. A consuming or unstable provider cursor fails conformance; callers
+must not advertise replayable higher-level cursors for that provider.
+
+This is an idempotent-replay guarantee, not snapshot isolation. Results may
+change when another actor mutates the provider namespace between list calls.
+
+## Combined copy atomicity
+
+A profile may claim `conditionalCopyDestination.atomicWithSource` only after
+the harness passes every advertised source predicate (`etag` and/or `version`)
+crossed with every advertised destination predicate (`create` and/or
+`replace`). Each combination proves that a stale source with a valid
+destination and a valid source with a stale destination leave the destination
+unchanged. A controlled two-promotion race then pairs one stale source with one
+valid source against the same destination condition: the stale attempt must
+fail, the valid attempt must win, and the final bytes must be the valid source.
+This detects adapters that serialize only one of the combined predicates.
+
+The runner-agnostic harness cannot inject a mutation inside a remote provider's
+private check/copy window, so this race does **not** by itself prove one internal
+linearization point. A profile may set `atomicWithSource: true` only when the
+provider API or an audited adapter implementation independently guarantees that
+the combined predicates and copy execute as one atomic request. The harness
+then verifies every observable predicate combination and fails profiles that
+drop either side.
+
+Profiles that advertise source and destination predicates but leave
+`atomicWithSource` false run the same complete cross-product as negative cases:
+every combined pair must fail before it can alter the destination.
 
 Run only these suites with:
 
@@ -115,6 +184,11 @@ own. `multipart-create` requires `create`, and
 declared profile. Promote that profile into application configuration
 intentionally; do not treat generic S3 compatibility as proof of conditional
 semantics.
+
+The public `withS3Capabilities()` helper mutates one raw S3 adapter and is
+single-use. Build a fresh raw adapter for each verified profile. Reapplication
+is rejected rather than merging capability fields, so declaration order cannot
+leave operations from a broader prior profile enabled.
 
 ## Embedding the harness
 

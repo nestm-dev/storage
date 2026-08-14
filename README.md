@@ -50,6 +50,11 @@ pnpm add @google-cloud/storage google-auth-library
 pnpm add @azure/storage-blob @azure/core-auth @azure/identity
 ```
 
+`@aws-sdk/client-s3` 3.919.0 or newer is required. Earlier releases omit
+destination `If-Match` and `If-None-Match` from the serialized `CopyObject`
+request even when those fields appear in a newer compile-time command shape;
+the package peer range and packed minimum-peer smoke test enforce this floor.
+
 `files-sdk` currently declares its optional Nest peer for Nest 10 and 11. This
 library does not import `files-sdk/nestjs`; the Nest 12 integration is entirely
 owned here. A package manager may nevertheless report that temporary optional
@@ -490,6 +495,12 @@ receive no inferred conditional capabilities.
 - provider capability inspection; and
 - pause/resume/abort through `StorageUploadControl`.
 
+Provider list cursors are opaque, non-consuming continuation tokens. Replaying
+the same cursor with the same list options against unchanged provider state
+must return an equivalent page and continuation cursor. This contract lets a
+caller safely retry or replay pagination; it does not promise snapshot
+isolation across concurrent provider mutations.
+
 Downloads are streaming by default:
 
 ```ts
@@ -519,6 +530,25 @@ copy, destination copy, atomic source-and-destination promotion, and multipart
 completion. They also declare the complete physical-key byte budget. Callers
 must check the exact primitive they need; a missing field is unsupported and is
 never widened from another operation.
+
+Storage-facing ETags have one canonical representation: a bare, case-sensitive
+opaque token with no HTTP quotes. Canonical values contain 1–1024 visible
+ASCII bytes and exclude commas, backslashes, whitespace, control characters,
+`DEL`, non-ASCII text, the `*` wildcard, and case-insensitive `W/` weak-tag
+prefixes. Treat the value as opaque: preserve the exact string returned by
+`head`, reads, or writes and pass it back unchanged to a conditional operation.
+Do not add or remove quotes in application code. S3-compatible drivers remove
+exactly one valid provider-owned quote pair on ingress and add exactly one pair
+when serializing the HTTP header.
+
+This tightens the precondition boundary. Quoted or otherwise non-canonical
+ETags that older versions happened to accept now fail with `INVALID_ARGUMENT`,
+and an unsafe provider result fails with a sanitized `PROVIDER` error instead
+of being exposed as a usable validator. Applications that persisted quoted
+ETags must refresh them with `head` rather than trimming them heuristically.
+Strict normalization prevents a caller-controlled wildcard, entity-tag list,
+weak validator, or malformed header value from widening an operation that
+promises one exact strong match.
 
 The native AWS S3 profile advertises ETag- and version-conditioned server-side
 copy. This lets an application validate a staged object and copy that exact
@@ -558,6 +588,11 @@ destination copy, atomic promotion, version predicates, and conditional
 multipart completion remain absent. Custom S3-compatible endpoints start with
 no conditional operations and the entire driver is forced read-only until an
 explicit conformance-verified `S3ProviderProfile` is supplied.
+
+`withS3Capabilities()` decorates a raw S3 adapter in place and may be applied
+only once. Construct a fresh raw adapter when selecting a different profile;
+reapplying the helper is rejected so a previous broader profile cannot survive
+a later narrower declaration.
 
 ### Resumable uploads
 
