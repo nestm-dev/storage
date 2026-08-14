@@ -1,7 +1,7 @@
 import { Readable } from 'node:stream';
 import { inspect } from 'node:util';
 
-import { createStoredFile } from 'files-sdk';
+import { createStoredFile, handlers } from 'files-sdk';
 import { memory } from 'files-sdk/memory';
 
 import {
@@ -10,7 +10,11 @@ import {
   isStorageError,
   type StorageError as StorageErrorType,
 } from '../storage.error.js';
-import { createFilesSdkDriver } from './files-sdk.driver.js';
+import {
+  createFilesSdkDriver,
+  markFilesSdkS3AdapterProvenance,
+  markFilesSdkS3AdapterUndecorated,
+} from './files-sdk.driver.js';
 
 async function rejectedStorageError(
   operation: () => Promise<unknown>,
@@ -26,6 +30,16 @@ async function rejectedStorageError(
 
 function logShape(error: StorageErrorType): string {
   return `${inspect(error, { depth: null })}\n${JSON.stringify({ error })}`;
+}
+
+function s3BackedMemoryAdapter(name = 's3') {
+  return Object.assign(memory(), {
+    name,
+    raw: {
+      config: { serviceId: 'S3' },
+      send: vi.fn(),
+    },
+  });
 }
 
 describe('FilesSdkStorageDriver', () => {
@@ -384,5 +398,618 @@ describe('FilesSdkStorageDriver', () => {
       'body',
       { condition: { type: 'create' } },
     );
+  });
+
+  it('validates an unprefixed physical-key budget against the exact adapter key before dispatch', async () => {
+    const adapter = Object.assign(memory(), {
+      physicalKey: { maxBytes: 1_024 },
+    });
+    const head = vi.spyOn(adapter, 'head');
+    const driver = createFilesSdkDriver({ adapter });
+
+    await expect(driver.head(`${'/'.repeat(1_024)}x`)).rejects.toMatchObject({
+      code: StorageErrorCode.LIMIT_EXCEEDED,
+      permanent: true,
+    });
+    expect(head).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      expectedPhysicalKey: '//object.txt',
+      logicalKey: '//object.txt',
+      prefix: undefined,
+    },
+    {
+      expectedPhysicalKey: 'scope/object.txt',
+      logicalKey: '//object.txt',
+      prefix: 'scope',
+    },
+  ])(
+    'dispatches the same exact $expectedPhysicalKey to ordinary and conditional adapters',
+    async ({ expectedPhysicalKey, logicalKey, prefix }) => {
+      const head = vi.fn(async (key: string) =>
+        createStoredFile(
+          {
+            key,
+            size: 0,
+            type: 'application/octet-stream',
+          },
+          {
+            factory: () => new ReadableStream<Uint8Array>(),
+            kind: 'stream',
+          },
+        ),
+      );
+      const downloadConditional = vi.fn(async (key: string) => ({
+        body: new ReadableStream<Uint8Array>(),
+        contentType: 'application/octet-stream',
+        etag: 'current-etag',
+        key,
+        name: key.split('/').at(-1) ?? key,
+        size: 0,
+      }));
+      const adapter = Object.assign(memory(), {
+        conditionalRead: { etag: true, version: false },
+        downloadConditional,
+        head,
+      });
+      const driver = createFilesSdkDriver({
+        adapter,
+        ...(prefix !== undefined && { prefix }),
+      });
+
+      await driver.head(logicalKey);
+      const object = await driver.downloadConditional(logicalKey, {
+        condition: { etag: 'current-etag' },
+      });
+      await object.body.cancel();
+
+      expect(head.mock.calls[0]?.[0]).toBe(expectedPhysicalKey);
+      expect(downloadConditional.mock.calls[0]?.[0]).toBe(expectedPhysicalKey);
+    },
+  );
+
+  it('rejects a configured list prefix plus its dispatch slash when over budget', async () => {
+    const adapter = Object.assign(memory(), {
+      physicalKey: { maxBytes: 1_024 },
+    });
+    const list = vi.spyOn(adapter, 'list');
+    const driver = createFilesSdkDriver({
+      adapter,
+      prefix: 'x'.repeat(1_024),
+    });
+
+    await expect(driver.list()).rejects.toMatchObject({
+      code: StorageErrorCode.LIMIT_EXCEEDED,
+      permanent: true,
+    });
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it('rejects an inferred scoped search prefix when even the safe walk is over budget', async () => {
+    const adapter = Object.assign(memory(), {
+      physicalKey: { maxBytes: 1_024 },
+    });
+    const list = vi.spyOn(adapter, 'list');
+    const driver = createFilesSdkDriver({
+      adapter,
+      prefix: 'x'.repeat(1_024),
+    });
+    const collect = async (): Promise<void> => {
+      for await (const _item of driver.search('child*')) {
+        // Consume the lazy search so validation runs.
+      }
+    };
+
+    await expect(collect()).rejects.toMatchObject({
+      code: StorageErrorCode.LIMIT_EXCEEDED,
+      permanent: true,
+    });
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it('rejects an over-budget inferred search prefix without widening the walk', async () => {
+    const adapter = Object.assign(memory(), {
+      physicalKey: { maxBytes: 2 },
+    });
+    const list = vi.spyOn(adapter, 'list');
+    const driver = createFilesSdkDriver({ adapter });
+
+    const collect = async (): Promise<void> => {
+      for await (const _item of driver.search('foo/*.txt')) {
+        // Consume the lazy search so its derived list operation is guarded.
+      }
+    };
+
+    await expect(collect()).rejects.toMatchObject({
+      code: StorageErrorCode.LIMIT_EXCEEDED,
+      permanent: true,
+    });
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { pattern: '../secret*', prefix: undefined },
+    { pattern: '/../secret*', prefix: undefined },
+    { pattern: 'scope/../../x*', prefix: undefined },
+    { pattern: '../secret*', prefix: 'tenant' },
+    { pattern: '/../secret*', prefix: 'tenant' },
+    { pattern: 'scope/../../x*', prefix: 'tenant' },
+  ])(
+    'rejects inferred relative search prefix $pattern with driver prefix $prefix',
+    async ({ pattern, prefix }) => {
+      const adapter = Object.assign(memory(), {
+        physicalKey: { maxBytes: 1_024 },
+      });
+      const list = vi.spyOn(adapter, 'list');
+      const driver = createFilesSdkDriver({
+        adapter,
+        ...(prefix !== undefined && { prefix }),
+      });
+      const collect = async (): Promise<void> => {
+        for await (const _item of driver.search(pattern)) {
+          // Consume the lazy search so validation runs.
+        }
+      };
+
+      await expect(collect()).rejects.toMatchObject({
+        code: StorageErrorCode.INVALID_ARGUMENT,
+        permanent: true,
+      });
+      expect(list).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([undefined, 'tenant'])(
+    'allows normal dotted inferred search prefixes with driver prefix %s',
+    async (prefix) => {
+      const adapter = memory();
+      const list = vi.spyOn(adapter, 'list');
+      const driver = createFilesSdkDriver({
+        adapter,
+        ...(prefix !== undefined && { prefix }),
+      });
+
+      for await (const _item of driver.search('.well-known/*.json')) {
+        // The empty memory adapter has no results.
+      }
+
+      expect(list).toHaveBeenCalled();
+    },
+  );
+
+  it('uses the exact picomatch-inferred base for physical-key budgeting', async () => {
+    const adapter = Object.assign(memory(), {
+      physicalKey: { maxBytes: 5 },
+    });
+    const list = vi.spyOn(adapter, 'list');
+    const driver = createFilesSdkDriver({ adapter, prefix: 't' });
+
+    for await (const _item of driver.search('foo/*.txt')) {
+      // The empty memory adapter has no results.
+    }
+
+    expect(list).toHaveBeenCalledOnce();
+    expect(list.mock.calls[0]?.[0]?.prefix).toBe('t/foo');
+  });
+
+  it('does not validate or dispatch a search walk when maxResults is non-positive', async () => {
+    const adapter = Object.assign(memory(), {
+      physicalKey: { maxBytes: 1_024 },
+    });
+    const list = vi.spyOn(adapter, 'list');
+    const driver = createFilesSdkDriver({
+      adapter,
+      prefix: 'x'.repeat(1_024),
+    });
+
+    for await (const _item of driver.search('child*', { maxResults: 0 })) {
+      // files-sdk returns before walking the provider.
+    }
+
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it('enforces key budgets after plugins rewrite object and list operations', async () => {
+    const adapter = Object.assign(memory(), {
+      physicalKey: { maxBytes: 1_024 },
+    });
+    const upload = vi.spyOn(adapter, 'upload');
+    const list = vi.spyOn(adapter, 'list');
+    const overBudget = 'x'.repeat(1_025);
+    const driver = createFilesSdkDriver({
+      adapter,
+      plugins: [
+        {
+          name: 'malicious-key-rewriter',
+          wrap: handlers({
+            list: (operation, next) =>
+              next({
+                ...operation,
+                options: { ...operation.options, prefix: overBudget },
+              }),
+            upload: (operation, next) =>
+              next({ ...operation, key: overBudget }),
+          }),
+        },
+      ],
+    });
+
+    await expect(driver.upload('ok', 'body')).rejects.toMatchObject({
+      code: StorageErrorCode.LIMIT_EXCEEDED,
+      permanent: true,
+    });
+    await expect(driver.list()).rejects.toMatchObject({
+      code: StorageErrorCode.LIMIT_EXCEEDED,
+      permanent: true,
+    });
+    const collect = async (): Promise<void> => {
+      for await (const _item of driver.search('ok*')) {
+        // Consume the lazy search so the rewritten list reaches dispatch.
+      }
+    };
+    await expect(collect()).rejects.toMatchObject({
+      code: StorageErrorCode.LIMIT_EXCEEDED,
+      permanent: true,
+    });
+
+    expect(upload).not.toHaveBeenCalled();
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it('rejects a raw undecorated s3 adapter before dispatch', () => {
+    const adapter = s3BackedMemoryAdapter();
+    const upload = vi.spyOn(adapter, 'upload');
+
+    expect(() => createFilesSdkDriver({ adapter, readonly: true })).toThrow(
+      expect.objectContaining({
+        code: StorageErrorCode.INVALID_ARGUMENT,
+        permanent: true,
+      }),
+    );
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  it('rejects a renamed package S3 adapter through a raw proxy before dispatch', () => {
+    const adapter = s3BackedMemoryAdapter();
+    const upload = vi.spyOn(adapter, 'upload');
+    markFilesSdkS3AdapterUndecorated(adapter);
+    const alias = {
+      ...adapter,
+      name: 'renamed-s3',
+      raw: new Proxy(adapter.raw, {}),
+    };
+
+    expect(() => createFilesSdkDriver({ adapter: alias })).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+    );
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  it.each(['undecorated', 'unverified'] as const)(
+    'rejects a shallow %s S3 alias that replaces raw but keeps package methods',
+    (state) => {
+      const adapter = s3BackedMemoryAdapter();
+      const upload = vi.spyOn(adapter, 'upload');
+      if (state === 'undecorated') {
+        markFilesSdkS3AdapterUndecorated(adapter);
+      } else {
+        markFilesSdkS3AdapterProvenance(adapter, 'unverified');
+      }
+      const alias = {
+        ...adapter,
+        name: `renamed-${adapter.name}`,
+        raw: {},
+      };
+
+      expect(() => createFilesSdkDriver({ adapter: alias })).toThrow(
+        expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+      );
+      expect(upload).not.toHaveBeenCalled();
+    },
+  );
+
+  it('enforces unverified S3 provenance before ordinary mutation dispatch', async () => {
+    const adapter = s3BackedMemoryAdapter();
+    const upload = vi.spyOn(adapter, 'upload');
+    const remove = vi.spyOn(adapter, 'delete');
+    const copy = vi.spyOn(adapter, 'copy');
+    const move = vi.spyOn(adapter, 'move');
+    const signedUploadUrl = vi.spyOn(adapter, 'signedUploadUrl');
+    markFilesSdkS3AdapterProvenance(adapter, 'unverified');
+    const alias = { ...adapter, name: `renamed-${adapter.name}` };
+
+    const driver = createFilesSdkDriver({ adapter: alias, readonly: false });
+
+    expect(driver.capabilities).toMatchObject({
+      nativeUploadProgress: false,
+      resumableUpload: false,
+      serverSideCopy: false,
+      signedUpload: false,
+    });
+    await expect(driver.upload('upload.txt', 'body')).rejects.toMatchObject({
+      code: StorageErrorCode.READ_ONLY,
+    });
+    await expect(driver.delete('delete.txt')).rejects.toMatchObject({
+      code: StorageErrorCode.READ_ONLY,
+    });
+    await expect(driver.copy('source.txt', 'copy.txt')).rejects.toMatchObject({
+      code: StorageErrorCode.READ_ONLY,
+    });
+    await expect(driver.move('source.txt', 'move.txt')).rejects.toMatchObject({
+      code: StorageErrorCode.READ_ONLY,
+    });
+    await expect(
+      driver.signUpload('signed.txt', { expiresIn: 60 }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.READ_ONLY });
+
+    expect(upload).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalled();
+    expect(copy).not.toHaveBeenCalled();
+    expect(move).not.toHaveBeenCalled();
+    expect(signedUploadUrl).not.toHaveBeenCalled();
+  });
+
+  it('rejects forged global S3 provenance from a foreign package copy', () => {
+    const adapter = s3BackedMemoryAdapter('renamed-s3');
+    const upload = vi.spyOn(adapter, 'upload');
+    Object.defineProperty(
+      adapter.raw,
+      Symbol.for('@nestm/storage/files-sdk/s3-adapter-provenance'),
+      {
+        configurable: false,
+        enumerable: false,
+        value: 'verified',
+        writable: false,
+      },
+    );
+
+    expect(() => createFilesSdkDriver({ adapter })).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+    );
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  it('rejects a Proxy that forges symbol-description provenance', () => {
+    const adapter = s3BackedMemoryAdapter();
+    const upload = vi.spyOn(adapter, 'upload');
+    const forged = new Proxy(adapter, {
+      get(target, property, receiver) {
+        if (typeof property === 'symbol') {
+          return {
+            provenance: 'verified',
+            surface: {},
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+
+    expect(() => createFilesSdkDriver({ adapter: forged })).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+    );
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  it.each(['native', 'verified'] as const)(
+    'permits mutations through aliases for %s S3 provenance',
+    async (provenance) => {
+      const adapter = Object.assign(s3BackedMemoryAdapter(), {
+        physicalKey: Object.freeze({ maxBytes: 1_024 }),
+      });
+      const upload = vi.spyOn(adapter, 'upload');
+      markFilesSdkS3AdapterUndecorated(adapter);
+      markFilesSdkS3AdapterProvenance(adapter, provenance);
+      const alias = new Proxy(
+        {
+          ...adapter,
+          name: `renamed-${adapter.name}`,
+        },
+        {},
+      );
+      const driver = createFilesSdkDriver({ adapter: alias });
+
+      await expect(driver.upload('allowed.txt', 'body')).resolves.toMatchObject(
+        { key: 'allowed.txt' },
+      );
+      expect(upload).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('keeps an existing explicit readonly driver readonly after its raw client is verified', async () => {
+    const adapter = s3BackedMemoryAdapter('s3-alias');
+    markFilesSdkS3AdapterProvenance(adapter, 'verified');
+    const blocked = createFilesSdkDriver({ adapter, readonly: true });
+    const allowed = createFilesSdkDriver({ adapter });
+
+    await expect(blocked.upload('blocked.txt', 'body')).rejects.toMatchObject({
+      code: StorageErrorCode.READ_ONLY,
+    });
+    await expect(allowed.upload('allowed.txt', 'body')).resolves.toMatchObject({
+      key: 'allowed.txt',
+    });
+  });
+
+  it('rejects same-raw aliases that add or replace reserved S3 extensions', () => {
+    const physicalKey = Object.freeze({ maxBytes: 1_024 });
+    const adapter = Object.assign(s3BackedMemoryAdapter(), { physicalKey });
+    markFilesSdkS3AdapterProvenance(adapter, 'verified');
+
+    expect(() =>
+      createFilesSdkDriver({
+        adapter: {
+          ...adapter,
+          conditionalCreate: { resultEtag: true },
+        },
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+    );
+    expect(() =>
+      createFilesSdkDriver({
+        adapter: {
+          ...adapter,
+          physicalKey: { maxBytes: 1_024 },
+        },
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+    );
+  });
+
+  it.each([
+    'url',
+    'signedUploadUrl',
+    'upload',
+    'delete',
+    'copy',
+    'move',
+  ] as const)('rejects a same-raw alias that replaces %s', (method) => {
+    const adapter = s3BackedMemoryAdapter();
+    markFilesSdkS3AdapterProvenance(adapter, 'verified');
+    const alias = { ...adapter } as unknown as Record<string, unknown>;
+    alias[method] = vi.fn();
+
+    expect(() =>
+      createFilesSdkDriver({
+        adapter: alias as unknown as typeof adapter,
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+    );
+  });
+
+  it('rejects same-raw aliases that replace bucket or support authority', () => {
+    const adapter = s3BackedMemoryAdapter();
+    markFilesSdkS3AdapterProvenance(adapter, 'verified');
+
+    expect(() =>
+      createFilesSdkDriver({
+        adapter: { ...adapter, bucket: 'other-bucket' },
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+    );
+    expect(() =>
+      createFilesSdkDriver({
+        adapter: {
+          ...adapter,
+          supportsRange: adapter.supportsRange !== true,
+        },
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+    );
+  });
+
+  it('binds a validated adapter snapshot before Files retains it', async () => {
+    const adapter = s3BackedMemoryAdapter();
+    const originalUpload = vi.fn(adapter.upload);
+    adapter.upload = originalUpload;
+    markFilesSdkS3AdapterProvenance(adapter, 'verified');
+    const alias = { ...adapter };
+
+    const driver = createFilesSdkDriver({ adapter: alias });
+    const replacementUpload = vi.fn(async () => {
+      throw new Error('replacement upload must not be retained');
+    });
+    alias.upload = replacementUpload;
+
+    await driver.upload('bound.txt', 'body');
+
+    expect(originalUpload).toHaveBeenCalledOnce();
+    expect(replacementUpload).not.toHaveBeenCalled();
+  });
+
+  it('does not transfer verified provenance to a different raw client', () => {
+    const adapter = s3BackedMemoryAdapter();
+    const upload = vi.spyOn(adapter, 'upload');
+    markFilesSdkS3AdapterProvenance(adapter, 'verified');
+    const differentRaw = {
+      config: { serviceId: 'S3' },
+      send: vi.fn(),
+    };
+    const alias = new Proxy(adapter, {
+      get(target, property, receiver) {
+        return property === 'raw'
+          ? differentRaw
+          : Reflect.get(target, property, receiver);
+      },
+    });
+    expect(() => createFilesSdkDriver({ adapter: alias })).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+    );
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  it('keeps generic non-S3 adapters writable', async () => {
+    const adapter = memory();
+    const upload = vi.spyOn(adapter, 'upload');
+    const driver = createFilesSdkDriver({ adapter });
+
+    await expect(driver.upload('allowed.txt', 'body')).resolves.toMatchObject({
+      key: 'allowed.txt',
+    });
+    expect(upload).toHaveBeenCalledOnce();
+  });
+
+  it('hides and blocks every conditional mutation for unverified S3 provenance', async () => {
+    const uploadConditional = vi.fn();
+    const deleteConditional = vi.fn();
+    const promote = vi.fn();
+    const adapter = Object.assign(s3BackedMemoryAdapter(), {
+      conditionalCopyDestination: {
+        atomicWithSource: true,
+        create: true,
+        replace: true,
+      },
+      conditionalCopySource: { etag: true, version: true },
+      conditionalCreate: { resultEtag: true },
+      conditionalDelete: { etag: true },
+      conditionalMultipartCompletion: { create: true, replace: true },
+      conditionalReplace: { resultEtag: true },
+      deleteConditional,
+      promote,
+      uploadConditional,
+    });
+    markFilesSdkS3AdapterProvenance(adapter, 'unverified');
+    const driver = createFilesSdkDriver({ adapter });
+
+    expect(driver.capabilities.conditionalCreate).toBeUndefined();
+    expect(driver.capabilities.conditionalReplace).toBeUndefined();
+    expect(driver.capabilities.conditionalDelete).toBeUndefined();
+    expect(driver.capabilities.conditionalCopySource).toBeUndefined();
+    expect(driver.capabilities.conditionalCopyDestination).toBeUndefined();
+    expect(driver.capabilities.conditionalMultipartCompletion).toBeUndefined();
+    for (const multipart of [false, true]) {
+      await expect(
+        driver.uploadConditional('create.txt', 'body', {
+          condition: { type: 'create' },
+          multipart,
+        }),
+      ).rejects.toMatchObject({ code: StorageErrorCode.READ_ONLY });
+      await expect(
+        driver.uploadConditional('replace.txt', 'body', {
+          condition: { etag: 'current-etag', type: 'replace' },
+          multipart,
+        }),
+      ).rejects.toMatchObject({ code: StorageErrorCode.READ_ONLY });
+    }
+    await expect(
+      driver.deleteConditional('delete.txt', {
+        condition: { etag: 'current-etag' },
+      }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.READ_ONLY });
+    await expect(
+      driver.promote('source.txt', 'destination.txt', {
+        destination: { type: 'create' },
+        sourceEtag: 'source-etag',
+      }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.READ_ONLY });
+
+    expect(uploadConditional).not.toHaveBeenCalled();
+    expect(deleteConditional).not.toHaveBeenCalled();
+    expect(promote).not.toHaveBeenCalled();
   });
 });

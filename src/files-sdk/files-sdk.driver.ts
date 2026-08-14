@@ -3,10 +3,12 @@ import { Readable } from 'node:stream';
 import {
   Files,
   FilesError,
+  handlers,
   type Adapter,
   type Body,
   type DownloadOptions,
   type FilesOptions,
+  type FilesPlugin,
   type ListOptions,
   type OperationOptions,
   type RetryOptions,
@@ -61,6 +63,296 @@ import { getFilesSdkUploadControl } from '../storage-upload-control.js';
 
 export type FilesSdkDriverOptions<AdapterType extends Adapter> =
   FilesOptions<AdapterType>;
+
+export type FilesSdkS3AdapterProvenance = 'native' | 'verified' | 'unverified';
+
+const FILES_SDK_S3_RESERVED_EXTENSION_KEYS = [
+  'conditionalCopyDestination',
+  'conditionalCopySource',
+  'conditionalCreate',
+  'conditionalDelete',
+  'conditionalMultipartCompletion',
+  'conditionalRead',
+  'conditionalReplace',
+  'deleteConditional',
+  'downloadConditional',
+  'physicalKey',
+  'promote',
+  'signedDownloadPolicy',
+  'signedUploadPolicy',
+  'uploadConditional',
+] as const;
+
+const FILES_SDK_S3_AUTHORITY_KEYS = [
+  ...FILES_SDK_S3_RESERVED_EXTENSION_KEYS,
+  'bucket',
+  'copy',
+  'delete',
+  'deleteMany',
+  'download',
+  'exists',
+  'head',
+  'list',
+  'move',
+  'reportsUploadProgress',
+  'resumableUpload',
+  'signedUploadUrl',
+  'signedUrl',
+  'supportsCacheControl',
+  'supportsDelimiter',
+  'supportsMetadata',
+  'supportsRange',
+  'supportsServerSideCopy',
+  'upload',
+  'url',
+] as const;
+
+type FilesSdkS3AuthorityKey = (typeof FILES_SDK_S3_AUTHORITY_KEYS)[number];
+
+interface FilesSdkS3AuthoritySnapshotEntry {
+  readonly present: boolean;
+  readonly value: unknown;
+}
+
+type FilesSdkS3AuthoritySnapshot = Readonly<
+  Record<FilesSdkS3AuthorityKey, FilesSdkS3AuthoritySnapshotEntry>
+>;
+
+interface FilesSdkS3AdapterProvenanceRecord {
+  readonly provenance: FilesSdkS3AdapterProvenance;
+  readonly surface: FilesSdkS3AuthoritySnapshot;
+}
+
+const s3AdapterProvenance = new WeakMap<
+  object,
+  FilesSdkS3AdapterProvenanceRecord
+>();
+const undecoratedS3Adapters = new WeakSet<object>();
+const s3AdapterAuthority = new WeakMap<object, object>();
+const s3MethodAuthority = new WeakMap<Function, object>();
+const s3AuthorityState = new WeakMap<
+  object,
+  {
+    readonly raw: object;
+    readonly record?: FilesSdkS3AdapterProvenanceRecord;
+  }
+>();
+const conflictingS3Authority = Symbol('conflictingS3Authority');
+
+function adapterRawObject(adapter: Adapter): object | undefined {
+  try {
+    const raw = adapter.raw;
+    return (typeof raw === 'object' && raw !== null) ||
+      typeof raw === 'function'
+      ? raw
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function s3AdapterAuthorityTokenOf(
+  adapter: Adapter,
+): object | typeof conflictingS3Authority | undefined {
+  let resolved = s3AdapterAuthority.get(adapter);
+  const consider = (token: object | undefined): boolean => {
+    if (token === undefined) return true;
+    if (resolved !== undefined && resolved !== token) return false;
+    resolved = token;
+    return true;
+  };
+  try {
+    const candidate = adapter as unknown as Record<PropertyKey, unknown>;
+    for (const key of FILES_SDK_S3_AUTHORITY_KEYS) {
+      if (!(key in candidate)) continue;
+      const value = candidate[key];
+      if (
+        typeof value === 'function' &&
+        !consider(s3MethodAuthority.get(value))
+      ) {
+        return conflictingS3Authority;
+      }
+    }
+    return resolved;
+  } catch {
+    return conflictingS3Authority;
+  }
+}
+
+function bindS3AdapterAuthorityMethods(adapter: Adapter, token: object): void {
+  const candidate = adapter as unknown as Record<PropertyKey, unknown>;
+  for (const key of FILES_SDK_S3_AUTHORITY_KEYS) {
+    if (!(key in candidate)) continue;
+    const value = candidate[key];
+    if (typeof value !== 'function') continue;
+    const existing = s3MethodAuthority.get(value);
+    if (existing !== undefined && existing !== token) {
+      throw new TypeError('S3 adapter methods have conflicting authority.');
+    }
+    s3MethodAuthority.set(value, token);
+  }
+}
+
+function attachS3AdapterAuthority(adapter: Adapter, raw: object): object {
+  const existing = s3AdapterAuthorityTokenOf(adapter);
+  if (existing === conflictingS3Authority) {
+    throw new TypeError('S3 adapter authority is inconsistent.');
+  }
+  const token = existing ?? Object.freeze({});
+  const state = s3AuthorityState.get(token);
+  if (state !== undefined && state.raw !== raw) {
+    throw new TypeError('S3 adapter authority raw client cannot be changed.');
+  }
+  if (state === undefined) s3AuthorityState.set(token, { raw });
+  s3AdapterAuthority.set(adapter, token);
+  bindS3AdapterAuthorityMethods(adapter, token);
+  return token;
+}
+
+function setS3AdapterProvenance(
+  target: object,
+  adapter: Adapter,
+  provenance: FilesSdkS3AdapterProvenance,
+): FilesSdkS3AdapterProvenanceRecord {
+  const existing = s3AdapterProvenanceOfRaw(target);
+  if (existing !== undefined) {
+    if (
+      existing.provenance !== provenance ||
+      mismatchedS3Authority(adapter, existing.surface) !== undefined
+    ) {
+      throw new TypeError('S3 adapter provenance cannot be changed.');
+    }
+    s3AdapterProvenance.set(target, existing);
+    return existing;
+  }
+  const record = Object.freeze({
+    provenance,
+    surface: s3AuthoritySnapshot(adapter),
+  });
+  s3AdapterProvenance.set(target, record);
+  return record;
+}
+
+function s3AdapterProvenanceOfRaw(
+  raw: object,
+): FilesSdkS3AdapterProvenanceRecord | undefined {
+  return s3AdapterProvenance.get(raw);
+}
+
+function s3AuthoritySnapshot(adapter: Adapter): FilesSdkS3AuthoritySnapshot {
+  const candidate = adapter as unknown as Record<PropertyKey, unknown>;
+  return Object.freeze(
+    Object.fromEntries(
+      FILES_SDK_S3_AUTHORITY_KEYS.map((key) => {
+        const present = key in candidate;
+        return [
+          key,
+          Object.freeze({
+            present,
+            value: present ? candidate[key] : undefined,
+          }),
+        ];
+      }),
+    ) as Record<FilesSdkS3AuthorityKey, FilesSdkS3AuthoritySnapshotEntry>,
+  );
+}
+
+function mismatchedS3Authority(
+  adapter: Adapter,
+  snapshot: FilesSdkS3AuthoritySnapshot,
+): FilesSdkS3AuthorityKey | undefined {
+  const candidate = adapter as unknown as Record<PropertyKey, unknown>;
+  try {
+    return FILES_SDK_S3_AUTHORITY_KEYS.find((key) => {
+      const present = key in candidate;
+      const expected = snapshot[key];
+      return (
+        present !== expected.present ||
+        !Object.is(present ? candidate[key] : undefined, expected.value)
+      );
+    });
+  } catch {
+    return FILES_SDK_S3_AUTHORITY_KEYS[0];
+  }
+}
+
+/** Rejects adapters already carrying reserved storage S3 extensions. */
+export function assertFilesSdkS3AdapterHasNoReservedExtensions(
+  adapter: Adapter,
+): void {
+  const reserved = filesSdkS3ReservedExtensionOf(adapter);
+  if (reserved !== undefined) {
+    throw new TypeError(
+      `S3 adapter already defines reserved extension "${reserved}".`,
+    );
+  }
+}
+
+function filesSdkS3ReservedExtensionOf(
+  adapter: Adapter,
+): (typeof FILES_SDK_S3_RESERVED_EXTENSION_KEYS)[number] | undefined {
+  const candidate = adapter as unknown as Record<PropertyKey, unknown>;
+  try {
+    return FILES_SDK_S3_RESERVED_EXTENSION_KEYS.find((key) => key in candidate);
+  } catch {
+    return FILES_SDK_S3_RESERVED_EXTENSION_KEYS[0];
+  }
+}
+
+/** Records that an S3 adapter was constructed but not provider-decorated. */
+export function markFilesSdkS3AdapterUndecorated(adapter: Adapter): void {
+  const raw = adapterRawObject(adapter);
+  if (raw === undefined) {
+    throw new TypeError('S3 adapter must expose an object raw client.');
+  }
+  attachS3AdapterAuthority(adapter, raw);
+  undecoratedS3Adapters.add(raw);
+}
+
+/** Records the provider verification state of one decorated S3 adapter. */
+export function markFilesSdkS3AdapterProvenance(
+  adapter: Adapter,
+  provenance: FilesSdkS3AdapterProvenance,
+): void {
+  const raw = adapterRawObject(adapter);
+  if (raw === undefined) {
+    throw new TypeError('S3 adapter must expose an object raw client.');
+  }
+  markFilesSdkS3RawClientProvenance(raw, adapter, provenance);
+}
+
+/** Records final provider verification state on one stable raw S3 client. */
+export function markFilesSdkS3RawClientProvenance(
+  raw: object,
+  adapter: Adapter,
+  provenance: FilesSdkS3AdapterProvenance,
+): void {
+  const authority = attachS3AdapterAuthority(adapter, raw);
+  const record = setS3AdapterProvenance(raw, adapter, provenance);
+  s3AuthorityState.set(authority, { raw, record });
+  bindS3AdapterAuthorityMethods(adapter, authority);
+}
+
+function isUndecoratedS3Raw(raw: object): boolean {
+  return undecoratedS3Adapters.has(raw);
+}
+
+function isStructuralS3Raw(raw: object): boolean {
+  try {
+    const candidate = raw as {
+      readonly config?: unknown;
+      readonly send?: unknown;
+    };
+    return (
+      typeof candidate.send === 'function' &&
+      typeof candidate.config === 'object' &&
+      candidate.config !== null &&
+      (candidate.config as { readonly serviceId?: unknown }).serviceId === 'S3'
+    );
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Optional adapter extension for providers that can conditionally copy an
@@ -750,6 +1042,208 @@ function uploadResultOf(result: UploadResult): StorageUploadResult {
   };
 }
 
+function normalizeFilesSdkPrefix(prefix: unknown): string {
+  if (prefix === undefined) return '';
+  if (typeof prefix !== 'string') {
+    throw new StorageError('prefix must be a string.', {
+      code: StorageErrorCode.INVALID_ARGUMENT,
+      permanent: true,
+    });
+  }
+  const normalized = prefix.replaceAll(/^\/+|(?<!\/)\/+$/gu, '');
+  if (normalized.length === 0 || normalized.includes('\0')) {
+    throw new StorageError(
+      'prefix must be a non-empty string without null bytes.',
+      {
+        code: StorageErrorCode.INVALID_ARGUMENT,
+        permanent: true,
+      },
+    );
+  }
+  if (
+    normalized.split('/').some((segment) => segment === '.' || segment === '..')
+  ) {
+    throw new StorageError('prefix must not contain . or .. path segments.', {
+      code: StorageErrorCode.INVALID_ARGUMENT,
+      permanent: true,
+    });
+  }
+  return normalized;
+}
+
+function physicalPluginKey(
+  prefix: string,
+  key: unknown,
+): { readonly logicalKey: string; readonly physicalKey: string } {
+  if (typeof key !== 'string' || key.length === 0) {
+    throw new StorageError('The final plugin key must be a non-empty string.', {
+      code: StorageErrorCode.INVALID_ARGUMENT,
+      permanent: true,
+    });
+  }
+  if (key.includes('\0')) {
+    throw new StorageError(
+      'The final plugin key must not contain null bytes.',
+      {
+        code: StorageErrorCode.INVALID_ARGUMENT,
+        key,
+        permanent: true,
+      },
+    );
+  }
+  const normalized = key.replace(/^\/+/u, '');
+  if (
+    normalized.split('/').some((segment) => segment === '.' || segment === '..')
+  ) {
+    throw new StorageError(
+      'The final plugin key must not contain . or .. path segments.',
+      {
+        code: StorageErrorCode.INVALID_ARGUMENT,
+        key,
+        permanent: true,
+      },
+    );
+  }
+  return {
+    logicalKey: key,
+    physicalKey: prefix.length === 0 ? key : `${prefix}/${normalized}`,
+  };
+}
+
+function assertPhysicalPluginBudget(
+  physicalKey: string,
+  maxBytes: number | undefined,
+  logicalKey?: string,
+): void {
+  if (
+    maxBytes === undefined ||
+    new TextEncoder().encode(physicalKey).byteLength <= maxBytes
+  ) {
+    return;
+  }
+  throw new StorageError(
+    `The combined storage prefix and key exceed the provider's ${maxBytes}-byte physical-key limit.`,
+    {
+      code: StorageErrorCode.LIMIT_EXCEEDED,
+      ...(logicalKey !== undefined && { key: logicalKey }),
+      permanent: true,
+    },
+  );
+}
+
+function physicalKeyGuardPlugin(
+  prefix: string,
+  maxBytes: number | undefined,
+): FilesPlugin {
+  const assertKey = (key: unknown): string => {
+    const resolved = physicalPluginKey(prefix, key);
+    assertPhysicalPluginBudget(
+      resolved.physicalKey,
+      maxBytes,
+      resolved.logicalKey,
+    );
+    return resolved.logicalKey;
+  };
+  const assertListOptions = (options: unknown): ListOptions | undefined => {
+    if (
+      options !== undefined &&
+      (typeof options !== 'object' || options === null)
+    ) {
+      throw new StorageError(
+        'The final plugin list options must be an object.',
+        {
+          code: StorageErrorCode.INVALID_ARGUMENT,
+          permanent: true,
+        },
+      );
+    }
+    const listPrefix = (options as { readonly prefix?: unknown } | undefined)
+      ?.prefix;
+    if (listPrefix === undefined || listPrefix === '') {
+      if (prefix.length > 0) {
+        assertPhysicalPluginBudget(`${prefix}/`, maxBytes);
+      }
+      return options === undefined
+        ? undefined
+        : (() => {
+            const { prefix: _prefix, ...rest } = options as ListOptions;
+            return Object.freeze({
+              ...rest,
+              ...(listPrefix === '' && { prefix: listPrefix }),
+            });
+          })();
+    }
+    if (typeof listPrefix !== 'string') {
+      throw new StorageError('The final plugin list prefix must be a string.', {
+        code: StorageErrorCode.INVALID_ARGUMENT,
+        permanent: true,
+      });
+    }
+    const resolved = physicalPluginKey(prefix, listPrefix);
+    assertPhysicalPluginBudget(
+      resolved.physicalKey,
+      maxBytes,
+      resolved.logicalKey,
+    );
+    return Object.freeze({
+      ...(options as ListOptions),
+      prefix: resolved.logicalKey,
+    });
+  };
+  return {
+    name: '@nestm/storage/physical-key-guard',
+    wrap: handlers({
+      copy: (operation, next) => {
+        const from = assertKey(operation.from);
+        const to = assertKey(operation.to);
+        return next(Object.freeze({ ...operation, from, to }));
+      },
+      delete: (operation, next) => {
+        const key = assertKey(operation.key);
+        return next(Object.freeze({ ...operation, key }));
+      },
+      download: (operation, next) => {
+        const key = assertKey(operation.key);
+        return next(Object.freeze({ ...operation, key }));
+      },
+      exists: (operation, next) => {
+        const key = assertKey(operation.key);
+        return next(Object.freeze({ ...operation, key }));
+      },
+      head: (operation, next) => {
+        const key = assertKey(operation.key);
+        return next(Object.freeze({ ...operation, key }));
+      },
+      list: (operation, next) => {
+        const options = assertListOptions(operation.options);
+        return next(
+          Object.freeze({
+            ...operation,
+            ...(options !== undefined && { options }),
+          }),
+        );
+      },
+      move: (operation, next) => {
+        const from = assertKey(operation.from);
+        const to = assertKey(operation.to);
+        return next(Object.freeze({ ...operation, from, to }));
+      },
+      signedUploadUrl: (operation, next) => {
+        const key = assertKey(operation.key);
+        return next(Object.freeze({ ...operation, key }));
+      },
+      upload: (operation, next) => {
+        const key = assertKey(operation.key);
+        return next(Object.freeze({ ...operation, key }));
+      },
+      url: (operation, next) => {
+        const key = assertKey(operation.key);
+        return next(Object.freeze({ ...operation, key }));
+      },
+    }),
+  };
+}
+
 export class FilesSdkStorageDriver<
   AdapterType extends Adapter = Adapter,
 > implements StorageDriver {
@@ -770,21 +1264,102 @@ export class FilesSdkStorageDriver<
     FilesSdkSignedDownloadPolicyAdapter | undefined;
 
   constructor(options: FilesSdkDriverOptions<AdapterType>) {
-    this.#files = new Files(options);
-    this.#name = options.adapter.name;
-    this.#conditionalCopy = conditionalCopyAdapterOf(options.adapter);
-    this.#conditionalDelete = conditionalDeleteAdapterOf(options.adapter);
-    this.#conditionalRead = conditionalReadAdapterOf(options.adapter);
-    this.#conditionalUpload = conditionalUploadAdapterOf(options.adapter);
-    this.#physicalKey = physicalKeyAdapterOf(options.adapter);
+    const raw = adapterRawObject(options.adapter);
+    const rawProvenance =
+      raw === undefined ? undefined : s3AdapterProvenanceOfRaw(raw);
+    const authorityToken = s3AdapterAuthorityTokenOf(options.adapter);
+    const authorityState =
+      typeof authorityToken === 'object'
+        ? s3AuthorityState.get(authorityToken)
+        : undefined;
+    const authorityInvalid =
+      authorityToken === conflictingS3Authority ||
+      (authorityState !== undefined &&
+        (authorityState.record === undefined ||
+          raw === undefined ||
+          (raw !== authorityState.raw &&
+            rawProvenance !== authorityState.record)));
+    const s3Provenance = authorityState?.record ?? rawProvenance;
+    if (
+      authorityInvalid ||
+      (s3Provenance === undefined &&
+        raw !== undefined &&
+        (isUndecoratedS3Raw(raw) || isStructuralS3Raw(raw)))
+    ) {
+      throw new StorageError(
+        'Raw S3 adapters must be configured with withS3Capabilities() or createS3StorageDriver().',
+        {
+          code: StorageErrorCode.INVALID_ARGUMENT,
+          permanent: true,
+        },
+      );
+    }
+    const mismatchedAuthority =
+      s3Provenance === undefined
+        ? undefined
+        : mismatchedS3Authority(options.adapter, s3Provenance.surface);
+    if (mismatchedAuthority !== undefined) {
+      throw new StorageError(
+        `S3 adapter authority "${mismatchedAuthority}" does not match its verified provider profile.`,
+        {
+          code: StorageErrorCode.INVALID_ARGUMENT,
+          permanent: true,
+        },
+      );
+    }
+    const adapterForFiles =
+      s3Provenance === undefined
+        ? options.adapter
+        : (Object.freeze({ ...options.adapter }) as AdapterType);
+    const copiedAuthorityMismatch =
+      s3Provenance === undefined
+        ? undefined
+        : mismatchedS3Authority(adapterForFiles, s3Provenance.surface);
+    if (copiedAuthorityMismatch !== undefined) {
+      throw new StorageError(
+        `S3 adapter authority "${copiedAuthorityMismatch}" changed while it was being bound.`,
+        {
+          code: StorageErrorCode.INVALID_ARGUMENT,
+          permanent: true,
+        },
+      );
+    }
+    const readOnly =
+      options.readonly === true || s3Provenance?.provenance === 'unverified';
+    this.#physicalKey = physicalKeyAdapterOf(adapterForFiles);
+    const guardedPrefix = normalizeFilesSdkPrefix(options.prefix);
+    const plugins = [
+      ...(options.plugins ?? []),
+      physicalKeyGuardPlugin(
+        guardedPrefix,
+        this.#physicalKey?.physicalKey.maxBytes,
+      ),
+    ];
+    this.#files = new Files({
+      ...options,
+      adapter: adapterForFiles,
+      plugins,
+      readonly: readOnly,
+    });
+    this.#name = adapterForFiles.name;
+    this.#conditionalCopy = conditionalCopyAdapterOf(adapterForFiles);
+    this.#conditionalDelete = conditionalDeleteAdapterOf(adapterForFiles);
+    this.#conditionalRead = conditionalReadAdapterOf(adapterForFiles);
+    this.#conditionalUpload = conditionalUploadAdapterOf(adapterForFiles);
     this.#prefix = this.#files.prefix;
+    if (guardedPrefix !== this.#prefix) {
+      throw new StorageError('Storage prefix normalization was inconsistent.', {
+        code: StorageErrorCode.INVALID_ARGUMENT,
+        permanent: true,
+      });
+    }
     this.#assertPhysicalKeyBudget(this.#prefix);
-    this.#readOnly = options.readonly === true;
+    this.#readOnly = readOnly;
     this.#retries = storageRetryOptions(options.retries);
     this.#signal = options.signal;
     this.#timeout = options.timeout;
-    this.#signedUploadPolicy = signedUploadPolicyAdapterOf(options.adapter);
-    this.#signedDownloadPolicy = signedDownloadPolicyAdapterOf(options.adapter);
+    this.#signedUploadPolicy = signedUploadPolicyAdapterOf(adapterForFiles);
+    this.#signedDownloadPolicy = signedDownloadPolicyAdapterOf(adapterForFiles);
   }
 
   get name(): string {
@@ -1217,9 +1792,7 @@ export class FilesSdkStorageDriver<
   }
 
   async list(options?: StorageListOptions): Promise<StorageListResult> {
-    if (options?.prefix !== undefined && options.prefix.length > 0) {
-      this.#assertLogicalKey(options.prefix);
-    }
+    this.#assertListPhysicalPrefix(options?.prefix);
     return this.#call(async () => {
       const result = await this.#files.list(listOptions(options));
       return {
@@ -1244,9 +1817,6 @@ export class FilesSdkStorageDriver<
     options?: StorageSearchOptions,
   ): AsyncGenerator<StorageObjectMetadata, void> {
     try {
-      if (options?.prefix !== undefined && options.prefix.length > 0) {
-        this.#assertLogicalKey(options.prefix);
-      }
       for await (const file of this.#files.search(
         pattern,
         searchOptions(options),
@@ -1313,7 +1883,7 @@ export class FilesSdkStorageDriver<
       });
     }
     const physicalKey =
-      this.#prefix.length === 0 ? normalized : `${this.#prefix}/${normalized}`;
+      this.#prefix.length === 0 ? key : `${this.#prefix}/${normalized}`;
     this.#assertPhysicalKeyBudget(physicalKey, key);
     return physicalKey;
   }
@@ -1322,14 +1892,28 @@ export class FilesSdkStorageDriver<
     this.#path(key);
   }
 
-  #assertPhysicalKeyBudget(physicalKey: string, logicalKey?: string): void {
-    const maxBytes = this.#physicalKey?.physicalKey.maxBytes;
-    if (
-      maxBytes === undefined ||
-      new TextEncoder().encode(physicalKey).byteLength <= maxBytes
-    ) {
+  #assertListPhysicalPrefix(prefix: string | undefined): void {
+    if (prefix !== undefined && prefix.length > 0) {
+      this.#assertLogicalKey(prefix);
       return;
     }
+    if (this.#prefix.length > 0) {
+      this.#assertPhysicalKeyBudget(`${this.#prefix}/`);
+    }
+  }
+
+  #physicalKeyExceedsBudget(physicalKey: string): boolean {
+    const maxBytes = this.#physicalKey?.physicalKey.maxBytes;
+    return (
+      maxBytes !== undefined &&
+      new TextEncoder().encode(physicalKey).byteLength > maxBytes
+    );
+  }
+
+  #assertPhysicalKeyBudget(physicalKey: string, logicalKey?: string): void {
+    const maxBytes = this.#physicalKey?.physicalKey.maxBytes;
+    if (maxBytes === undefined || !this.#physicalKeyExceedsBudget(physicalKey))
+      return;
     throw new StorageError(
       `The combined storage prefix and key exceed the provider's ${maxBytes}-byte physical-key limit.`,
       {

@@ -347,8 +347,17 @@ function getS3MinimumPeerSource(minimumVersion) {
 import { createRequire } from 'node:module';
 
 import { S3Client } from '@aws-sdk/client-s3';
-import { StorageClient } from '@nestm/storage/core';
-import { createS3StorageDriver } from '@nestm/storage/files-sdk/s3';
+import {
+  StorageClient,
+  StorageErrorCode,
+} from '@nestm/storage/core';
+import { createFilesSdkDriver } from '@nestm/storage/files-sdk';
+import {
+  createS3StorageDriver,
+  defineS3ProviderProfile,
+  s3,
+  withS3Capabilities,
+} from '@nestm/storage/files-sdk/s3';
 
 const require = createRequire(import.meta.url);
 const clientS3Package = require('@aws-sdk/client-s3/package.json');
@@ -382,14 +391,128 @@ S3Client.prototype.send = function (...arguments_) {
 };
 
 try {
+  const baseAdapterOptions = {
+    bucket: 'minimum-peer-bucket',
+    credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+    region: 'us-east-1',
+  };
+
+  const forgedUndecorated = s3(baseAdapterOptions);
+  try {
+    Object.defineProperty(
+      forgedUndecorated.raw,
+      Symbol.for('@nestm/storage/files-sdk/s3-adapter-provenance'),
+      {
+        configurable: false,
+        enumerable: false,
+        value: 'verified',
+        writable: false,
+      },
+    );
+    assert.throws(
+      () => createFilesSdkDriver({ adapter: forgedUndecorated }),
+      (error) => error?.code === StorageErrorCode.INVALID_ARGUMENT,
+    );
+    assert.throws(
+      () =>
+        createFilesSdkDriver({
+          adapter: { ...forgedUndecorated, name: 'renamed-forged-s3' },
+        }),
+      (error) => error?.code === StorageErrorCode.INVALID_ARGUMENT,
+    );
+    assert.throws(
+      () =>
+        createFilesSdkDriver({
+          adapter: {
+            ...forgedUndecorated,
+            name: 'renamed-replaced-raw-s3',
+            raw: {},
+          },
+        }),
+      (error) => error?.code === StorageErrorCode.INVALID_ARGUMENT,
+    );
+    const symbolForgingRaw = new Proxy(forgedUndecorated.raw, {
+      get(target, property, receiver) {
+        if (
+          typeof property === 'symbol' &&
+          property.description?.toLowerCase().includes('provenance')
+        ) {
+          return 'verified';
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    assert.throws(
+      () =>
+        createFilesSdkDriver({
+          adapter: {
+            ...forgedUndecorated,
+            name: 'renamed-symbol-forging-s3',
+            raw: symbolForgingRaw,
+          },
+        }),
+      (error) => error?.code === StorageErrorCode.INVALID_ARGUMENT,
+    );
+  } finally {
+    forgedUndecorated.raw.destroy();
+  }
+
+  const unverifiedBase = s3({
+    ...baseAdapterOptions,
+    endpoint: 'https://unverified.minimum-peer.invalid',
+  });
+  const unverifiedClient = new StorageClient(
+    'minimum-peer-unverified',
+    createFilesSdkDriver({
+      adapter: withS3Capabilities(unverifiedBase),
+      readonly: false,
+    }),
+  );
+  try {
+    assert.equal(unverifiedClient.capabilities.signedUpload, false);
+    await assert.rejects(
+      () => unverifiedClient.upload('blocked.txt', 'blocked'),
+      (error) => error?.code === StorageErrorCode.READ_ONLY,
+    );
+  } finally {
+    await unverifiedClient.onApplicationShutdown();
+  }
+
+  const narrowBase = s3({
+    ...baseAdapterOptions,
+    endpoint: 'https://verified.minimum-peer.invalid',
+  });
+  const narrowAdapter = withS3Capabilities(narrowBase, {
+    providerProfile: defineS3ProviderProfile({
+      name: 'minimum-peer-narrow',
+      physicalKey: { maxBytes: 512 },
+      conditionalRead: { etag: true, version: false },
+    }),
+  });
+  try {
+    assert.throws(
+      () =>
+        createFilesSdkDriver({
+          adapter: {
+            ...narrowAdapter,
+            conditionalCreate: { resultEtag: true },
+            async uploadConditional() {
+              throw new Error('widened alias must never dispatch');
+            },
+          },
+        }),
+      (error) => error?.code === StorageErrorCode.INVALID_ARGUMENT,
+    );
+  } finally {
+    narrowBase.raw.destroy();
+  }
+
+  assert.equal(serializedRequests.length, 0);
+
   const client = new StorageClient(
     'minimum-peer',
     createS3StorageDriver({
-      adapter: {
-        bucket: 'minimum-peer-bucket',
-        credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
-        region: 'us-east-1',
-      },
+      adapter: baseAdapterOptions,
     }),
   );
 

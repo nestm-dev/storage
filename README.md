@@ -36,6 +36,14 @@ such as `files-sdk/gcs`:
 pnpm add files-sdk@2.2.3
 ```
 
+Pass AWS-SDK-backed S3 adapters through the package-owned `s3()` and
+`withS3Capabilities()` helpers (or use `createS3StorageDriver()`).
+`createFilesSdkDriver()` rejects a structurally S3-backed raw adapter that has
+not crossed this provenance boundary, even when a wrapper renames or proxies
+the adapter. This prevents callers from bypassing endpoint and provider-profile
+checks by omitting the capability decorator or replacing the public `raw`
+property while retaining methods closed over the original client.
+
 Install only the native SDKs required by the chosen provider. For example:
 
 ```sh
@@ -471,9 +479,19 @@ health checks, and startup validation.
 The `s3` slug additionally carries the verified per-operation profile and
 signed-policy capabilities described under
 [Exact provider conditions and staged-object promotion](#exact-provider-conditions-and-staged-object-promotion);
-every other provider exposes exactly what its adapter declares. When the
-provider _is_ known at build time, import `@nestm/storage/files-sdk/s3` or
-`@nestm/storage/files-sdk/fs` directly and skip the indirection.
+every provider not backed by the AWS S3 SDK exposes what its adapter declares.
+When the provider _is_ known at build time, import
+`@nestm/storage/files-sdk/s3` or `@nestm/storage/files-sdk/fs` directly and skip
+the indirection.
+
+S3 endpoint and public-URL provenance is resolved from the adapter that
+`files-sdk` actually constructs, including values merged from `configJson`.
+An unaudited endpoint forces the driver read-only, and a `publicBaseUrl` removes
+the signed-download TTL guarantee because the resulting public URL does not
+expire. AWS-SDK-backed noncanonical provider slugs (for example an S3-compatible
+provider wrapper) also default to unverified/read-only; only the canonical
+`s3` provider may infer the native AWS profile, and a custom endpoint becomes
+writable only with an explicit branded `S3ProviderProfile`.
 
 Before enabling conditional operations for a custom S3-compatible endpoint,
 run the reusable
@@ -530,6 +548,23 @@ copy, destination copy, atomic source-and-destination promotion, and multipart
 completion. They also declare the complete physical-key byte budget. Callers
 must check the exact primitive they need; a missing field is unsupported and is
 never widened from another operation.
+
+The physical-key budget applies to the exact key sent to the adapter. It
+therefore counts leading slashes for unprefixed drivers, the separator added to
+a configured driver prefix, and provider prefixes derived for `list` or
+`search`. Over-budget object keys and explicit list/search prefixes fail before
+provider dispatch rather than being normalized into a shorter key. A glob's
+provider prefix is the exact prefix inferred by files-sdk itself, and that
+derived list operation passes through the same final guard. A non-positive
+`maxResults` performs no provider walk and therefore dispatches no prefix.
+
+Adapters and plugins execute as trusted in-process code; this package does not
+attempt to sandbox a plugin that performs its own network or filesystem I/O.
+For supported plugin pipelines that forward operations through `next`, the
+physical-key guard is the innermost wrapper, after caller plugins and before
+the adapter call. A plugin therefore cannot widen an upload key or list/search
+prefix past the declared byte ceiling while still using the normal dispatch
+pipeline.
 
 Storage-facing ETags have one canonical representation: a bare, case-sensitive
 opaque token with no HTTP quotes. Canonical values contain 1–1024 visible
@@ -592,7 +627,16 @@ explicit conformance-verified `S3ProviderProfile` is supplied.
 `withS3Capabilities()` decorates a raw S3 adapter in place and may be applied
 only once. Construct a fresh raw adapter when selecting a different profile;
 reapplying the helper is rejected so a previous broader profile cannot survive
-a later narrower declaration.
+a later narrower declaration. The selected profile is bound to the exact
+reserved capability and operation members installed by that decoration;
+same-client aliases may change display metadata but cannot add or replace those
+members to widen the profile.
+
+The package-owned `s3()` factory also retains whether `publicBaseUrl` was
+configured even when the second `withS3Capabilities()` options object is
+omitted. In that case `signedDownloadPolicy.expiresIn` is false. Foreign S3
+adapters whose construction metadata is unavailable receive the same
+conservative false value instead of claiming an enforceable TTL.
 
 ### Resumable uploads
 

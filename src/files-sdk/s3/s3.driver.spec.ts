@@ -15,12 +15,15 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { inspect } from 'node:util';
 
+import { s3 as upstreamS3 } from 'files-sdk/s3';
+
 import { StorageClient } from '../../storage.client.js';
 import {
   isStorageError,
   StorageErrorCode,
   type StorageError,
 } from '../../storage.error.js';
+import { createFilesSdkDriver } from '../files-sdk.driver.js';
 import {
   AWS_S3_PROVIDER_PROFILE,
   CLOUDFLARE_R2_PROVIDER_PROFILE,
@@ -233,6 +236,189 @@ describe('createS3StorageDriver', () => {
       ).toThrow(/does not match the SDK client endpoint provenance/u);
     } finally {
       native.raw.destroy();
+    }
+  });
+
+  it('retains direct S3 public-URL construction policy when helper options are omitted', () => {
+    const publicAdapter = s3({
+      ...adapter,
+      publicBaseUrl: 'https://cdn.example.test',
+    });
+    const signedAdapter = s3(adapter);
+    const unknownAdapter = upstreamS3({
+      ...adapter,
+      publicBaseUrl: 'https://foreign-cdn.example.test',
+    });
+    try {
+      expect(withS3Capabilities(publicAdapter).signedDownloadPolicy).toEqual({
+        expiresIn: false,
+      });
+      expect(withS3Capabilities(signedAdapter).signedDownloadPolicy).toEqual({
+        expiresIn: true,
+      });
+      expect(withS3Capabilities(unknownAdapter).signedDownloadPolicy).toEqual({
+        expiresIn: false,
+      });
+    } finally {
+      publicAdapter.raw.destroy();
+      signedAdapter.raw.destroy();
+      unknownAdapter.raw.destroy();
+    }
+  });
+
+  it('does not export S3 construction-metadata authority', async () => {
+    const publicApi = await import('./index.js');
+
+    expect(publicApi).not.toHaveProperty('recordS3AdapterConstructionMetadata');
+    expect(publicApi).not.toHaveProperty('recordS3ConstructionMetadata');
+  });
+
+  it('forces direct unverified custom helper composition read-only', async () => {
+    const send = vi
+      .spyOn(S3Client.prototype, 'send')
+      .mockRejectedValue(new Error('unexpected S3 dispatch') as never);
+    const base = s3({
+      ...adapter,
+      endpoint: 'https://unverified.objects.example.test',
+    });
+    const client = new StorageClient(
+      'direct-unverified-custom',
+      createFilesSdkDriver({
+        adapter: withS3Capabilities(base),
+        readonly: false,
+      }),
+    );
+    try {
+      expect(client.capabilities.signedUpload).toBe(false);
+      await expect(
+        client.upload('blocked.txt', 'blocked'),
+      ).rejects.toMatchObject({
+        code: StorageErrorCode.READ_ONLY,
+      });
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      await client.onApplicationShutdown();
+      send.mockRestore();
+    }
+  });
+
+  it.each([
+    ['native', undefined],
+    ['custom', 'https://raw.objects.example.test'],
+  ] as const)(
+    'rejects an undecorated raw %s S3 adapter at driver construction',
+    (_provenance, endpoint) => {
+      const send = vi
+        .spyOn(S3Client.prototype, 'send')
+        .mockRejectedValue(new Error('unexpected S3 dispatch') as never);
+      const base = s3({
+        ...adapter,
+        ...(endpoint === undefined ? {} : { endpoint }),
+      });
+      try {
+        expect(() =>
+          createFilesSdkDriver({ adapter: base, readonly: false }),
+        ).toThrow(
+          expect.objectContaining({
+            code: StorageErrorCode.INVALID_ARGUMENT,
+            permanent: true,
+          }),
+        );
+        expect(send).not.toHaveBeenCalled();
+      } finally {
+        base.raw.destroy();
+        send.mockRestore();
+      }
+    },
+  );
+
+  it('rejects a renamed spread alias of an undecorated package S3 adapter', () => {
+    const send = vi
+      .spyOn(S3Client.prototype, 'send')
+      .mockRejectedValue(new Error('unexpected S3 dispatch') as never);
+    const base = s3(adapter);
+    const renamed = { ...base, name: 'renamed-s3' };
+    try {
+      expect(() =>
+        createFilesSdkDriver({ adapter: renamed, readonly: false }),
+      ).toThrow(
+        expect.objectContaining({
+          code: StorageErrorCode.INVALID_ARGUMENT,
+          permanent: true,
+        }),
+      );
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      base.raw.destroy();
+      send.mockRestore();
+    }
+  });
+
+  it('rejects preseeded broad storage extensions before applying a narrow profile', () => {
+    const base = Object.assign(s3(adapter), {
+      conditionalCreate: { resultEtag: true },
+      uploadConditional: vi.fn(),
+    });
+    const narrow = defineS3ProviderProfile({
+      name: 'narrow-read-only',
+      physicalKey: { maxBytes: 512 },
+      conditionalRead: { etag: true, version: false },
+    });
+    try {
+      expect(() =>
+        withS3Capabilities(base, { providerProfile: narrow }),
+      ).toThrow(/reserved extension/u);
+      expect(() =>
+        createFilesSdkDriver({
+          adapter: { ...base, name: 'renamed-preseeded-s3' },
+        }),
+      ).toThrow(
+        expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+      );
+    } finally {
+      base.raw.destroy();
+    }
+  });
+
+  it('commits no final provenance when capability decoration throws', () => {
+    const base = s3(adapter);
+    const throwing = new Proxy(base, {
+      set() {
+        throw new TypeError('decoration blocked');
+      },
+    });
+    try {
+      expect(() => withS3Capabilities(throwing)).toThrow('decoration blocked');
+      expect(() =>
+        createFilesSdkDriver({
+          adapter: { ...base, name: 'renamed-partial-s3' },
+        }),
+      ).toThrow(
+        expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+      );
+    } finally {
+      base.raw.destroy();
+    }
+  });
+
+  it('commits no final provenance when adapter freezing throws', () => {
+    const base = s3(adapter);
+    const throwing = new Proxy(base, {
+      preventExtensions() {
+        throw new TypeError('freeze blocked');
+      },
+    });
+    try {
+      expect(() => withS3Capabilities(throwing)).toThrow('freeze blocked');
+      expect(() =>
+        createFilesSdkDriver({
+          adapter: { ...base, name: 'renamed-unfrozen-s3' },
+        }),
+      ).toThrow(
+        expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+      );
+    } finally {
+      base.raw.destroy();
     }
   });
 

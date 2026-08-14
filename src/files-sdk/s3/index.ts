@@ -11,7 +11,7 @@ import {
 import { Readable } from 'node:stream';
 import {
   mapS3Error,
-  s3,
+  s3 as createFilesSdkS3Adapter,
   type S3Adapter,
   type S3AdapterOptions,
 } from 'files-sdk/s3';
@@ -37,7 +37,10 @@ import {
   storageEtagHeader,
 } from '../../storage-etag.js';
 import {
+  assertFilesSdkS3AdapterHasNoReservedExtensions,
   createFilesSdkDriver,
+  markFilesSdkS3AdapterUndecorated,
+  markFilesSdkS3RawClientProvenance,
   type FilesSdkConditionalCopyAdapter,
   type FilesSdkConditionalDeleteAdapter,
   type FilesSdkConditionalReadAdapter,
@@ -49,6 +52,10 @@ import {
   type FilesSdkStorageDriver,
   mapFilesSdkError,
 } from '../files-sdk.driver.js';
+import {
+  getS3ConstructionMetadata,
+  recordS3ConstructionMetadata,
+} from './construction-metadata.js';
 
 export interface S3StorageDriverOptions extends Omit<
   FilesSdkDriverOptions<S3Adapter>,
@@ -693,8 +700,10 @@ function missingResultEtag(key: string): StorageError {
   );
 }
 
+type S3RequestAdapter = Pick<S3Adapter, 'bucket' | 'raw'>;
+
 async function uploadConditionalSingle(
-  base: S3Adapter,
+  base: S3RequestAdapter,
   key: string,
   body: StorageBody,
   conditional: StorageConditionalUploadOptions,
@@ -742,7 +751,7 @@ async function uploadConditionalSingle(
 }
 
 async function uploadConditionalMultipart(
-  base: S3Adapter,
+  base: S3RequestAdapter,
   key: string,
   body: StorageBody,
   conditional: StorageConditionalUploadOptions,
@@ -904,6 +913,16 @@ async function uploadConditionalMultipart(
 
 const configuredS3Clients = new WeakSet<S3Adapter['raw']>();
 
+/** Constructs the upstream S3 adapter while retaining security-relevant metadata. */
+export function s3(options: S3AdapterOptions): S3Adapter {
+  const adapter = createFilesSdkS3Adapter(options);
+  markFilesSdkS3AdapterUndecorated(adapter);
+  recordS3ConstructionMetadata(adapter.raw, {
+    publicBaseUrlConfigured: options.publicBaseUrl !== undefined,
+  });
+  return adapter;
+}
+
 /**
  * Adds only the exact operations declared by one verified provider profile.
  * Each raw adapter may be decorated once so capability state cannot depend on
@@ -915,12 +934,14 @@ export function withS3Capabilities(
     providerProfile?: S3ProviderProfile;
   } = {},
 ): S3StorageAdapter {
-  if (configuredS3Clients.has(base.raw)) {
+  const raw = base.raw;
+  if (configuredS3Clients.has(raw)) {
     throw new TypeError(
       'withS3Capabilities may only be applied once to an S3 adapter.',
     );
   }
-  const sdkHasCustomEndpoint = base.raw.config.isCustomEndpoint === true;
+  assertFilesSdkS3AdapterHasNoReservedExtensions(base);
+  const sdkHasCustomEndpoint = raw.config.isCustomEndpoint === true;
   if (options.endpoint !== undefined && !sdkHasCustomEndpoint) {
     throw new TypeError(
       'The declared S3 endpoint does not match the SDK client endpoint provenance.',
@@ -930,20 +951,34 @@ export function withS3Capabilities(
     // files-sdk does not expose this S3Client constructor option. Endpoint
     // resolution is lazy, so fixing the resolved SDK config before the adapter
     // is exposed prevents environment and shared-config endpoint redirection.
-    base.raw.config.ignoreConfiguredEndpointUrls = true;
+    raw.config.ignoreConfiguredEndpointUrls = true;
   }
+  const inferredNativeAws = base.name === 's3' && !sdkHasCustomEndpoint;
   const profile =
     options.providerProfile ??
-    (sdkHasCustomEndpoint
-      ? UNVERIFIED_S3_PROVIDER_PROFILE
-      : AWS_S3_PROVIDER_PROFILE);
+    (inferredNativeAws
+      ? AWS_S3_PROVIDER_PROFILE
+      : UNVERIFIED_S3_PROVIDER_PROFILE);
   assertVerifiedS3ProviderProfile(profile);
-  configuredS3Clients.add(base.raw);
+  const provenance =
+    options.providerProfile === undefined
+      ? inferredNativeAws
+        ? 'native'
+        : 'unverified'
+      : inferredNativeAws
+        ? 'native'
+        : 'verified';
+  const constructionMetadata = getS3ConstructionMetadata(raw);
+  const publicBaseUrlConfigured =
+    options.publicBaseUrl !== undefined ||
+    constructionMetadata?.publicBaseUrlConfigured === true;
+  const bucket = base.bucket;
+  const requestAdapter: S3RequestAdapter = { bucket, raw };
   const adapter = Object.assign(base, {
     physicalKey: profile.physicalKey,
     signedUploadPolicy: Object.freeze({ contentType: true, sizeRange: true }),
     signedDownloadPolicy: Object.freeze({
-      expiresIn: options.publicBaseUrl === undefined,
+      expiresIn: constructionMetadata !== undefined && !publicBaseUrlConfigured,
     }),
   } satisfies FilesSdkPhysicalKeyAdapter &
     FilesSdkSignedDownloadPolicyAdapter &
@@ -1007,11 +1042,11 @@ export function withS3Capabilities(
           );
         }
         await withS3Retry(promotion, 'copy', async (signal) => {
-          await base.raw.send(
+          await raw.send(
             new CopyObjectCommand({
-              Bucket: base.bucket,
+              Bucket: bucket,
               CopySource: copySource(
-                base.bucket,
+                bucket,
                 sourceKey,
                 promotion.sourceVersion,
               ),
@@ -1068,9 +1103,9 @@ export function withS3Capabilities(
           );
         }
         const result = await withS3Retry(options, 'download', (signal) =>
-          base.raw.send(
+          raw.send(
             new GetObjectCommand({
-              Bucket: base.bucket,
+              Bucket: bucket,
               ...(options.condition.etag !== undefined && {
                 IfMatch: etagHeader(
                   options.condition.etag,
@@ -1115,9 +1150,9 @@ export function withS3Capabilities(
         options: StorageConditionalDeleteOptions,
       ): Promise<void> {
         await withS3Retry(options, 'delete', async (signal) => {
-          await base.raw.send(
+          await raw.send(
             new DeleteObjectCommand({
-              Bucket: base.bucket,
+              Bucket: bucket,
               IfMatch: etagHeader(
                 options.condition.etag,
                 key,
@@ -1195,12 +1230,15 @@ export function withS3Capabilities(
           );
         }
         return multipartRequested
-          ? uploadConditionalMultipart(base, key, body, conditional)
-          : uploadConditionalSingle(base, key, body, conditional);
+          ? uploadConditionalMultipart(requestAdapter, key, body, conditional)
+          : uploadConditionalSingle(requestAdapter, key, body, conditional);
       },
     } satisfies FilesSdkConditionalUploadAdapter);
   }
 
+  Object.freeze(adapter);
+  markFilesSdkS3RawClientProvenance(raw, adapter, provenance);
+  configuredS3Clients.add(raw);
   return adapter;
 }
 
@@ -1225,5 +1263,5 @@ export function createS3StorageDriver(
   });
 }
 
-export { mapS3Error, s3 } from 'files-sdk/s3';
+export { mapS3Error };
 export type { S3Adapter, S3AdapterOptions, S3Sdk } from 'files-sdk/s3';
