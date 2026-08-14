@@ -312,6 +312,24 @@ workspace capability remains the authorization boundary even when approval is
 disabled. The module's `AiSdkService.files()` API is the model provider's file
 upload facility and is unrelated to storage workspaces.
 
+Atomic create collisions remain sanitized tool errors by default. Applications
+that model an existing destination as a normal tool result can map that one
+case while preserving replace/ETag conflicts as failures:
+
+```ts
+const tools = createAiSdkWorkspaceTools({
+  workspace,
+  mapCreateConflict: ({ path }) => ({
+    kind: 'artifact-conflict' as const,
+    path,
+    status: 'already-exists' as const,
+  }),
+});
+```
+
+The mapper receives only the logical workspace path; provider errors, object
+keys, and mount coordinates are never exposed.
+
 This logical confinement is sufficient for a `ToolLoopAgent` whose only file
 capabilities are these tools. It cannot constrain a coding harness that already
 has shell, `node:fs`, or subprocess access. For Codex/Claude-style harnesses,
