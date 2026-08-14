@@ -26,4 +26,13 @@ export function createMemoryStorageDriver(
   });
 }
 
+export {
+  createStorageProviderConformanceCases,
+  type StorageProviderConformanceCapabilities,
+  type StorageProviderConformanceCase,
+  type StorageProviderConformanceCaseResult,
+  type StorageProviderConformanceFixture,
+  type StorageProviderConformanceOptions,
+} from './provider-conformance.js';
+
 export type { MemoryAdapterOptions, MemorySeed } from 'files-sdk/memory';

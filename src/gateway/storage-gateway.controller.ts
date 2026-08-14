@@ -26,6 +26,7 @@ import {
   StorageErrorCode,
   isStorageError,
 } from '../storage.error.js';
+import { storageEtagHeader } from '../storage-etag.js';
 import { StorageService } from '../storage.service.js';
 import type {
   StorageByteRange,
@@ -328,14 +329,29 @@ async function* enforceUploadLimit(
   }
 }
 
+function providerEtagHeader(
+  object: StorageObject | StorageObjectMetadata,
+): string | undefined {
+  const etag =
+    object.etag === undefined ? undefined : storageEtagHeader(object.etag);
+  if (object.etag !== undefined && etag === undefined) {
+    throw new StorageError('Storage provider returned a malformed ETag.', {
+      code: StorageErrorCode.PROVIDER,
+      permanent: true,
+    });
+  }
+  return etag;
+}
+
 function setObjectHeaders(
   response: ServerResponse,
   object: StorageObject | StorageObjectMetadata,
+  etag: string | undefined,
 ): void {
   response.setHeader('content-length', String(object.size));
   response.setHeader('content-type', object.contentType);
-  if (object.etag !== undefined) {
-    response.setHeader('etag', object.etag);
+  if (etag !== undefined) {
+    response.setHeader('etag', etag);
   }
   if (object.lastModified !== undefined) {
     response.setHeader('last-modified', object.lastModified.toUTCString());
@@ -499,10 +515,17 @@ export class StorageGatewayController {
       const object = await client.downloadStream(objectKey, {
         ...(range !== undefined && { range }),
       });
+      let etag: string | undefined;
+      try {
+        etag = providerEtagHeader(object);
+      } catch (error) {
+        await object.body.cancel(error).catch(() => undefined);
+        throw error;
+      }
       const raw = rawResponseOf(response);
       raw.statusCode =
         range === undefined ? HttpStatus.OK : HttpStatus.PARTIAL_CONTENT;
-      setObjectHeaders(raw, object);
+      setObjectHeaders(raw, object, etag);
       const baseContentType = object.contentType
         .split(';', 1)[0]
         ?.trim()
@@ -627,9 +650,10 @@ export class StorageGatewayController {
       const metadata = await this.storage
         .use(this.options.store)
         .head(objectKey);
+      const etag = providerEtagHeader(metadata);
       const raw = rawResponseOf(response);
       raw.statusCode = HttpStatus.OK;
-      setObjectHeaders(raw, metadata);
+      setObjectHeaders(raw, metadata, etag);
       raw.end();
     });
   }

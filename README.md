@@ -36,6 +36,14 @@ such as `files-sdk/gcs`:
 pnpm add files-sdk@2.2.3
 ```
 
+Pass AWS-SDK-backed S3 adapters through the package-owned `s3()` and
+`withS3Capabilities()` helpers (or use `createS3StorageDriver()`).
+`createFilesSdkDriver()` rejects a structurally S3-backed raw adapter that has
+not crossed this provenance boundary, even when a wrapper renames or proxies
+the adapter. This prevents callers from bypassing endpoint and provider-profile
+checks by omitting the capability decorator or replacing the public `raw`
+property while retaining methods closed over the original client.
+
 Install only the native SDKs required by the chosen provider. For example:
 
 ```sh
@@ -49,6 +57,11 @@ pnpm add @google-cloud/storage google-auth-library
 # Azure Blob Storage
 pnpm add @azure/storage-blob @azure/core-auth @azure/identity
 ```
+
+`@aws-sdk/client-s3` 3.919.0 or newer is required. Earlier releases omit
+destination `If-Match` and `If-None-Match` from the serialized `CopyObject`
+request even when those fields appear in a newer compile-time command shape;
+the package peer range and packed minimum-peer smoke test enforce this floor.
 
 `files-sdk` currently declares its optional Nest peer for Nest 10 and 11. This
 library does not import `files-sdk/nestjs`; the Nest 12 integration is entirely
@@ -463,25 +476,48 @@ listStorageProviderSecretEnvVars('s3').map((variable) => variable.key);
 The catalog is pure data and pulls in no adapter, so it is safe in config UIs,
 health checks, and startup validation.
 
-The `s3` slug additionally carries the conditional-promotion and signed-policy
-capabilities described under
-[Race-free staged-object promotion](#race-free-staged-object-promotion); every
-other provider exposes exactly what its adapter declares. When the provider _is_
-known at build time, import `@nestm/storage/files-sdk/s3` or
-`@nestm/storage/files-sdk/fs` directly and skip the indirection.
+The `s3` slug additionally carries the verified per-operation profile and
+signed-policy capabilities described under
+[Exact provider conditions and staged-object promotion](#exact-provider-conditions-and-staged-object-promotion);
+every provider not backed by the AWS S3 SDK exposes what its adapter declares.
+When the provider _is_ known at build time, import
+`@nestm/storage/files-sdk/s3` or `@nestm/storage/files-sdk/fs` directly and skip
+the indirection.
+
+S3 endpoint and public-URL provenance is resolved from the adapter that
+`files-sdk` actually constructs, including values merged from `configJson`.
+An unaudited endpoint forces the driver read-only, and a `publicBaseUrl` removes
+the signed-download TTL guarantee because the resulting public URL does not
+expire. AWS-SDK-backed noncanonical provider slugs (for example an S3-compatible
+provider wrapper) also default to unverified/read-only; only the canonical
+`s3` provider may infer the native AWS profile, and a custom endpoint becomes
+writable only with an explicit branded `S3ProviderProfile`.
+
+Before enabling conditional operations for a custom S3-compatible endpoint,
+run the reusable
+[provider conformance contract](https://github.com/nestm-dev/storage/blob/main/docs/provider-conformance.md)
+against dedicated test credentials. Unknown endpoints are forced read-only and
+receive no inferred conditional capabilities.
 
 ## Storage API
 
 `StorageClient` exposes:
 
 - `upload`, `downloadStream`, `head`, `exists`, `delete`, `copy`, and `move`;
-- conditional staged-object `promote` when the driver advertises it;
+- exact `uploadConditional`, `downloadConditional`, `deleteConditional`, and
+  staged-object `promote` operations when the driver advertises each primitive;
 - `list`, cursor-aware `listAll`, and lazy `search`;
 - `signDownload` and discriminated PUT/POST `signUpload`;
 - `uploadMany`, `downloadMany`, `headMany`, `existsMany`, and `deleteMany`;
 - `file(key)` handles;
 - provider capability inspection; and
 - pause/resume/abort through `StorageUploadControl`.
+
+Provider list cursors are opaque, non-consuming continuation tokens. Replaying
+the same cursor with the same list options against unchanged provider state
+must return an equivalent page and continuation cursor. This contract lets a
+caller safely retry or replay pagination; it does not promise snapshot
+isolation across concurrent provider mutations.
 
 Downloads are streaming by default:
 
@@ -505,11 +541,54 @@ Node `Readable` uploads are accepted and converted to Web streams without
 buffering. Provider capability gaps fail closed with `StorageError` rather than
 silently discarding a range, metadata, or cache-control request.
 
-### Race-free staged-object promotion
+### Exact provider conditions and staged-object promotion
 
-The S3 bridge advertises ETag- and version-conditional server-side copy. This
-lets an application validate a staged object and copy that exact source to its
-final key instead of re-reading whichever bytes occupy the staging key later:
+Capabilities distinguish conditional create, replace, delete, read, source
+copy, destination copy, atomic source-and-destination promotion, and multipart
+completion. They also declare the complete physical-key byte budget. Callers
+must check the exact primitive they need; a missing field is unsupported and is
+never widened from another operation.
+
+The physical-key budget applies to the exact key sent to the adapter. It
+therefore counts leading slashes for unprefixed drivers, the separator added to
+a configured driver prefix, and provider prefixes derived for `list` or
+`search`. Over-budget object keys and explicit list/search prefixes fail before
+provider dispatch rather than being normalized into a shorter key. A glob's
+provider prefix is the exact prefix inferred by files-sdk itself, and that
+derived list operation passes through the same final guard. A non-positive
+`maxResults` performs no provider walk and therefore dispatches no prefix.
+
+Adapters and plugins execute as trusted in-process code; this package does not
+attempt to sandbox a plugin that performs its own network or filesystem I/O.
+For supported plugin pipelines that forward operations through `next`, the
+physical-key guard is the innermost wrapper, after caller plugins and before
+the adapter call. A plugin therefore cannot widen an upload key or list/search
+prefix past the declared byte ceiling while still using the normal dispatch
+pipeline.
+
+Storage-facing ETags have one canonical representation: a bare, case-sensitive
+opaque token with no HTTP quotes. Canonical values contain 1–1024 visible
+ASCII bytes and exclude commas, backslashes, whitespace, control characters,
+`DEL`, non-ASCII text, the `*` wildcard, and case-insensitive `W/` weak-tag
+prefixes. Treat the value as opaque: preserve the exact string returned by
+`head`, reads, or writes and pass it back unchanged to a conditional operation.
+Do not add or remove quotes in application code. S3-compatible drivers remove
+exactly one valid provider-owned quote pair on ingress and add exactly one pair
+when serializing the HTTP header.
+
+This tightens the precondition boundary. Quoted or otherwise non-canonical
+ETags that older versions happened to accept now fail with `INVALID_ARGUMENT`,
+and an unsafe provider result fails with a sanitized `PROVIDER` error instead
+of being exposed as a usable validator. Applications that persisted quoted
+ETags must refresh them with `head` rather than trimming them heuristically.
+Strict normalization prevents a caller-controlled wildcard, entity-tag list,
+weak validator, or malformed header value from widening an operation that
+promises one exact strong match.
+
+The native AWS S3 profile advertises ETag- and version-conditioned server-side
+copy. This lets an application validate a staged object and copy that exact
+source to its final key instead of re-reading whichever bytes occupy the
+staging key later:
 
 ```ts
 import { StorageError, StorageErrorCode } from '@nestm/storage';
@@ -532,9 +611,58 @@ await media.delete(stagingKey);
 ```
 
 `sourceVersion` can select an immutable S3 version and may be combined with
-`sourceEtag`. A promotion without either identity is rejected. Drivers that do
-not publish `capabilities.conditionalCopy` fail with `NOT_SUPPORTED` rather
-than falling back to an unsafe ordinary copy.
+`sourceEtag`. A destination condition can independently require create-only or
+replacement of an exact ETag. Combining source and destination predicates also
+requires `capabilities.conditionalCopyDestination.atomicWithSource`; otherwise
+the request fails with `NOT_SUPPORTED`. A promotion must contain at least one
+source or destination predicate.
+
+Cloudflare R2 has a separate stable profile: create, replace, ETag-conditioned
+read, and ETag-conditioned source copy are enabled, while conditional delete,
+destination copy, atomic promotion, version predicates, and conditional
+multipart completion remain absent. R2 proves content-type binding for
+presigned PUT requests but not POST-form size ranges, so its signed-upload
+policy is `{ contentType: true, sizeRange: false }` and the gateway refuses to
+mint its POST upload form. Cloudflare documents that presigned `POST` form
+uploads are not supported in its
+[presigned URL contract](https://developers.cloudflare.com/r2/api/s3/presigned-urls/).
+Direct R2 signed-upload calls that request a size bound likewise fail with
+`NOT_SUPPORTED` before signing.
+Custom S3-compatible endpoints start with no conditional operations and the
+entire driver is forced read-only until an explicit conformance-verified
+`S3ProviderProfile` is supplied. Omitting `signedUploadPolicy` while defining a
+custom profile normalizes both policy claims to `false`; providers may opt in
+only to constraints their conformance evidence proves.
+
+Successful S3 signed uploads enforce every requested constraint. A request
+with `contentType` and no `maxSize` uses a presigned PUT whose signature
+includes the `content-type` header. A request with `maxSize` uses a POST policy
+with `content-length-range` and, when present, an exact `Content-Type`
+condition. S3 cannot express a lower-only `minSize` through this contract, so
+that shape fails with `NOT_SUPPORTED`; an unclaimed profile constraint also
+fails before credentials are resolved or a URL is minted. Literal physical
+keys ending in AWS's `${filename}` POST template are rejected for bounded
+uploads because the SDK otherwise widens the exact key condition to a prefix.
+
+`withS3Capabilities()` decorates a raw S3 adapter in place and may be applied
+only once. Construct a fresh raw adapter when selecting a different profile;
+reapplying the helper is rejected so a previous broader profile cannot survive
+a later narrower declaration. The selected profile is bound to the exact
+reserved capability and operation members installed by that decoration;
+same-client aliases may change display metadata but cannot add or replace those
+members to widen the profile.
+
+An explicit profile applied to a native AWS SDK endpoint may only narrow the
+immutable `AWS_S3_PROVIDER_PROFILE`. It cannot raise the complete-key budget
+above 1,024 bytes or claim an operation/policy bit absent from the built-in
+profile. This containment follows actual SDK endpoint provenance even when an
+adapter alias changes its display name.
+
+The package-owned `s3()` factory also retains whether `publicBaseUrl` was
+configured even when the second `withS3Capabilities()` options object is
+omitted. In that case `signedDownloadPolicy.expiresIn` is false. Foreign S3
+adapters whose construction metadata is unavailable receive the same
+conservative false value instead of claiming an enforceable TTL.
 
 ### Resumable uploads
 
@@ -676,8 +804,11 @@ by `maxSignedUploadBytes`, and require an exact lowercase MIME type from
 `attachment` or `inline` response disposition; arbitrary response-header text
 and filenames are rejected. A driver must also advertise
 `signedUploadPolicy.contentType` and `signedUploadPolicy.sizeRange`; otherwise
-the gateway refuses to mint the URL. `createS3StorageDriver()` advertises both
-and uses S3 POST policy conditions. Signed downloads similarly require
+the gateway refuses to mint the URL. Native AWS advertises both and uses S3
+POST policy conditions. R2 advertises content-type enforcement but not a POST
+size range, while omitted custom declarations normalize both claims to false;
+the gateway therefore fails closed for those profiles. Signed downloads
+similarly require
 `signedDownloadPolicy.expiresIn`. The S3 factory advertises it only when no
 permanent `publicBaseUrl` was configured, preventing a configured TTL from
 silently returning a non-expiring public link.

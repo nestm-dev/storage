@@ -17,6 +17,8 @@ import {
   type FilesSdkDriverOptions,
   type FilesSdkStorageDriver,
 } from '../files-sdk.driver.js';
+import type { S3Adapter, S3ProviderProfile } from '../s3/index.js';
+import { recordS3ConstructionMetadata } from '../s3/construction-metadata.js';
 
 /** Slug of a storage provider this package can build a driver for. */
 export type StorageProviderName = ProviderSlug;
@@ -39,6 +41,8 @@ export interface ProviderStorageDriverOptions extends Omit<
   /** Which provider to build. Validate untrusted input with {@link isStorageProvider}. */
   provider: StorageProviderName;
   config?: StorageProviderConfig;
+  /** Verified operation profile for the `s3` slug, especially custom endpoints. */
+  s3ProviderProfile?: S3ProviderProfile;
 }
 
 /**
@@ -48,11 +52,12 @@ export interface ProviderStorageDriverOptions extends Omit<
  * `'r2'`, `'fs'`, …) and installs one native SDK, instead of the application
  * hard-coding a driver per backend.
  *
- * The `s3` slug additionally gets the conditional-promotion and signed-policy
- * capabilities {@link createS3StorageDriver} attaches; every other provider
- * exposes exactly what its adapter declares. Import
- * `@nestm/storage/files-sdk/s3` directly when the provider is known at build
- * time and the extra indirection buys nothing.
+ * The `s3` slug additionally gets the exact verified provider profile and
+ * signed-policy capabilities {@link createS3StorageDriver} attaches. Providers
+ * not backed by the AWS S3 SDK expose what their adapter declares;
+ * noncanonical S3-backed providers default to an unverified, read-only profile.
+ * Import `@nestm/storage/files-sdk/s3` directly when the provider is known at
+ * build time and the extra indirection buys nothing.
  *
  * @throws StorageError `INVALID_ARGUMENT` for an unknown slug, and whatever the
  * adapter reports (mapped) when required config or credentials are missing.
@@ -60,7 +65,7 @@ export interface ProviderStorageDriverOptions extends Omit<
 export async function createProviderStorageDriver(
   options: ProviderStorageDriverOptions,
 ): Promise<FilesSdkStorageDriver> {
-  const { provider, config, ...filesOptions } = options;
+  const { provider, config, s3ProviderProfile, ...filesOptions } = options;
   if (!isStorageProvider(provider)) {
     throw unknownProvider(provider);
   }
@@ -68,13 +73,42 @@ export async function createProviderStorageDriver(
   // `loadFiles` owns the slug → adapter mapping and keeps the import lazy; the
   // client it returns is discarded so the caller's own driver options (prefix,
   // hooks, plugins, readonly, retries) apply to the instance the bridge builds.
-  const adapter = await resolveAdapter(provider, config);
-  return createFilesSdkDriver({ ...filesOptions, adapter });
+  if (s3ProviderProfile !== undefined && provider !== 's3') {
+    throw new StorageError(
+      's3ProviderProfile can only be used with the "s3" provider.',
+      { code: StorageErrorCode.INVALID_ARGUMENT, permanent: true },
+    );
+  }
+  const adapter = await resolveAdapter(provider, config, s3ProviderProfile);
+  return createFilesSdkDriver({
+    ...filesOptions,
+    adapter,
+  });
+}
+
+function isS3BackedAdapter(adapter: Adapter): adapter is S3Adapter {
+  try {
+    const raw = adapter.raw;
+    if (typeof raw !== 'object' || raw === null) return false;
+    const candidate = raw as {
+      readonly config?: unknown;
+      readonly send?: unknown;
+    };
+    return (
+      typeof candidate.send === 'function' &&
+      typeof candidate.config === 'object' &&
+      candidate.config !== null &&
+      (candidate.config as { readonly serviceId?: unknown }).serviceId === 'S3'
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function resolveAdapter(
   provider: StorageProviderName,
   config: StorageProviderConfig | undefined,
+  s3ProviderProfile: S3ProviderProfile | undefined,
 ): Promise<Adapter> {
   let resolved;
   try {
@@ -89,23 +123,37 @@ async function resolveAdapter(
       adapter as Parameters<typeof withFsConditionalMutation>[0],
     );
   }
-  if (provider !== 's3') {
+  if (!isS3BackedAdapter(adapter)) {
     return adapter;
   }
-  // Built by `s3(...)`, so its `raw` is an S3Client and the promotion path
-  // holds. The S3-compatible wrappers keep only what they declare themselves.
+  // Every AWS-SDK-backed wrapper gets fail-closed S3 provenance and endpoint
+  // hardening. Only the canonical `s3` slug may infer native AWS or accept an
+  // explicit verified profile; named compatibles remain unverified/read-only.
   const { withS3Capabilities } = await import('../s3/index.js');
-  return withS3Capabilities(
-    adapter as Parameters<typeof withS3Capabilities>[0],
-    {
-      ...(typeof config?.endpoint === 'string' && {
-        endpoint: config.endpoint,
-      }),
-      ...(config?.publicBaseUrl !== undefined && {
-        publicBaseUrl: config.publicBaseUrl,
-      }),
-    },
-  );
+  const configJsonPublicBaseUrl = config?.configJson?.publicBaseUrl;
+  const publicBaseUrl =
+    config?.publicBaseUrl ??
+    (typeof configJsonPublicBaseUrl === 'string'
+      ? configJsonPublicBaseUrl
+      : undefined);
+  const s3Adapter = adapter as Parameters<typeof withS3Capabilities>[0];
+  recordS3ConstructionMetadata(s3Adapter.raw, {
+    publicBaseUrlConfigured:
+      provider !== 's3' ||
+      config?.publicBaseUrl !== undefined ||
+      configJsonPublicBaseUrl !== undefined,
+  });
+  return withS3Capabilities(s3Adapter, {
+    ...(typeof config?.endpoint === 'string' && {
+      endpoint: config.endpoint,
+    }),
+    ...(publicBaseUrl !== undefined && {
+      publicBaseUrl,
+    }),
+    ...(s3ProviderProfile !== undefined && {
+      providerProfile: s3ProviderProfile,
+    }),
+  });
 }
 
 function unknownProvider(provider: string): StorageError {

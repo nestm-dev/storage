@@ -1,4 +1,5 @@
 import { settleMany } from './internal/settle-many.js';
+import { isCanonicalStorageEtag } from './storage-etag.js';
 import {
   StorageError,
   StorageErrorCode,
@@ -11,6 +12,7 @@ import type {
   StorageBulkOptions,
   StorageCapabilities,
   StorageConditionalDeleteOptions,
+  StorageConditionalReadOptions,
   StorageConditionalUploadOptions,
   StorageDeleteManyResult,
   StorageDownloadManyResult,
@@ -215,6 +217,9 @@ export interface StorageFileHandle {
     options: StorageConditionalUploadOptions,
   ): Promise<StorageUploadResult>;
   download(options?: StorageDownloadOptions): Promise<StorageObject>;
+  downloadConditional(
+    options: StorageConditionalReadOptions,
+  ): Promise<StorageObject>;
   bytes(options?: StorageBufferedDownloadOptions): Promise<Uint8Array>;
   text(options?: StorageBufferedDownloadOptions): Promise<string>;
   head(options?: StorageOperationOptions): Promise<StorageObjectMetadata>;
@@ -269,6 +274,7 @@ export class StorageClient {
       delete: (options) => this.delete(key, options),
       deleteConditional: (options) => this.deleteConditional(key, options),
       download: (options) => this.downloadStream(key, options),
+      downloadConditional: (options) => this.downloadConditional(key, options),
       exists: (options) => this.exists(key, options),
       head: (options) => this.head(key, options),
       key,
@@ -312,18 +318,30 @@ export class StorageClient {
     }
     if (
       condition.type === 'replace' &&
-      (typeof condition.etag !== 'string' || condition.etag.length === 0)
+      !isCanonicalStorageEtag(condition.etag)
     ) {
-      invalidArgument('condition.etag must be a non-empty string.');
+      invalidArgument('condition.etag must be a canonical storage ETag.');
     }
 
-    const capability = this.#driver.capabilities.conditionalMutation;
-    const uploadConditional = this.#driver.uploadConditional;
-    const supported =
+    const capability =
       condition.type === 'create'
-        ? capability?.create === true
-        : capability?.replace === true;
-    if (!supported || uploadConditional === undefined) {
+        ? this.#driver.capabilities.conditionalCreate
+        : this.#driver.capabilities.conditionalReplace;
+    const uploadConditional = this.#driver.uploadConditional;
+    const multipartRequested =
+      options.multipart !== undefined && options.multipart !== false;
+    const multipartCapability =
+      this.#driver.capabilities.conditionalMultipartCompletion;
+    const multipartSupported =
+      !multipartRequested ||
+      (condition.type === 'create'
+        ? multipartCapability?.create === true
+        : multipartCapability?.replace === true);
+    if (
+      capability === undefined ||
+      !multipartSupported ||
+      uploadConditional === undefined
+    ) {
       throw new StorageError(
         `Store "${this.name}" does not support the requested conditional upload.`,
         {
@@ -349,6 +367,59 @@ export class StorageClient {
     assertDownloadOptions(options);
     return this.#execute({ key, operation: 'download', store: this.name }, () =>
       this.#driver.download(key, options),
+    );
+  }
+
+  downloadConditional(
+    key: string,
+    options: StorageConditionalReadOptions,
+  ): Promise<StorageObject> {
+    assertKey(key);
+    assertDownloadOptions(options);
+    if (
+      options === undefined ||
+      options.condition === undefined ||
+      typeof options.condition !== 'object' ||
+      options.condition === null
+    ) {
+      invalidArgument('conditional read requires a condition object.');
+    }
+    const { etag, version } = options.condition;
+    if (etag !== undefined && !isCanonicalStorageEtag(etag)) {
+      invalidArgument('condition.etag must be a canonical storage ETag.');
+    }
+    if (
+      version !== undefined &&
+      (typeof version !== 'string' || version.length === 0)
+    ) {
+      invalidArgument('condition.version must be a non-empty string.');
+    }
+    if (etag === undefined && version === undefined) {
+      invalidArgument('conditional read requires an etag, version, or both.');
+    }
+
+    const capability = this.#driver.capabilities.conditionalRead;
+    const downloadConditional = this.#driver.downloadConditional;
+    if (
+      downloadConditional === undefined ||
+      capability === undefined ||
+      (etag !== undefined && !capability.etag) ||
+      (version !== undefined && !capability.version)
+    ) {
+      throw new StorageError(
+        `Store "${this.name}" does not support the requested conditional read.`,
+        {
+          code: StorageErrorCode.NOT_SUPPORTED,
+          key,
+          operation: 'download',
+          permanent: true,
+          store: this.name,
+        },
+      );
+    }
+
+    return this.#execute({ key, operation: 'download', store: this.name }, () =>
+      downloadConditional.call(this.#driver, key, options),
     );
   }
 
@@ -418,15 +489,14 @@ export class StorageClient {
     assertKey(key);
     if (
       options.condition === undefined ||
-      typeof options.condition.etag !== 'string' ||
-      options.condition.etag.length === 0
+      !isCanonicalStorageEtag(options.condition.etag)
     ) {
-      invalidArgument('condition.etag must be a non-empty string.');
+      invalidArgument('condition.etag must be a canonical storage ETag.');
     }
 
-    const capability = this.#driver.capabilities.conditionalMutation;
+    const capability = this.#driver.capabilities.conditionalDelete;
     const deleteConditional = this.#driver.deleteConditional;
-    if (capability?.delete !== true || deleteConditional === undefined) {
+    if (capability?.etag !== true || deleteConditional === undefined) {
       throw new StorageError(
         `Store "${this.name}" does not support conditional delete.`,
         {
@@ -493,23 +563,53 @@ export class StorageClient {
     assertKey(destinationKey, 'destination key');
     const sourceEtag = options.sourceEtag;
     const sourceVersion = options.sourceVersion;
-    if (sourceEtag !== undefined && sourceEtag.length === 0) {
-      invalidArgument('sourceEtag must be a non-empty string.');
+    if (sourceEtag !== undefined && !isCanonicalStorageEtag(sourceEtag)) {
+      invalidArgument('sourceEtag must be a canonical storage ETag.');
     }
-    if (sourceVersion !== undefined && sourceVersion.length === 0) {
+    if (
+      sourceVersion !== undefined &&
+      (typeof sourceVersion !== 'string' || sourceVersion.length === 0)
+    ) {
       invalidArgument('sourceVersion must be a non-empty string.');
     }
-    if (sourceEtag === undefined && sourceVersion === undefined) {
-      invalidArgument('promote requires sourceEtag, sourceVersion, or both.');
+    const destination = options.destination;
+    if (
+      destination !== undefined &&
+      (typeof destination !== 'object' ||
+        destination === null ||
+        (destination.type !== 'create' && destination.type !== 'replace'))
+    ) {
+      invalidArgument('destination.type must be "create" or "replace".');
+    }
+    if (
+      sourceEtag === undefined &&
+      sourceVersion === undefined &&
+      destination === undefined
+    ) {
+      invalidArgument('promote requires a source or destination precondition.');
+    }
+    if (
+      destination?.type === 'replace' &&
+      !isCanonicalStorageEtag(destination.etag)
+    ) {
+      invalidArgument('destination.etag must be a canonical storage ETag.');
     }
 
-    const capability = this.#driver.capabilities.conditionalCopy;
+    const sourceCapability = this.#driver.capabilities.conditionalCopySource;
+    const destinationCapability =
+      this.#driver.capabilities.conditionalCopyDestination;
     const promote = this.#driver.promote;
     if (
-      capability?.supported !== true ||
       promote === undefined ||
-      (sourceEtag !== undefined && !capability.etag) ||
-      (sourceVersion !== undefined && !capability.version)
+      (sourceEtag !== undefined && sourceCapability?.etag !== true) ||
+      (sourceVersion !== undefined && sourceCapability?.version !== true) ||
+      (destination?.type === 'create' &&
+        destinationCapability?.create !== true) ||
+      (destination?.type === 'replace' &&
+        destinationCapability?.replace !== true) ||
+      (destination !== undefined &&
+        (sourceEtag !== undefined || sourceVersion !== undefined) &&
+        destinationCapability?.atomicWithSource !== true)
     ) {
       throw new StorageError(
         `Store "${this.name}" does not support the requested conditional promotion.`,

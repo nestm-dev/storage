@@ -93,9 +93,8 @@ describe('StorageClient', () => {
     Object.defineProperty(driver, 'capabilities', {
       value: {
         ...driver.capabilities,
-        conditionalCopy: {
+        conditionalCopySource: {
           etag: true,
-          supported: true,
           version: false,
         },
       },
@@ -104,12 +103,12 @@ describe('StorageClient', () => {
     const client = new StorageClient('media', driver);
 
     await client.file('staging/image.png').promoteTo('final/image.png', {
-      sourceEtag: '"verified-etag"',
+      sourceEtag: 'verified-etag',
     });
     expect(promote).toHaveBeenCalledWith(
       'staging/image.png',
       'final/image.png',
-      { sourceEtag: '"verified-etag"' },
+      { sourceEtag: 'verified-etag' },
     );
     expect(() =>
       client.promote('staging/image.png', 'final/image.png', {
@@ -124,7 +123,14 @@ describe('StorageClient', () => {
     const client = new StorageClient('media', createMemoryStorageDriver());
 
     expect(() => client.promote('staging.bin', 'final.bin', {})).toThrow(
-      'requires sourceEtag',
+      'requires a source or destination precondition',
+    );
+    expect(() =>
+      client.promote('staging.bin', 'final.bin', {
+        destination: { type: 'invalid' } as never,
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
     );
     expect(() =>
       client.promote('staging.bin', 'final.bin', { sourceEtag: 'etag' }),
@@ -164,12 +170,9 @@ describe('StorageClient', () => {
     Object.defineProperty(driver, 'capabilities', {
       value: {
         ...driver.capabilities,
-        conditionalMutation: {
-          create: true,
-          delete: true,
-          etag: true,
-          replace: true,
-        },
+        conditionalCreate: { resultEtag: true },
+        conditionalDelete: { etag: true },
+        conditionalReplace: { resultEtag: true },
       },
     });
     driver.uploadConditional = uploadConditional;
@@ -191,35 +194,78 @@ describe('StorageClient', () => {
     });
   });
 
-  it('rejects invalid conditional ETags before calling a driver', () => {
+  it('rejects non-canonical conditional ETags in every slot before calling a driver', () => {
     const driver = createMemoryStorageDriver();
+    const promote = vi.fn();
+    const downloadConditional = vi.fn();
     Object.defineProperty(driver, 'capabilities', {
       value: {
         ...driver.capabilities,
-        conditionalMutation: {
+        conditionalCopyDestination: {
+          atomicWithSource: true,
           create: true,
-          delete: true,
-          etag: true,
           replace: true,
         },
+        conditionalCopySource: { etag: true, version: false },
+        conditionalCreate: { resultEtag: true },
+        conditionalDelete: { etag: true },
+        conditionalRead: { etag: true, version: false },
+        conditionalReplace: { resultEtag: true },
       },
     });
     driver.uploadConditional = vi.fn();
     driver.deleteConditional = vi.fn();
+    driver.downloadConditional = downloadConditional;
+    driver.promote = promote;
     const client = new StorageClient('media', driver);
 
-    expect(() =>
-      client.uploadConditional('note.txt', 'next', {
-        condition: { etag: '', type: 'replace' },
-      }),
-    ).toThrow(
-      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
-    );
-    expect(() =>
-      client.deleteConditional('note.txt', { condition: { etag: '' } }),
-    ).toThrow(
-      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
-    );
+    const invalidEtags = [
+      '',
+      '*',
+      'W/"etag"',
+      'w/etag',
+      '"etag"',
+      '"stale","current"',
+      'stale,current',
+      'etag\\value',
+      ' etag',
+      'etag ',
+      'etag\tvalue',
+      'etag\r\nif-match:*',
+      'café',
+      'x'.repeat(1025),
+    ];
+    for (const etag of invalidEtags) {
+      const calls: Array<() => unknown> = [
+        () =>
+          client.uploadConditional('note.txt', 'next', {
+            condition: { etag, type: 'replace' },
+          }),
+        () => client.downloadConditional('note.txt', { condition: { etag } }),
+        () => client.deleteConditional('note.txt', { condition: { etag } }),
+        () =>
+          client.promote('source.txt', 'destination.txt', {
+            sourceEtag: etag,
+          }),
+        () =>
+          client.promote('source.txt', 'destination.txt', {
+            destination: { etag, type: 'replace' },
+          }),
+      ];
+      for (const call of calls) {
+        expect(call).toThrow(
+          expect.objectContaining({
+            code: StorageErrorCode.INVALID_ARGUMENT,
+            permanent: true,
+          }),
+        );
+      }
+    }
+
+    expect(driver.uploadConditional).not.toHaveBeenCalled();
+    expect(driver.deleteConditional).not.toHaveBeenCalled();
+    expect(downloadConditional).not.toHaveBeenCalled();
+    expect(promote).not.toHaveBeenCalled();
   });
 
   it('classifies invalid owned options before calling the provider', async () => {

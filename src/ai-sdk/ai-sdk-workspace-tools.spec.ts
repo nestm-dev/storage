@@ -57,8 +57,27 @@ const TEXT_FILE: StorageWorkspaceTextFile = {
   text: 'hello',
 };
 
+const MALICIOUS_ETAGS = [
+  '',
+  '"etag-a", "etag-b"',
+  'etag-a", "etag-b',
+  '*',
+  'W/"etag"',
+  'w/"etag"',
+  'unsafe\r\nIf-Match: *',
+  '"etag',
+  'etag"',
+  '""etag""',
+  'etag,other',
+  'etag\\other',
+  ' etag',
+  'etag ',
+  'x'.repeat(1_025),
+] as const;
+
 function createWorkspaceDouble(
   permissions: readonly StorageWorkspacePermission[],
+  maxPathBytes = 1_024,
 ): WorkspaceDouble {
   const permissionSet = new Set(permissions);
   const list = vi.fn(async () => ({ entries: [] as StorageWorkspaceEntry[] }));
@@ -75,7 +94,7 @@ function createWorkspaceDouble(
   const workspace = {
     permissions: permissionSet,
     limits: {
-      maxPathBytes: 1_024,
+      maxPathBytes,
       maxReadBytes: 100,
       maxWriteBytes: 200,
       maxPageSize: 25,
@@ -265,6 +284,20 @@ describe('createAiSdkWorkspaceTools', () => {
       copySchema.safeParse({
         source: 'from.txt',
         destination: 'to.txt',
+        etag: 'source-etag',
+      }).success,
+    ).toBe(true);
+    expect(
+      copySchema.safeParse({
+        source: 'from.txt',
+        destination: 'to.txt',
+      }).success,
+    ).toBe(false);
+    expect(
+      copySchema.safeParse({
+        source: 'from.txt',
+        destination: 'to.txt',
+        etag: 'source-etag',
         overwrite: true,
       }).success,
     ).toBe(false);
@@ -400,6 +433,96 @@ describe('createAiSdkWorkspaceTools', () => {
     ).toBe(false);
   });
 
+  it('rejects non-canonical ETags across every mutation schema', () => {
+    const fixture = createWorkspaceDouble([
+      'read',
+      'create',
+      'replace',
+      'copy',
+      'move',
+      'delete',
+    ]);
+    const tools = createAiSdkWorkspaceTools({ workspace: fixture.workspace });
+    const schemas = [
+      {
+        input: (etag: string) => ({
+          content: 'replacement',
+          etag,
+          mode: 'replace',
+          path: 'target.txt',
+        }),
+        schema: viewTool(tools, 'workspace_write_file').inputSchema,
+      },
+      {
+        input: (etag: string) => ({
+          destination: 'copy.txt',
+          etag,
+          source: 'source.txt',
+        }),
+        schema: viewTool(tools, 'workspace_copy_file').inputSchema,
+      },
+      {
+        input: (etag: string) => ({
+          destination: 'move.txt',
+          etag,
+          source: 'source.txt',
+        }),
+        schema: viewTool(tools, 'workspace_move_file').inputSchema,
+      },
+      {
+        input: (etag: string) => ({ etag, path: 'target.txt' }),
+        schema: viewTool(tools, 'workspace_delete_file').inputSchema,
+      },
+    ];
+
+    for (const etag of MALICIOUS_ETAGS) {
+      for (const { input, schema } of schemas) {
+        expect(
+          schema.safeParse(input(etag)).success,
+          JSON.stringify(etag.slice(0, 80)),
+        ).toBe(false);
+      }
+    }
+  });
+
+  it('uses the fixed ETag limit independently of the workspace path limit', () => {
+    const fixture = createWorkspaceDouble(
+      ['read', 'create', 'replace', 'copy', 'move', 'delete'],
+      16,
+    );
+    const tools = createAiSdkWorkspaceTools({ workspace: fixture.workspace });
+    const etag = 'a'.repeat(1_024);
+
+    expect(
+      viewTool(tools, 'workspace_write_file').inputSchema.safeParse({
+        content: 'replacement',
+        etag,
+        mode: 'replace',
+        path: 'target.txt',
+      }).success,
+    ).toBe(true);
+    expect(
+      viewTool(tools, 'workspace_copy_file').inputSchema.safeParse({
+        destination: 'copy.txt',
+        etag,
+        source: 'source.txt',
+      }).success,
+    ).toBe(true);
+    expect(
+      viewTool(tools, 'workspace_move_file').inputSchema.safeParse({
+        destination: 'move.txt',
+        etag,
+        source: 'source.txt',
+      }).success,
+    ).toBe(true);
+    expect(
+      viewTool(tools, 'workspace_delete_file').inputSchema.safeParse({
+        etag,
+        path: 'target.txt',
+      }).success,
+    ).toBe(true);
+  });
+
   it('clamps bounded text reads and serializes file metadata', async () => {
     const fixture = createWorkspaceDouble(['read']);
     const controller = new AbortController();
@@ -428,6 +551,22 @@ describe('createAiSdkWorkspaceTools', () => {
     expect(fixture.readText).toHaveBeenCalledWith('docs/readme.md', {
       maxBytes: 100,
       signal: controller.signal,
+    });
+  });
+
+  it('sanitizes a non-canonical ETag returned by a workspace', async () => {
+    const fixture = createWorkspaceDouble(['read']);
+    fixture.stat.mockResolvedValueOnce({
+      ...FILE,
+      etag: '"etag-a", "etag-b"',
+    });
+    const tools = createAiSdkWorkspaceTools({ workspace: fixture.workspace });
+
+    await expect(
+      executeTool(tools, 'workspace_stat', { path: 'docs/readme.md' }),
+    ).rejects.toMatchObject({
+      code: StorageErrorCode.PROVIDER,
+      message: 'The workspace operation failed.',
     });
   });
 
@@ -515,8 +654,11 @@ describe('createAiSdkWorkspaceTools', () => {
     await executeTool(tools, 'workspace_copy_file', {
       source: 'from.txt',
       destination: 'copied.txt',
+      etag: 'source-etag',
     });
-    expect(fixture.copyFile).toHaveBeenCalledWith('from.txt', 'copied.txt', {});
+    expect(fixture.copyFile).toHaveBeenCalledWith('from.txt', 'copied.txt', {
+      etag: 'source-etag',
+    });
 
     await executeTool(tools, 'workspace_move_file', {
       source: 'from.txt',

@@ -146,7 +146,7 @@ export interface StorageWorkspace {
   copyFile(
     source: string,
     destination: string,
-    options?: StorageOperationOptions,
+    options: StorageWorkspaceMutationOptions,
   ): Promise<StorageWorkspaceFile>;
   moveFile(
     source: string,

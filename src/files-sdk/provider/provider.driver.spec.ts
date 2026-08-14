@@ -2,8 +2,11 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { S3Client } from '@aws-sdk/client-s3';
+
 import { StorageClient } from '../../storage.client.js';
 import { StorageErrorCode } from '../../storage.error.js';
+import { defineS3ProviderProfile } from '../s3/index.js';
 import {
   createProviderStorageDriver,
   getStorageProvider,
@@ -81,53 +84,237 @@ describe('createProviderStorageDriver', () => {
         secretAccessKey: 'test',
       },
       provider: 's3',
+      readonly: false,
     });
 
-    expect(driver.capabilities.conditionalCopy).toEqual({
+    expect(driver.capabilities.conditionalCreate).toEqual({
+      resultEtag: true,
+    });
+    expect(driver.capabilities.conditionalReplace).toEqual({
+      resultEtag: true,
+    });
+    expect(driver.capabilities.conditionalDelete).toEqual({
       etag: true,
-      supported: true,
+    });
+    expect(driver.capabilities.conditionalRead).toEqual({
+      etag: true,
       version: true,
     });
-    expect(driver.capabilities.conditionalMutation).toEqual({
-      create: true,
-      delete: true,
+    expect(driver.capabilities.conditionalCopySource).toEqual({
       etag: true,
+      version: true,
+    });
+    expect(driver.capabilities.conditionalCopyDestination).toEqual({
+      atomicWithSource: true,
+      create: true,
       replace: true,
     });
+    expect(driver.capabilities.conditionalMultipartCompletion).toEqual({
+      create: true,
+      replace: true,
+    });
+    expect(driver.capabilities.physicalKey).toEqual({ maxBytes: 1_024 });
     expect(driver.capabilities.signedUploadPolicy).toEqual({
       contentType: true,
       sizeRange: true,
     });
+    expect(driver.capabilities.signedDownloadPolicy).toEqual({
+      expiresIn: true,
+    });
   });
 
-  it('does not advertise conditional mutation for an unverified S3-compatible endpoint', async () => {
+  it('rejects a native S3 profile that widens the AWS key ceiling before dispatch', async () => {
+    const send = vi.spyOn(S3Client.prototype, 'send');
+    try {
+      await expect(
+        createProviderStorageDriver({
+          config: {
+            accessKeyId: 'test',
+            bucket: 'artifacts',
+            region: 'us-east-1',
+            secretAccessKey: 'test',
+          },
+          provider: 's3',
+          s3ProviderProfile: defineS3ProviderProfile({
+            name: 'invalid-widened-provider-native',
+            physicalKey: { maxBytes: 2048 },
+          }),
+        }),
+      ).rejects.toThrow(
+        /cannot widen aws-s3-general-purpose physicalKey\.maxBytes/u,
+      );
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      send.mockRestore();
+    }
+  });
+
+  it('forces a configJson-resolved unverified S3 endpoint read-only without dispatch', async () => {
+    const send = vi
+      .spyOn(S3Client.prototype, 'send')
+      .mockRejectedValue(new Error('unexpected S3 dispatch') as never);
     const driver = await createProviderStorageDriver({
       config: {
         accessKeyId: 'test',
         bucket: 'artifacts',
-        endpoint: 'https://objects.example.test',
+        configJson: {
+          endpoint: 'https://objects.example.test',
+          publicBaseUrl: 'https://cdn.example.test',
+        },
         region: 'us-east-1',
         secretAccessKey: 'test',
       },
       provider: 's3',
+      readonly: false,
     });
 
-    expect(driver.capabilities.conditionalMutation).toBeUndefined();
+    expect(driver.capabilities.conditionalCreate).toBeUndefined();
+    expect(driver.capabilities.conditionalReplace).toBeUndefined();
+    expect(driver.capabilities.conditionalDelete).toBeUndefined();
+    expect(driver.capabilities.conditionalRead).toBeUndefined();
+    expect(driver.capabilities.conditionalCopySource).toBeUndefined();
+    expect(driver.capabilities.conditionalCopyDestination).toBeUndefined();
+    expect(driver.capabilities.conditionalMultipartCompletion).toBeUndefined();
+    expect(driver.capabilities.physicalKey).toEqual({ maxBytes: 1_024 });
+    expect(driver.capabilities.resumableUpload).toBe(false);
+    expect(driver.capabilities.serverSideCopy).toBe(false);
+    expect(driver.capabilities.signedUpload).toBe(false);
+    expect(driver.capabilities.signedUploadPolicy).toBeUndefined();
+    expect(driver.capabilities.signedDownloadPolicy).toEqual({
+      expiresIn: false,
+    });
+    expect(driver.capabilities.nativeUploadProgress).toBe(false);
+    const client = new StorageClient('unverified-provider', driver);
+    try {
+      const mutations = [
+        () => client.upload('blocked.txt', 'blocked'),
+        () => client.delete('blocked.txt'),
+        () => client.copy('source.txt', 'destination.txt'),
+        () => client.move('source.txt', 'destination.txt'),
+        () => client.signUpload('blocked.txt', { expiresIn: 60 }),
+      ];
+      for (const mutate of mutations) {
+        await expect(mutate()).rejects.toMatchObject({
+          code: StorageErrorCode.READ_ONLY,
+        });
+      }
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      await client.onApplicationShutdown();
+      send.mockRestore();
+    }
   });
 
-  it('claims no conditional copy for a provider that does not declare it', async () => {
+  it('forces a named S3-backed provider unverified and read-only', async () => {
+    const send = vi
+      .spyOn(S3Client.prototype, 'send')
+      .mockRejectedValue(new Error('unexpected S3 dispatch') as never);
+    const driver = await createProviderStorageDriver({
+      config: {
+        accessKeyId: 'test',
+        bucket: 'artifacts',
+        endpoint: 'https://minio.example.test',
+        region: 'us-east-1',
+        secretAccessKey: 'test',
+      },
+      provider: 'minio',
+      readonly: false,
+    });
+
+    expect(driver.capabilities.conditionalCreate).toBeUndefined();
+    expect(driver.capabilities.conditionalRead).toBeUndefined();
+    expect(driver.capabilities.physicalKey).toEqual({ maxBytes: 1_024 });
+    expect(driver.capabilities.signedUpload).toBe(false);
+    expect(driver.capabilities.signedDownloadPolicy).toEqual({
+      expiresIn: false,
+    });
+    const client = new StorageClient('unverified-minio', driver);
+    try {
+      await expect(
+        client.upload('blocked.txt', 'blocked'),
+      ).rejects.toMatchObject({
+        code: StorageErrorCode.READ_ONLY,
+      });
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      await client.onApplicationShutdown();
+      send.mockRestore();
+    }
+  });
+
+  it('forwards an explicit verified profile to a custom S3 endpoint', async () => {
+    const driver = await createProviderStorageDriver({
+      config: {
+        accessKeyId: 'test',
+        bucket: 'artifacts',
+        configJson: { endpoint: 'https://objects.example.test' },
+        region: 'us-east-1',
+        secretAccessKey: 'test',
+      },
+      provider: 's3',
+      s3ProviderProfile: defineS3ProviderProfile({
+        name: 'verified-custom',
+        physicalKey: { maxBytes: 512 },
+        conditionalCreate: { resultEtag: true },
+      }),
+    });
+
+    expect(driver.capabilities.conditionalCreate).toEqual({
+      resultEtag: true,
+    });
+    expect(driver.capabilities.conditionalReplace).toBeUndefined();
+    expect(driver.capabilities.physicalKey).toEqual({ maxBytes: 512 });
+    expect(driver.capabilities.signedUpload).toBe('runtime');
+    expect(driver.capabilities.signedUploadPolicy).toEqual({
+      contentType: false,
+      sizeRange: false,
+    });
+  });
+
+  it('rejects an S3 profile for a different provider', async () => {
+    await expect(
+      createProviderStorageDriver({
+        config: { root },
+        provider: 'fs',
+        s3ProviderProfile: defineS3ProviderProfile({
+          name: 'wrong-provider',
+          physicalKey: { maxBytes: 512 },
+        }),
+      }),
+    ).rejects.toMatchObject({
+      code: StorageErrorCode.INVALID_ARGUMENT,
+      permanent: true,
+    });
+  });
+
+  it('exposes the filesystem provider exact conditional capabilities', async () => {
     const driver = await createProviderStorageDriver({
       config: { root },
       provider: 'fs',
     });
 
-    expect(driver.capabilities.conditionalCopy).toBeUndefined();
-    expect(driver.capabilities.conditionalMutation).toEqual({
-      create: true,
-      delete: true,
+    expect(driver.capabilities.conditionalCreate).toEqual({
+      resultEtag: true,
+    });
+    expect(driver.capabilities.conditionalReplace).toEqual({
+      resultEtag: true,
+    });
+    expect(driver.capabilities.conditionalDelete).toEqual({ etag: true });
+    expect(driver.capabilities.conditionalRead).toEqual({
       etag: true,
+      version: false,
+    });
+    expect(driver.capabilities.conditionalCopySource).toEqual({
+      etag: true,
+      version: false,
+    });
+    expect(driver.capabilities.conditionalCopyDestination).toEqual({
+      atomicWithSource: true,
+      create: true,
       replace: true,
     });
+    expect(driver.capabilities.conditionalMultipartCompletion).toBeUndefined();
+    expect(driver.capabilities.physicalKey).toEqual({ maxBytes: 4_096 });
   });
 
   it('rejects an unknown slug before importing anything', async () => {

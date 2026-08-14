@@ -134,11 +134,14 @@ describe('createFsStorageDriver', () => {
       createFsStorageDriver({ adapter: { root } }),
     );
 
-    expect(client.capabilities.conditionalMutation).toEqual({
-      create: true,
-      delete: true,
+    expect(client.capabilities.conditionalCreate).toEqual({
+      resultEtag: true,
+    });
+    expect(client.capabilities.conditionalReplace).toEqual({
+      resultEtag: true,
+    });
+    expect(client.capabilities.conditionalDelete).toEqual({
       etag: true,
-      replace: true,
     });
     const created = await client.uploadConditional('note.txt', 'first', {
       condition: { type: 'create' },
@@ -199,13 +202,21 @@ describe('createFsStorageDriver', () => {
     ).toMatchObject([{ reason: { code: StorageErrorCode.CONFLICT } }]);
   });
 
-  it('does not advertise conditional mutation from a readonly filesystem driver', () => {
+  it('does not advertise conditional mutations from a readonly filesystem driver', () => {
     const driver = createFsStorageDriver({
       adapter: { root },
       readonly: true,
     });
 
-    expect(driver.capabilities.conditionalMutation).toBeUndefined();
+    expect(driver.capabilities.conditionalCreate).toBeUndefined();
+    expect(driver.capabilities.conditionalReplace).toBeUndefined();
+    expect(driver.capabilities.conditionalDelete).toBeUndefined();
+    expect(driver.capabilities.conditionalCopySource).toBeUndefined();
+    expect(driver.capabilities.conditionalCopyDestination).toBeUndefined();
+    expect(driver.capabilities.conditionalRead).toEqual({
+      etag: true,
+      version: false,
+    });
   });
 
   it('rejects a parent symlink during conditional create', async () => {

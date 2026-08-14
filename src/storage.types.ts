@@ -40,6 +40,12 @@ export interface StoragePromotionOptions extends StorageOperationOptions {
   sourceEtag?: string;
   /** Copy this immutable provider version of the source object. */
   sourceVersion?: string;
+  /**
+   * Protect the destination in the same provider copy request. When a source
+   * condition is also present, the provider profile must explicitly declare
+   * that both predicates are evaluated atomically.
+   */
+  destination?: { type: 'create' } | { type: 'replace'; etag: string };
 }
 
 export interface StorageMultipartOptions {
@@ -82,6 +88,7 @@ export interface StorageUploadResult {
   key: string;
   size: number;
   contentType: string;
+  /** Canonical bare provider ETag; pass it back unchanged as a condition. */
   etag?: string;
   lastModified?: Date;
 }
@@ -91,6 +98,7 @@ export interface StorageObjectMetadata {
   name: string;
   size: number;
   contentType: string;
+  /** Canonical bare provider ETag; pass it back unchanged as a condition. */
   etag?: string;
   lastModified?: Date;
   metadata?: Record<string, string>;
@@ -109,6 +117,20 @@ export interface StorageDownloadOptions extends StorageOperationOptions {
   range?: StorageByteRange;
 }
 
+/**
+ * Reads one exact observed object identity. At least one provider identity is
+ * required; a driver must never emulate this with a separate head request.
+ */
+export type StorageConditionalReadOptions = StorageDownloadOptions &
+  (
+    | {
+        condition: { etag: string; version?: string };
+      }
+    | {
+        condition: { etag?: string; version: string };
+      }
+  );
+
 export interface StorageBufferedDownloadOptions extends StorageDownloadOptions {
   /**
    * Maximum number of bytes buffered in memory. Defaults to 10 MiB.
@@ -119,6 +141,11 @@ export interface StorageBufferedDownloadOptions extends StorageDownloadOptions {
 
 export interface StorageListOptions extends StorageOperationOptions {
   prefix?: string;
+  /**
+   * Opaque, non-consuming continuation token returned by `list`. Replaying a
+   * cursor with the same options against unchanged provider state must return
+   * an equivalent page and continuation cursor.
+   */
   cursor?: string;
   limit?: number;
   delimiter?: string;
@@ -127,6 +154,7 @@ export interface StorageListOptions extends StorageOperationOptions {
 export interface StorageListResult {
   items: StorageObjectMetadata[];
   prefixes?: string[];
+  /** Opaque replayable continuation token for the next page, when present. */
   cursor?: string;
 }
 
@@ -169,24 +197,49 @@ export interface StorageSignedUrlCapability {
   maxExpiresIn?: number;
 }
 
-export interface StorageConditionalCopyCapability {
-  supported: boolean;
+export interface StorageConditionalWriteCapability {
+  /** A successful write returns the provider ETag identifying its result. */
+  resultEtag: boolean;
+}
+
+export interface StorageConditionalDeleteCapability {
+  /** Delete can compare the current object against an opaque provider ETag. */
   etag: boolean;
+}
+
+export interface StorageConditionalReadCapability {
+  /** Read can require the current object to match an opaque provider ETag. */
+  etag: boolean;
+  /** Read can select an immutable provider version. */
   version: boolean;
 }
 
-export interface StorageConditionalMutationCapability {
-  /** Native create-if-absent support. */
-  create: boolean;
-  /** Native replace-if-current-ETag-matches support. */
-  replace: boolean;
-  /** Native delete-if-current-ETag-matches support. */
-  delete: boolean;
-  /**
-   * Successful conditional uploads return an ETag usable for CAS. A provider
-   * that commits without returning one must fail rather than report success.
-   */
+export interface StorageConditionalCopySourceCapability {
+  /** Copy can require the source to match an opaque provider ETag. */
   etag: boolean;
+  /** Copy can select an immutable source version. */
+  version: boolean;
+}
+
+export interface StorageConditionalCopyDestinationCapability {
+  /** Copy can require that the destination does not exist. */
+  create: boolean;
+  /** Copy can require that the destination matches an opaque provider ETag. */
+  replace: boolean;
+  /** Source and destination predicates share one provider linearization point. */
+  atomicWithSource: boolean;
+}
+
+export interface StorageConditionalMultipartCompletionCapability {
+  /** Multipart completion can require that the destination does not exist. */
+  create: boolean;
+  /** Multipart completion can require that the destination ETag matches. */
+  replace: boolean;
+}
+
+export interface StoragePhysicalKeyCapability {
+  /** Maximum UTF-8 bytes in the complete provider key, including prefixes. */
+  maxBytes: number;
 }
 
 export interface StorageSignedUploadPolicyCapability {
@@ -211,16 +264,26 @@ export interface StorageCapabilities {
   resumableUpload: boolean;
   serverSideCopy: boolean;
   /**
-   * Conditional server-side copy used to promote an already verified staged
-   * object without a validation/copy race. Absent means unsupported for
-   * compatibility with drivers built against earlier package versions.
+   * Native create-if-absent support. Absent means unsupported; callers must
+   * not emulate it with an exists request followed by an unconditional write.
    */
-  conditionalCopy?: StorageConditionalCopyCapability;
+  conditionalCreate?: StorageConditionalWriteCapability;
   /**
-   * Native conditional mutations. Absent means unsupported; callers must not
-   * emulate these operations with a separate `exists()` or `head()` request.
+   * Native replace-if-current-ETag-matches support. Absent means unsupported.
    */
-  conditionalMutation?: StorageConditionalMutationCapability;
+  conditionalReplace?: StorageConditionalWriteCapability;
+  /** Native delete-if-current-ETag-matches support. */
+  conditionalDelete?: StorageConditionalDeleteCapability;
+  /** Native conditional read of an exact observed identity. */
+  conditionalRead?: StorageConditionalReadCapability;
+  /** Source predicates supported by conditional server-side copy. */
+  conditionalCopySource?: StorageConditionalCopySourceCapability;
+  /** Destination predicates supported by conditional server-side copy. */
+  conditionalCopyDestination?: StorageConditionalCopyDestinationCapability;
+  /** Conditions enforced by multipart completion rather than part upload. */
+  conditionalMultipartCompletion?: StorageConditionalMultipartCompletionCapability;
+  /** Provider budget for the complete physical key. */
+  physicalKey?: StoragePhysicalKeyCapability;
   signedDownload: StorageSignedUrlCapability;
   /** Expiry guarantees enforced by the provider adapter. */
   signedDownloadPolicy?: StorageSignedDownloadPolicyCapability;

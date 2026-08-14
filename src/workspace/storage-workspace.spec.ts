@@ -32,6 +32,24 @@ const ALL_PERMISSIONS: readonly StorageWorkspacePermission[] = [
   'delete',
 ];
 
+const MALICIOUS_ETAGS = [
+  '',
+  '"etag-a", "etag-b"',
+  'etag-a", "etag-b',
+  '*',
+  'W/"etag"',
+  'w/"etag"',
+  'unsafe\r\nIf-Match: *',
+  '"etag',
+  'etag"',
+  '""etag""',
+  'etag,other',
+  'etag\\other',
+  ' etag',
+  'etag ',
+  'x'.repeat(1_025),
+] as const;
+
 function mountedFs(root: string) {
   const client = new StorageClient(
     'workspace-tests',
@@ -127,7 +145,7 @@ describe('StorageWorkspace', () => {
       code: StorageErrorCode.INVALID_ARGUMENT,
     });
     await expect(
-      workspace.copyFile('link.txt', 'copied.txt'),
+      workspace.copyFile('link.txt', 'copied.txt', { etag: 'source-etag' }),
     ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
   });
 
@@ -167,6 +185,76 @@ describe('StorageWorkspace', () => {
     await workspace.deleteFile('src/a.ts', { etag: replaced.etag ?? '' });
     await expect(workspace.stat('src/a.ts')).rejects.toMatchObject({
       code: StorageErrorCode.NOT_FOUND,
+    });
+  });
+
+  it('rejects non-canonical ETags for every conditional mutation', async () => {
+    const driver = createFsStorageDriver({ adapter: { root } });
+    const workspace = mountStorageWorkspace(
+      new StorageClient('canonical-etags', driver),
+      { permissions: ALL_PERMISSIONS, prefix: 'scope' },
+    );
+
+    for (const etag of MALICIOUS_ETAGS) {
+      const label = JSON.stringify(etag.slice(0, 80));
+      await expect(
+        workspace.writeFile('target.txt', 'replacement', {
+          etag,
+          mode: 'replace',
+        }),
+        label,
+      ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+      await expect(
+        workspace.copyFile('source.txt', 'copy.txt', { etag }),
+        label,
+      ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+      await expect(
+        workspace.moveFile('source.txt', 'move.txt', { etag }),
+        label,
+      ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+      await expect(
+        workspace.deleteFile('target.txt', { etag }),
+        label,
+      ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    }
+  });
+
+  it('uses the fixed ETag limit independently of the workspace path limit', async () => {
+    const driver = createFsStorageDriver({ adapter: { root } });
+    const workspace = mountStorageWorkspace(
+      new StorageClient('etag-limit', driver),
+      {
+        limits: { maxPathBytes: 16 },
+        permissions: ALL_PERMISSIONS,
+        prefix: 'scope',
+      },
+    );
+    await workspace.writeFile('target.txt', 'original', { mode: 'create' });
+
+    await expect(
+      workspace.writeFile('target.txt', 'replacement', {
+        etag: 'a'.repeat(1_024),
+        mode: 'replace',
+      }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.CONFLICT });
+  });
+
+  it('fails closed when a provider returns a non-canonical ETag', async () => {
+    const driver = createMemoryStorageDriver({
+      adapter: { initial: { 'scope/file.txt': 'body' } },
+    });
+    const originalHead = driver.head.bind(driver);
+    driver.head = async (key, options) => ({
+      ...(await originalHead(key, options)),
+      etag: '"etag-a", "etag-b"',
+    });
+    const workspace = mountStorageWorkspace(
+      new StorageClient('malformed-provider-etag', driver),
+      { prefix: 'scope' },
+    );
+
+    await expect(workspace.stat('file.txt')).rejects.toMatchObject({
+      code: StorageErrorCode.PROVIDER,
     });
   });
 
@@ -346,10 +434,14 @@ describe('StorageWorkspace', () => {
       mode: 'create',
     });
 
-    const copied = await workspace.copyFile('source.txt', 'copy.txt');
+    const copied = await workspace.copyFile('source.txt', 'copy.txt', {
+      etag: source.etag ?? '',
+    });
     expect(copied.contentType).toBe('text/plain');
     await expect(
-      workspace.copyFile('source.txt', 'copy.txt'),
+      workspace.copyFile('source.txt', 'copy.txt', {
+        etag: source.etag ?? '',
+      }),
     ).rejects.toMatchObject({ code: StorageErrorCode.CONFLICT });
     await expect(
       workspace.moveFile('source.txt', 'moved.txt', {
@@ -485,7 +577,7 @@ describe('StorageWorkspace', () => {
     );
 
     await expect(
-      workspace.copyFile('source.txt', 'copy.txt'),
+      workspace.copyFile('source.txt', 'copy.txt', { etag: 'etag' }),
     ).rejects.toMatchObject({ code: StorageErrorCode.NOT_SUPPORTED });
     await expect(
       workspace.moveFile('source.txt', 'moved.txt', { etag: 'etag' }),

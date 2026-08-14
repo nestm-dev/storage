@@ -29,6 +29,18 @@ const tarballPath = join(temporaryRoot, 'nestm-storage.tgz');
 const rootPackage = JSON.parse(
   readFileSync(join(projectRoot, 'package.json'), 'utf8'),
 );
+const awsPeerNames = [
+  '@aws-sdk/client-s3',
+  '@aws-sdk/lib-storage',
+  '@aws-sdk/s3-presigned-post',
+  '@aws-sdk/s3-request-presigner',
+];
+const minimumAwsPeerVersions = Object.fromEntries(
+  awsPeerNames.map((name) => [
+    name,
+    caretMinimum(rootPackage.peerDependencies?.[name], name),
+  ]),
+);
 
 try {
   run('pnpm', ['pack', '--out', tarballPath], projectRoot);
@@ -43,14 +55,13 @@ try {
         private: true,
         type: 'module',
         dependencies: {
-          '@aws-sdk/client-s3':
-            rootPackage.devDependencies['@aws-sdk/client-s3'],
+          '@aws-sdk/client-s3': minimumAwsPeerVersions['@aws-sdk/client-s3'],
           '@aws-sdk/lib-storage':
-            rootPackage.devDependencies['@aws-sdk/lib-storage'],
+            minimumAwsPeerVersions['@aws-sdk/lib-storage'],
           '@aws-sdk/s3-presigned-post':
-            rootPackage.devDependencies['@aws-sdk/s3-presigned-post'],
+            minimumAwsPeerVersions['@aws-sdk/s3-presigned-post'],
           '@aws-sdk/s3-request-presigner':
-            rootPackage.devDependencies['@aws-sdk/s3-request-presigner'],
+            minimumAwsPeerVersions['@aws-sdk/s3-request-presigner'],
           '@nestm/storage': `file:${tarballPath}`,
         },
         devDependencies: {
@@ -88,6 +99,10 @@ try {
     )}\n`,
   );
   writeFileSync(join(consumerRoot, 'src', 'smoke.ts'), getConsumerSource());
+  writeFileSync(
+    join(consumerRoot, 's3-minimum-peer.mjs'),
+    getS3MinimumPeerSource(minimumAwsPeerVersions),
+  );
 
   run(
     'npm',
@@ -101,6 +116,7 @@ try {
 
   run('npm', ['exec', '--', 'tsc', '-p', '.'], consumerRoot);
   run(process.execPath, ['dist/smoke.js'], consumerRoot);
+  run(process.execPath, ['s3-minimum-peer.mjs'], consumerRoot);
 } finally {
   rmSync(temporaryRoot, { force: true, recursive: true });
 }
@@ -111,6 +127,16 @@ function run(command, arguments_, cwd) {
     env: process.env,
     stdio: 'inherit',
   });
+}
+
+function caretMinimum(range, packageName) {
+  const match = /^\^(\d+\.\d+\.\d+)$/.exec(range ?? '');
+  if (match?.[1] === undefined) {
+    throw new Error(
+      `${packageName} must use one exact caret peer range for the packed minimum-peer test.`,
+    );
+  }
+  return match[1];
 }
 
 function getConsumerSource() {
@@ -279,11 +305,33 @@ const s3Driver = createS3StorageDriver({
     region: 'us-east-1',
   },
 });
-assert.deepEqual(s3Driver.capabilities.conditionalCopy, {
+assert.deepEqual(s3Driver.capabilities.conditionalCreate, {
+  resultEtag: true,
+});
+assert.deepEqual(s3Driver.capabilities.conditionalReplace, {
+  resultEtag: true,
+});
+assert.deepEqual(s3Driver.capabilities.conditionalDelete, {
   etag: true,
-  supported: true,
+});
+assert.deepEqual(s3Driver.capabilities.conditionalRead, {
+  etag: true,
   version: true,
 });
+assert.deepEqual(s3Driver.capabilities.conditionalCopySource, {
+  etag: true,
+  version: true,
+});
+assert.deepEqual(s3Driver.capabilities.conditionalCopyDestination, {
+  atomicWithSource: true,
+  create: true,
+  replace: true,
+});
+assert.deepEqual(s3Driver.capabilities.conditionalMultipartCompletion, {
+  create: true,
+  replace: true,
+});
+assert.deepEqual(s3Driver.capabilities.physicalKey, { maxBytes: 1_024 });
 assert.deepEqual(s3Driver.capabilities.signedUploadPolicy, {
   contentType: true,
   sizeRange: true,
@@ -302,5 +350,331 @@ assert.equal(await client.downloadText('hello.txt'), 'hello core');
 await client.onApplicationShutdown();
 await client.onApplicationShutdown();
 assert.equal(closeCalls, 1);
+`;
+}
+
+function getS3MinimumPeerSource(minimumVersions) {
+  return `import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+
+import { S3Client } from '@aws-sdk/client-s3';
+import {
+  StorageClient,
+  StorageErrorCode,
+} from '@nestm/storage/core';
+import { createFilesSdkDriver } from '@nestm/storage/files-sdk';
+import {
+  CLOUDFLARE_R2_PROVIDER_PROFILE,
+  createS3StorageDriver,
+  defineS3ProviderProfile,
+  s3,
+  withS3Capabilities,
+} from '@nestm/storage/files-sdk/s3';
+
+const require = createRequire(import.meta.url);
+for (const [name, expected] of Object.entries(${JSON.stringify(minimumVersions)})) {
+  const installed = require(name + '/package.json');
+  assert.equal(installed.version, expected, name + ' minimum peer drifted');
+}
+
+const serializedRequests = [];
+const instrumentedClients = new WeakSet();
+const originalSend = S3Client.prototype.send;
+process.env.AWS_ENDPOINT_URL_S3 = 'https://minimum-peer-redirect.invalid';
+process.env.AWS_IGNORE_CONFIGURED_ENDPOINT_URLS = 'false';
+
+S3Client.prototype.send = function (...arguments_) {
+  if (!instrumentedClients.has(this)) {
+    this.middlewareStack.add(
+      () => async (middlewareArguments) => {
+        serializedRequests.push(middlewareArguments.request);
+        return {
+          output: { $metadata: { httpStatusCode: 200 } },
+          response: { headers: {}, statusCode: 200 },
+        };
+      },
+      {
+        name: 'captureSerializedCopyDestinationConditions',
+        priority: 'high',
+        step: 'finalizeRequest',
+      },
+    );
+    instrumentedClients.add(this);
+  }
+  return Reflect.apply(originalSend, this, arguments_);
+};
+
+try {
+  const baseAdapterOptions = {
+    bucket: 'minimum-peer-bucket',
+    credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+    region: 'us-east-1',
+  };
+
+  const widenedNative = s3(baseAdapterOptions);
+  try {
+    assert.throws(
+      () =>
+        withS3Capabilities(widenedNative, {
+          providerProfile: defineS3ProviderProfile({
+            name: 'invalid-widened-minimum-peer-native',
+            physicalKey: { maxBytes: 2048 },
+          }),
+        }),
+      /cannot widen aws-s3-general-purpose physicalKey\\.maxBytes/u,
+    );
+  } finally {
+    widenedNative.raw.destroy();
+  }
+  assert.equal(serializedRequests.length, 0);
+
+  const forgedUndecorated = s3(baseAdapterOptions);
+  try {
+    Object.defineProperty(
+      forgedUndecorated.raw,
+      Symbol.for('@nestm/storage/files-sdk/s3-adapter-provenance'),
+      {
+        configurable: false,
+        enumerable: false,
+        value: 'verified',
+        writable: false,
+      },
+    );
+    assert.throws(
+      () => createFilesSdkDriver({ adapter: forgedUndecorated }),
+      (error) => error?.code === StorageErrorCode.INVALID_ARGUMENT,
+    );
+    assert.throws(
+      () =>
+        createFilesSdkDriver({
+          adapter: { ...forgedUndecorated, name: 'renamed-forged-s3' },
+        }),
+      (error) => error?.code === StorageErrorCode.INVALID_ARGUMENT,
+    );
+    assert.throws(
+      () =>
+        createFilesSdkDriver({
+          adapter: {
+            ...forgedUndecorated,
+            name: 'renamed-replaced-raw-s3',
+            raw: {},
+          },
+        }),
+      (error) => error?.code === StorageErrorCode.INVALID_ARGUMENT,
+    );
+    const symbolForgingRaw = new Proxy(forgedUndecorated.raw, {
+      get(target, property, receiver) {
+        if (
+          typeof property === 'symbol' &&
+          property.description?.toLowerCase().includes('provenance')
+        ) {
+          return 'verified';
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    assert.throws(
+      () =>
+        createFilesSdkDriver({
+          adapter: {
+            ...forgedUndecorated,
+            name: 'renamed-symbol-forging-s3',
+            raw: symbolForgingRaw,
+          },
+        }),
+      (error) => error?.code === StorageErrorCode.INVALID_ARGUMENT,
+    );
+  } finally {
+    forgedUndecorated.raw.destroy();
+  }
+
+  const unverifiedBase = s3({
+    ...baseAdapterOptions,
+    endpoint: 'https://unverified.minimum-peer.invalid',
+  });
+  const unverifiedClient = new StorageClient(
+    'minimum-peer-unverified',
+    createFilesSdkDriver({
+      adapter: withS3Capabilities(unverifiedBase),
+      readonly: false,
+    }),
+  );
+  try {
+    assert.equal(unverifiedClient.capabilities.signedUpload, false);
+    await assert.rejects(
+      () => unverifiedClient.upload('blocked.txt', 'blocked'),
+      (error) => error?.code === StorageErrorCode.READ_ONLY,
+    );
+  } finally {
+    await unverifiedClient.onApplicationShutdown();
+  }
+
+  const narrowBase = s3({
+    ...baseAdapterOptions,
+    endpoint: 'https://verified.minimum-peer.invalid',
+  });
+  const narrowAdapter = withS3Capabilities(narrowBase, {
+    providerProfile: defineS3ProviderProfile({
+      name: 'minimum-peer-narrow',
+      physicalKey: { maxBytes: 512 },
+      conditionalRead: { etag: true, version: false },
+    }),
+  });
+  try {
+    assert.deepEqual(narrowAdapter.signedUploadPolicy, {
+      contentType: false,
+      sizeRange: false,
+    });
+    assert.throws(
+      () =>
+        createFilesSdkDriver({
+          adapter: {
+            ...narrowAdapter,
+            conditionalCreate: { resultEtag: true },
+            async uploadConditional() {
+              throw new Error('widened alias must never dispatch');
+            },
+          },
+        }),
+      (error) => error?.code === StorageErrorCode.INVALID_ARGUMENT,
+    );
+  } finally {
+    narrowBase.raw.destroy();
+  }
+
+  assert.equal(serializedRequests.length, 0);
+
+  const client = new StorageClient(
+    'minimum-peer',
+    createS3StorageDriver({
+      adapter: baseAdapterOptions,
+    }),
+  );
+
+  await client.promote('source.txt', 'create.txt', {
+    destination: { type: 'create' },
+    sourceEtag: 'source-etag',
+  });
+  await client.promote('source.txt', 'replace.txt', {
+    destination: { etag: 'destination-etag', type: 'replace' },
+    sourceEtag: 'source-etag',
+  });
+
+  assert.equal(serializedRequests.length, 2);
+  const [createRequest, replaceRequest] = serializedRequests;
+  assert.ok(createRequest);
+  assert.ok(replaceRequest);
+  assert.equal(
+    createRequest.hostname,
+    'minimum-peer-bucket.s3.us-east-1.amazonaws.com',
+  );
+  assert.equal(
+    replaceRequest.hostname,
+    'minimum-peer-bucket.s3.us-east-1.amazonaws.com',
+  );
+
+  assert.equal(createRequest.headers['if-none-match'], '*');
+  assert.equal(createRequest.headers['if-match'], undefined);
+  assert.equal(
+    createRequest.headers['x-amz-copy-source-if-match'],
+    '"source-etag"',
+  );
+
+  assert.equal(replaceRequest.headers['if-match'], '"destination-etag"');
+  assert.equal(replaceRequest.headers['if-none-match'], undefined);
+  assert.equal(
+    replaceRequest.headers['x-amz-copy-source-if-match'],
+    '"source-etag"',
+  );
+
+  const typedPut = await client.signUpload('typed.txt', {
+    contentType: 'text/plain',
+    expiresIn: 60,
+  });
+  assert.equal(typedPut.method, 'PUT');
+  assert.deepEqual(typedPut.headers, { 'Content-Type': 'text/plain' });
+  assert.equal(
+    new URL(typedPut.url).searchParams.get('X-Amz-SignedHeaders'),
+    'content-type;host',
+  );
+
+  const boundedPost = await client.signUpload('bounded.txt', {
+    contentType: 'text/plain',
+    expiresIn: 60,
+    maxSize: 1000,
+    minSize: 100,
+  });
+  assert.equal(boundedPost.method, 'POST');
+  const boundedPolicy = JSON.parse(
+    Buffer.from(boundedPost.fields.Policy, 'base64').toString('utf8'),
+  );
+  assert.ok(
+    boundedPolicy.conditions.some(
+      (condition) =>
+        Array.isArray(condition) &&
+        condition[0] === 'content-length-range' &&
+        condition[1] === 100 &&
+        condition[2] === 1000,
+    ),
+  );
+  assert.ok(
+    boundedPolicy.conditions.some(
+      (condition) =>
+        Array.isArray(condition) &&
+        condition[0] === 'eq' &&
+        condition[1] === '$Content-Type' &&
+        condition[2] === 'text/plain',
+    ),
+  );
+  await assert.rejects(
+    () => client.signUpload('min-only.txt', { expiresIn: 60, minSize: 1 }),
+    (error) => error?.code === StorageErrorCode.NOT_SUPPORTED,
+  );
+  await assert.rejects(
+    () =>
+      client.signUpload('\${filename}', {
+        expiresIn: 60,
+        maxSize: 1000,
+      }),
+    (error) => error?.code === StorageErrorCode.INVALID_ARGUMENT,
+  );
+
+  const r2 = new StorageClient(
+    'minimum-peer-r2',
+    createS3StorageDriver({
+      adapter: {
+        ...baseAdapterOptions,
+        endpoint: 'https://account.r2.cloudflarestorage.com',
+        region: 'auto',
+      },
+      providerProfile: CLOUDFLARE_R2_PROVIDER_PROFILE,
+    }),
+  );
+  const r2TypedPut = await r2.signUpload('typed.txt', {
+    contentType: 'text/plain',
+    expiresIn: 60,
+  });
+  assert.equal(r2TypedPut.method, 'PUT');
+  assert.equal(
+    new URL(r2TypedPut.url).searchParams.get('X-Amz-SignedHeaders'),
+    'content-type;host',
+  );
+  await assert.rejects(
+    () =>
+      r2.signUpload('bounded.txt', {
+        expiresIn: 60,
+        maxSize: 1000,
+      }),
+    (error) => error?.code === StorageErrorCode.NOT_SUPPORTED,
+  );
+  await r2.onApplicationShutdown();
+  assert.equal(serializedRequests.length, 2);
+
+  await client.onApplicationShutdown();
+} finally {
+  S3Client.prototype.send = originalSend;
+  delete process.env.AWS_ENDPOINT_URL_S3;
+  delete process.env.AWS_IGNORE_CONFIGURED_ENDPOINT_URLS;
+}
 `;
 }
