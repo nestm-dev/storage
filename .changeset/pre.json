@@ -7,11 +7,14 @@
   "changesets": [
     "add-agent-workspaces",
     "add-artifact-storage",
+    "compose-workspace-tool-conflicts",
+    "fix-workspace-cursor-continuity",
     "framework-neutral-core",
     "harden-storage-boundaries",
     "initial-storage-release",
     "map-foreign-files-not-found",
     "restore-generic-storage-boundary",
-    "runtime-provider-selection"
+    "runtime-provider-selection",
+    "split-s3-conditional-capabilities"
   ]
 }

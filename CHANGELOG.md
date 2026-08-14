@@ -1,5 +1,115 @@
 # @nestm/storage
 
+## 0.1.0-alpha.8
+
+### Minor Changes
+
+- d81c6f4: Add a typed `mapCreateConflict` hook to the AI SDK workspace adapter so
+  applications can represent atomic create collisions as domain results without
+  mutating generated tools. Keep replace/ETag conflicts fail-closed and sanitize
+  mapper failures at the tool boundary.
+
+  Mark workspace tools with optional inputs or a combined create/replace union as
+  non-strict for provider schema generation while retaining strict Zod runtime
+  validation.
+
+- a0ea392: Add injectable, replica-safe workspace pagination cursors. The workspace now
+  binds versioned cursor payloads to stable store, mount, tenant/workspace, prefix,
+  operation, query, limit, and expiry context; authorizes non-consuming replay
+  before that expiry; and rejects altered or cross-context continuations.
+  Successful continuation still depends on the embedded provider cursor remaining
+  valid and available.
+
+  Export an AES-256-GCM key-ring codec for stateless multi-replica deployments and
+  an asynchronous byte-payload codec contract for shared durable opaque-token
+  stores. Cursor payloads and tokens are bounded, provider continuations remain
+  opaque, and pagination fails closed when no cursor mechanism is configured.
+  Compatible replicas rely on the universal driver contract for non-consuming,
+  instance-portable provider cursors whose position is independent of page size
+  while the provider token remains valid. Cursor expiry is not a provider-token
+  retention, snapshot-isolation, or uptime promise; provider invalidation remains
+  an operational list failure.
+
+- d996b92: Split the aggregate S3 conditional-mutation and copy declarations into exact
+  create, replace, delete, read, source-copy, destination-copy, atomic-promotion,
+  and multipart-completion capabilities. Add independent AWS S3, Cloudflare R2,
+  and fail-closed custom-endpoint profiles that force unverified drivers
+  read-only; enforce complete physical-key byte budgets; normalize provider
+  errors without retaining raw provider payloads or causes; and publish a reusable
+  provider conformance contract with gated filesystem, AWS, R2, and custom suites.
+
+  Normalize every provider ETag to a canonical bare 1–1024-byte visible ASCII
+  token and serialize exactly one HTTP quote pair at S3 request boundaries.
+  Quoted, weak, wildcard, list-shaped, control-bearing, non-ASCII, and otherwise
+  unsafe values now fail closed instead of being accepted as arbitrary non-empty
+  strings. Applications that persisted quoted ETags must refresh them from
+  provider metadata before conditional mutation; this prevents wildcard/list and
+  header-ambiguity inputs from widening an exact-match precondition.
+
+  Specify and test provider list cursors as non-consuming replayable tokens for
+  unchanged provider state, so higher-level replayable pagination can fail closed
+  when a provider cannot meet that contract.
+
+  Exercise the complete advertised source-condition by destination-condition
+  promotion matrix, including stale-state preservation and competing stale/valid
+  requests. Provider documentation or audited implementation evidence remains
+  required for the internal one-linearization-point claim.
+
+  Ordinary and conditional provider failures now expose stable public messages
+  and preserve only normalized codes and retry flags; raw provider bodies,
+  request metadata, and nested causes are not retained in loggable error shapes.
+
+  Raise the `@aws-sdk/client-s3` peer floor to 3.919.0, the first release that
+  serializes destination conditions for `CopyObject`, and verify the real wire
+  headers in the packed minimum-peer consumer. Native AWS construction now
+  disables environment and shared-config endpoint URL overrides, while the public
+  capability helper derives custom-endpoint provenance from the actual SDK client
+  instead of a duplicated caller hint. Capability decoration is now single-use
+  per raw S3 adapter, preventing broader operations from surviving a later
+  narrower profile application.
+
+  Bind S3 provider authority to package-private raw-client and adapter-method
+  identity plus the exact surface snapshot installed by capability decoration.
+  Structurally S3-backed raw adapters are rejected until they pass through the
+  package helper, regardless of adapter name, proxying, or forged global symbols;
+  same-client aliases cannot replace their raw client, ordinary methods, policies,
+  or conditional operations. Unverified custom endpoints and noncanonical
+  S3-backed provider slugs are forced read-only, while an explicit branded profile
+  unlocks only its declared conditional operations. Endpoint and public-URL
+  provenance now follows the adapter actually produced by the provider loader,
+  including `configJson`.
+
+  Retain `publicBaseUrl` construction policy in the package-owned `s3()` helper
+  so omitted decorator hints cannot re-enable an expiring-download claim. Unknown
+  foreign S3 construction conservatively disables that claim. Validate the exact
+  physical adapter key without stripping leading slashes, and include configured
+  separators plus list/search-derived prefixes in the provider byte budget before
+  dispatch. Search uses files-sdk's own inferred glob-prefix and zero-result
+  semantics instead of duplicating its matcher logic. The innermost dispatch guard
+  repeats these checks after supported in-process plugins have transformed an
+  operation; adapters and plugins remain trusted code rather than a sandbox
+  boundary.
+
+  Derive signed-upload policy claims from the branded provider profile instead
+  of granting them to every S3-compatible endpoint. Native AWS proves content
+  type and POST size-range enforcement; Cloudflare R2 proves content type but not
+  POST form size ranges; omitted custom declarations normalize to false/false so
+  the gateway fails closed. Profile authority is backed by a package-private
+  WeakSet after deep freezing, so reflecting and copying the nominal brand symbol
+  cannot forge conformance evidence.
+
+  Treat the built-in AWS profile as an immutable ceiling for every SDK client
+  with native endpoint provenance, independent of mutable adapter display names.
+  Explicit profiles may narrow its operations, policy bits, and key limit but
+  cannot raise the 1,024-byte physical-key budget or add unsupported claims.
+
+  Enforce every requested signed-upload constraint at URL creation time.
+  Content-type-constrained PUT URLs now sign the `content-type` header; bounded
+  AWS uploads use exact POST MIME and byte-range conditions; unsupported profile
+  constraints and lower-only S3 ranges fail before signing. Bounded POST uploads
+  also reject physical keys ending in AWS's `${filename}` template so an exact
+  authorized key cannot be widened into a prefix policy.
+
 ## 0.1.0-alpha.7
 
 ### Minor Changes
