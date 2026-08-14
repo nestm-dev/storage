@@ -13,7 +13,7 @@ importers:
     dependencies:
       files-sdk:
         specifier: 2.2.3
-        version: 2.2.3(@aws-sdk/client-s3@3.1103.0)(@aws-sdk/lib-storage@3.1103.0(@aws-sdk/client-s3@3.1103.0))(@aws-sdk/s3-presigned-post@3.1103.0)(@aws-sdk/s3-request-presigner@3.1103.0)(@nestjs/common@12.0.0-alpha.5(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.52(zod@4.4.3))(fastify@5.11.2)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3)
+        version: 2.2.3(@aws-sdk/client-s3@3.1103.0)(@aws-sdk/lib-storage@3.1103.0(@aws-sdk/client-s3@3.1103.0))(@aws-sdk/s3-presigned-post@3.1103.0)(@aws-sdk/s3-request-presigner@3.1103.0)(@nestjs/common@12.0.0-alpha.5(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.64(zod@4.4.3))(fastify@5.11.2)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3)
     devDependencies:
       '@aws-sdk/client-s3':
         specifier: 3.1103.0
@@ -55,8 +55,8 @@ importers:
         specifier: 4.1.10
         version: 4.1.10(vitest@4.1.10)
       ai:
-        specifier: 7.0.52
-        version: 7.0.52(zod@4.4.3)
+        specifier: 7.0.64
+        version: 7.0.64(zod@4.4.3)
       fastify:
         specifier: 5.11.2
         version: 5.11.2
@@ -90,20 +90,20 @@ importers:
 
 packages:
 
-  '@ai-sdk/gateway@4.0.41':
-    resolution: {integrity: sha512-DPkDmmA336kqmIp62on550/6Q6JHvldsnvN1SmkwU8QGrVt1PzFxqyKUn0C5EGGmSBpvF1ohZNtvWNl8gEVugA==}
+  '@ai-sdk/gateway@4.0.51':
+    resolution: {integrity: sha512-tQxWGUbg/O3A5EgekJo/C2byLVQ1r+vL6QdEVWmxUSnPhdCupcOeDbQO1tv9Um40VrdwYuSWlYzcbWvtlG5bOA==}
     engines: {node: '>=22'}
     peerDependencies:
       zod: ^3.25.76 || ^4.1.8
 
-  '@ai-sdk/provider-utils@5.0.21':
-    resolution: {integrity: sha512-Q4z27c5vqKuXZN65QuF7FVm+uvm3qxEioiQ+8c3s5xXlhbE1Y/SLGBB4BuF+UWia4KaDu2HmNpdR1RGW02/eGg==}
+  '@ai-sdk/provider-utils@5.0.27':
+    resolution: {integrity: sha512-EzAn4pdgG5g0xXtH6lE2zyNmfjDQIDjATkfqzuidEI35g++hh4+07vnjzkT/RmGmIClPZiRj/Q2GMPV2V7mkHw==}
     engines: {node: '>=22'}
     peerDependencies:
       zod: ^3.25.76 || ^4.1.8
 
-  '@ai-sdk/provider@4.0.5':
-    resolution: {integrity: sha512-9WAerTaPU2jcVi8dh8x27tySEuLur1Kfg7Go74GuCmsC/2MDSvrTkrK8ZrXWjryEevKfcPPmO1enveE7eqlzoA==}
+  '@ai-sdk/provider@4.0.7':
+    resolution: {integrity: sha512-6or44XprPzKbr8zkmzosowSE0pxkvJcoojBL+mCZvPUt3kvXp3XSNqeVun9golb1acEfSo6yaEBRT18h2VU+1Q==}
     engines: {node: '>=22'}
 
   '@aws-sdk/checksums@3.1000.26':
@@ -913,8 +913,8 @@ packages:
     resolution: {integrity: sha512-5cvg6CtKwfgdmVqY1WIiXKc3Q1bkRqGLi+2W/6ao+6Y7gu/RCwRuAhGEzh5B4KlszSuTLgZYuqFqo5bImjNKng==}
     engines: {node: '>= 0.6'}
 
-  ai@7.0.52:
-    resolution: {integrity: sha512-sEgRnYA+ddJ1rJSz1uKBjkGbOXhXdon1nvno49fVk3tabnlf8v5SaceLBpPDMtmDuLKQFztc/YbRsoCQoPzKZw==}
+  ai@7.0.64:
+    resolution: {integrity: sha512-29Ufm56e53pRzIPueWzZiwJsgxmZStaBFpwEkVM89sqyIIax/pzDm+ez/ksJ/CcY9UCuYzvCQpE2zkFHICvS3w==}
     engines: {node: '>=22'}
     peerDependencies:
       zod: ^3.25.76 || ^4.1.8
@@ -2308,23 +2308,23 @@ packages:
 
 snapshots:
 
-  '@ai-sdk/gateway@4.0.41(zod@4.4.3)':
+  '@ai-sdk/gateway@4.0.51(zod@4.4.3)':
     dependencies:
-      '@ai-sdk/provider': 4.0.5
-      '@ai-sdk/provider-utils': 5.0.21(zod@4.4.3)
+      '@ai-sdk/provider': 4.0.7
+      '@ai-sdk/provider-utils': 5.0.27(zod@4.4.3)
       '@vercel/oidc': 3.2.0
       zod: 4.4.3
 
-  '@ai-sdk/provider-utils@5.0.21(zod@4.4.3)':
+  '@ai-sdk/provider-utils@5.0.27(zod@4.4.3)':
     dependencies:
-      '@ai-sdk/provider': 4.0.5
+      '@ai-sdk/provider': 4.0.7
       '@standard-schema/spec': 1.1.0
       '@workflow/serde': 4.1.0
       eventsource-parser: 3.1.0
       undici: 7.29.0
       zod: 4.4.3
 
-  '@ai-sdk/provider@4.0.5':
+  '@ai-sdk/provider@4.0.7':
     dependencies:
       json-schema: 0.4.0
 
@@ -3207,11 +3207,11 @@ snapshots:
       mime-types: 3.0.2
       negotiator: 1.0.0
 
-  ai@7.0.52(zod@4.4.3):
+  ai@7.0.64(zod@4.4.3):
     dependencies:
-      '@ai-sdk/gateway': 4.0.41(zod@4.4.3)
-      '@ai-sdk/provider': 4.0.5
-      '@ai-sdk/provider-utils': 5.0.21(zod@4.4.3)
+      '@ai-sdk/gateway': 4.0.51(zod@4.4.3)
+      '@ai-sdk/provider': 4.0.7
+      '@ai-sdk/provider-utils': 5.0.27(zod@4.4.3)
       zod: 4.4.3
 
   ajv-formats@3.0.1(ajv@8.20.0):
@@ -3574,7 +3574,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  files-sdk@2.2.3(@aws-sdk/client-s3@3.1103.0)(@aws-sdk/lib-storage@3.1103.0(@aws-sdk/client-s3@3.1103.0))(@aws-sdk/s3-presigned-post@3.1103.0)(@aws-sdk/s3-request-presigner@3.1103.0)(@nestjs/common@12.0.0-alpha.5(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.52(zod@4.4.3))(fastify@5.11.2)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3):
+  files-sdk@2.2.3(@aws-sdk/client-s3@3.1103.0)(@aws-sdk/lib-storage@3.1103.0(@aws-sdk/client-s3@3.1103.0))(@aws-sdk/s3-presigned-post@3.1103.0)(@aws-sdk/s3-request-presigner@3.1103.0)(@nestjs/common@12.0.0-alpha.5(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.64(zod@4.4.3))(fastify@5.11.2)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3):
     dependencies:
       aws4fetch: 1.0.20
       commander: 15.0.0
@@ -3587,7 +3587,7 @@ snapshots:
       '@aws-sdk/s3-request-presigner': 3.1103.0
       '@modelcontextprotocol/sdk': 1.30.0(supports-color@7.2.0)(zod@4.4.3)
       '@nestjs/common': 12.0.0-alpha.5(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0)
-      ai: 7.0.52(zod@4.4.3)
+      ai: 7.0.64(zod@4.4.3)
       fastify: 5.11.2
       hono: 4.13.0
       zod: 4.4.3

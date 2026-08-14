@@ -188,6 +188,7 @@ describe('createAiSdkWorkspaceTools', () => {
       'workspace_stat',
       'workspace_write_file',
     ]);
+    expect(viewTool(tools, 'workspace_write_file').strict).toBe(false);
   });
 
   it('omits compound mutations until all enforcing permissions are present', () => {
@@ -314,6 +315,7 @@ describe('createAiSdkWorkspaceTools', () => {
       false,
     );
     expect(viewTool(tools, 'workspace_stat').strict).toBe(true);
+    expect(viewTool(tools, 'workspace_search').strict).toBe(false);
   });
 
   it('describes cursor continuation with the bound query options', () => {
@@ -331,6 +333,7 @@ describe('createAiSdkWorkspaceTools', () => {
       viewTool(tools, 'workspace_list').inputSchema.safeParse({ cursor })
         .success,
     ).toBe(true);
+    expect(viewTool(tools, 'workspace_list').strict).toBe(false);
     expect(
       viewTool(tools, 'workspace_list').inputSchema.safeParse({
         cursor: '',
@@ -375,6 +378,7 @@ describe('createAiSdkWorkspaceTools', () => {
       createTools,
       'workspace_write_file',
     ).inputSchema;
+    expect(viewTool(createTools, 'workspace_write_file').strict).toBe(true);
     expect(
       createSchema.safeParse({
         path: 'new.txt',
@@ -406,6 +410,7 @@ describe('createAiSdkWorkspaceTools', () => {
       replaceTools,
       'workspace_write_file',
     ).inputSchema;
+    expect(viewTool(replaceTools, 'workspace_write_file').strict).toBe(true);
     expect(
       replaceSchema.safeParse({
         path: 'old.txt',
@@ -683,6 +688,112 @@ describe('createAiSdkWorkspaceTools', () => {
     ).resolves.toEqual({ deleted: true, path: 'old.txt' });
     expect(fixture.deleteFile).toHaveBeenCalledWith('old.txt', {
       etag: 'delete-etag',
+    });
+  });
+
+  it('maps only atomic create conflicts through the typed application hook', async () => {
+    const fixture = createWorkspaceDouble(['create', 'replace']);
+    const conflict = new StorageWorkspaceError('private provider detail', {
+      code: StorageErrorCode.CONFLICT,
+      operation: 'writeFile',
+      path: 'existing.txt',
+      permanent: true,
+    });
+    fixture.writeFile.mockRejectedValue(conflict);
+    const mappedPaths: string[] = [];
+    const tools = createAiSdkWorkspaceTools({
+      workspace: fixture.workspace,
+      mapCreateConflict: ({ path }) => {
+        mappedPaths.push(path);
+        return { kind: 'already-exists' as const, path };
+      },
+    });
+
+    await expect(
+      executeTool(tools, 'workspace_write_file', {
+        path: 'existing.txt',
+        content: 'new',
+        mode: 'create',
+      }),
+    ).resolves.toEqual({ kind: 'already-exists', path: 'existing.txt' });
+    expect(mappedPaths).toEqual(['existing.txt']);
+
+    await expect(
+      executeTool(tools, 'workspace_write_file', {
+        path: 'existing.txt',
+        content: 'new',
+        mode: 'replace',
+        etag: 'stale-etag',
+      }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.CONFLICT });
+    expect(mappedPaths).toEqual(['existing.txt']);
+
+    fixture.writeFile.mockRejectedValueOnce(
+      new StorageWorkspaceError('private provider detail', {
+        code: StorageErrorCode.PROVIDER,
+        operation: 'writeFile',
+        path: 'new.txt',
+      }),
+    );
+    await expect(
+      executeTool(tools, 'workspace_write_file', {
+        path: 'new.txt',
+        content: 'new',
+        mode: 'create',
+      }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.PROVIDER });
+    expect(mappedPaths).toEqual(['existing.txt']);
+  });
+
+  it('keeps create conflicts as errors when no mapper is configured', async () => {
+    const fixture = createWorkspaceDouble(['create']);
+    fixture.writeFile.mockRejectedValue(
+      new StorageWorkspaceError('private provider detail', {
+        code: StorageErrorCode.CONFLICT,
+        operation: 'writeFile',
+        path: 'existing.txt',
+      }),
+    );
+    const tools = createAiSdkWorkspaceTools({ workspace: fixture.workspace });
+
+    await expect(
+      executeTool(tools, 'workspace_write_file', {
+        path: 'existing.txt',
+        content: 'new',
+        mode: 'create',
+      }),
+    ).rejects.toMatchObject({
+      code: StorageErrorCode.CONFLICT,
+      message:
+        'The operation conflicts with current workspace state. Refresh metadata and retry with the current ETag or a new destination.',
+    });
+  });
+
+  it('sanitizes failures thrown by a create-conflict mapper', async () => {
+    const fixture = createWorkspaceDouble(['create']);
+    fixture.writeFile.mockRejectedValue(
+      new StorageWorkspaceError('private provider detail', {
+        code: StorageErrorCode.CONFLICT,
+        operation: 'writeFile',
+        path: 'existing.txt',
+      }),
+    );
+    const tools = createAiSdkWorkspaceTools({
+      workspace: fixture.workspace,
+      mapCreateConflict: () => {
+        throw new Error('private application detail');
+      },
+    });
+
+    await expect(
+      executeTool(tools, 'workspace_write_file', {
+        path: 'existing.txt',
+        content: 'new',
+        mode: 'create',
+      }),
+    ).rejects.toMatchObject({
+      code: StorageErrorCode.PROVIDER,
+      message: 'The workspace operation failed.',
     });
   });
 

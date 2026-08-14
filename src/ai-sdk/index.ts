@@ -4,6 +4,8 @@ export {
   createAiSdkWorkspaceTools,
   isAiSdkWorkspaceMutationToolName,
   type AiSdkWorkspaceApprovalConfig,
+  type AiSdkWorkspaceCreateConflict,
+  type AiSdkWorkspaceCreateConflictMapper,
   type AiSdkWorkspaceDirectoryResult,
   type AiSdkWorkspaceEntryResult,
   type AiSdkWorkspaceFileResult,

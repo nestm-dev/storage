@@ -1,4 +1,4 @@
-import { tool, type ToolSet } from 'ai';
+import { tool, type JSONValue, type ToolSet } from 'ai';
 import { z } from 'zod';
 
 import {
@@ -45,7 +45,18 @@ export type AiSdkWorkspaceMutationToolName = Extract<
 export type AiSdkWorkspaceApprovalConfig =
   boolean | Partial<Record<AiSdkWorkspaceMutationToolName, boolean>>;
 
-export interface CreateAiSdkWorkspaceToolsOptions {
+export interface AiSdkWorkspaceCreateConflict {
+  /** The logical destination inside the mounted workspace. */
+  readonly path: string;
+}
+
+export type AiSdkWorkspaceCreateConflictMapper<Result extends JSONValue> = (
+  conflict: AiSdkWorkspaceCreateConflict,
+) => PromiseLike<Result> | Result;
+
+export interface CreateAiSdkWorkspaceToolsOptions<
+  CreateConflictResult extends JSONValue = never,
+> {
   /** The already-mounted, policy-enforcing workspace exposed to the tools. */
   workspace: StorageWorkspace;
   /**
@@ -55,6 +66,12 @@ export interface CreateAiSdkWorkspaceToolsOptions {
   maxReadBytes?: number;
   /** Mutation tools require approval by default. */
   requireApproval?: AiSdkWorkspaceApprovalConfig;
+  /**
+   * Maps an atomic create collision to an application result. When omitted,
+   * the collision remains an AiSdkWorkspaceToolError like every other storage
+   * failure. Replace conflicts are never mapped by this hook.
+   */
+  mapCreateConflict?: AiSdkWorkspaceCreateConflictMapper<CreateConflictResult>;
 }
 
 export type AiSdkWorkspaceToolErrorCode = StorageErrorCodeValue;
@@ -284,6 +301,35 @@ async function executeSafely<Result>(
   }
 }
 
+async function executeCreateAware<
+  Result,
+  CreateConflictResult extends JSONValue,
+>(
+  signal: AbortSignal | undefined,
+  input: { mode: 'create' | 'replace'; path: string },
+  operation: () => Promise<Result>,
+  mapCreateConflict:
+    AiSdkWorkspaceCreateConflictMapper<CreateConflictResult> | undefined,
+): Promise<CreateConflictResult | Result> {
+  try {
+    return await operation();
+  } catch (error) {
+    const safeError = sanitizeToolError(error, signal);
+    if (
+      input.mode === 'create' &&
+      safeError.code === StorageErrorCode.CONFLICT &&
+      mapCreateConflict !== undefined
+    ) {
+      try {
+        return await mapCreateConflict({ path: input.path });
+      } catch {
+        throw new AiSdkWorkspaceToolError(StorageErrorCode.PROVIDER);
+      }
+    }
+    throw safeError;
+  }
+}
+
 function serializeFile(file: StorageWorkspaceFile): AiSdkWorkspaceFileResult {
   if (file.etag !== undefined && !isCanonicalStorageEtag(file.etag)) {
     throw new Error('Workspace returned a malformed ETag.');
@@ -332,11 +378,14 @@ function serializePage(page: {
  * The workspace remains the enforcing boundary if a retained tool reference
  * is invoked after further narrowing.
  */
-export function createAiSdkWorkspaceTools({
+export function createAiSdkWorkspaceTools<
+  CreateConflictResult extends JSONValue = never,
+>({
   workspace,
   maxReadBytes: requestedMaxReadBytes,
   requireApproval = true,
-}: CreateAiSdkWorkspaceToolsOptions): ToolSet {
+  mapCreateConflict,
+}: CreateAiSdkWorkspaceToolsOptions<CreateConflictResult>): ToolSet {
   const maxReadBytes = resolveReadLimit(workspace, requestedMaxReadBytes);
   const tools: ToolSet = {};
   const pathSchema = logicalPath('File path', workspace.limits.maxPathBytes);
@@ -350,7 +399,9 @@ export function createAiSdkWorkspaceTools({
     tools.workspace_list = tool({
       description:
         'List files and directories inside the mounted workspace. Omit directory to list the workspace root.',
-      strict: true,
+      // Optional pagination and directory inputs are not compatible with
+      // OpenAI strict function schemas, which require every property.
+      strict: false,
       inputSchema: z
         .object({
           directory: directorySchema.optional(),
@@ -421,7 +472,8 @@ export function createAiSdkWorkspaceTools({
     tools.workspace_search = tool({
       description:
         'Search logical paths inside the mounted workspace using a bounded glob, substring, or exact match. Omit directory to search from the workspace root.',
-      strict: true,
+      // Search intentionally has optional filters and cursor inputs.
+      strict: false,
       inputSchema: z
         .object({
           query: searchQuery(workspace.limits.maxPathBytes),
@@ -496,30 +548,41 @@ export function createAiSdkWorkspaceTools({
           ? createSchema
           : replaceSchema;
 
-    tools.workspace_write_file = tool({
+    tools.workspace_write_file = tool<
+      z.infer<typeof inputSchema>,
+      unknown,
+      Record<string, unknown>
+    >({
       description:
         canCreate && canReplace
           ? 'Create a new UTF-8 text file or replace an existing file inside the mounted workspace. Create fails if the destination exists; replace requires its current ETag.'
           : canCreate
             ? 'Create a new UTF-8 text file inside the mounted workspace. The operation fails if the destination already exists.'
             : 'Replace an existing UTF-8 text file inside the mounted workspace using its current ETag.',
-      strict: true,
+      // The combined create/replace schema is a discriminated union. OpenAI
+      // strict function tools reject its root-level oneOf, while the runtime
+      // Zod schema continues to validate every tool call in non-strict mode.
+      strict: !(canCreate && canReplace),
       inputSchema,
       needsApproval: resolveApproval('workspace_write_file', requireApproval),
       execute: (input, { abortSignal }) =>
-        executeSafely(abortSignal, async () =>
-          serializeFile(
-            input.mode === 'create'
-              ? await workspace.writeFile(input.path, input.content, {
-                  mode: 'create',
-                  ...operationOptions(abortSignal),
-                })
-              : await workspace.writeFile(input.path, input.content, {
-                  mode: 'replace',
-                  etag: input.etag,
-                  ...operationOptions(abortSignal),
-                }),
-          ),
+        executeCreateAware(
+          abortSignal,
+          input,
+          async () =>
+            serializeFile(
+              input.mode === 'create'
+                ? await workspace.writeFile(input.path, input.content, {
+                    mode: 'create',
+                    ...operationOptions(abortSignal),
+                  })
+                : await workspace.writeFile(input.path, input.content, {
+                    mode: 'replace',
+                    etag: input.etag,
+                    ...operationOptions(abortSignal),
+                  }),
+            ),
+          mapCreateConflict,
         ),
     });
   }
