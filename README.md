@@ -463,19 +463,26 @@ listStorageProviderSecretEnvVars('s3').map((variable) => variable.key);
 The catalog is pure data and pulls in no adapter, so it is safe in config UIs,
 health checks, and startup validation.
 
-The `s3` slug additionally carries the conditional-promotion and signed-policy
-capabilities described under
-[Race-free staged-object promotion](#race-free-staged-object-promotion); every
-other provider exposes exactly what its adapter declares. When the provider _is_
-known at build time, import `@nestm/storage/files-sdk/s3` or
+The `s3` slug additionally carries the verified per-operation profile and
+signed-policy capabilities described under
+[Exact provider conditions and staged-object promotion](#exact-provider-conditions-and-staged-object-promotion);
+every other provider exposes exactly what its adapter declares. When the
+provider _is_ known at build time, import `@nestm/storage/files-sdk/s3` or
 `@nestm/storage/files-sdk/fs` directly and skip the indirection.
+
+Before enabling conditional operations for a custom S3-compatible endpoint,
+run the reusable
+[provider conformance contract](https://github.com/nestm-dev/storage/blob/main/docs/provider-conformance.md)
+against dedicated test credentials. Unknown endpoints are forced read-only and
+receive no inferred conditional capabilities.
 
 ## Storage API
 
 `StorageClient` exposes:
 
 - `upload`, `downloadStream`, `head`, `exists`, `delete`, `copy`, and `move`;
-- conditional staged-object `promote` when the driver advertises it;
+- exact `uploadConditional`, `downloadConditional`, `deleteConditional`, and
+  staged-object `promote` operations when the driver advertises each primitive;
 - `list`, cursor-aware `listAll`, and lazy `search`;
 - `signDownload` and discriminated PUT/POST `signUpload`;
 - `uploadMany`, `downloadMany`, `headMany`, `existsMany`, and `deleteMany`;
@@ -505,11 +512,18 @@ Node `Readable` uploads are accepted and converted to Web streams without
 buffering. Provider capability gaps fail closed with `StorageError` rather than
 silently discarding a range, metadata, or cache-control request.
 
-### Race-free staged-object promotion
+### Exact provider conditions and staged-object promotion
 
-The S3 bridge advertises ETag- and version-conditional server-side copy. This
-lets an application validate a staged object and copy that exact source to its
-final key instead of re-reading whichever bytes occupy the staging key later:
+Capabilities distinguish conditional create, replace, delete, read, source
+copy, destination copy, atomic source-and-destination promotion, and multipart
+completion. They also declare the complete physical-key byte budget. Callers
+must check the exact primitive they need; a missing field is unsupported and is
+never widened from another operation.
+
+The native AWS S3 profile advertises ETag- and version-conditioned server-side
+copy. This lets an application validate a staged object and copy that exact
+source to its final key instead of re-reading whichever bytes occupy the
+staging key later:
 
 ```ts
 import { StorageError, StorageErrorCode } from '@nestm/storage';
@@ -532,9 +546,18 @@ await media.delete(stagingKey);
 ```
 
 `sourceVersion` can select an immutable S3 version and may be combined with
-`sourceEtag`. A promotion without either identity is rejected. Drivers that do
-not publish `capabilities.conditionalCopy` fail with `NOT_SUPPORTED` rather
-than falling back to an unsafe ordinary copy.
+`sourceEtag`. A destination condition can independently require create-only or
+replacement of an exact ETag. Combining source and destination predicates also
+requires `capabilities.conditionalCopyDestination.atomicWithSource`; otherwise
+the request fails with `NOT_SUPPORTED`. A promotion must contain at least one
+source or destination predicate.
+
+Cloudflare R2 has a separate stable profile: create, replace, ETag-conditioned
+read, and ETag-conditioned source copy are enabled, while conditional delete,
+destination copy, atomic promotion, version predicates, and conditional
+multipart completion remain absent. Custom S3-compatible endpoints start with
+no conditional operations and the entire driver is forced read-only until an
+explicit conformance-verified `S3ProviderProfile` is supplied.
 
 ### Resumable uploads
 

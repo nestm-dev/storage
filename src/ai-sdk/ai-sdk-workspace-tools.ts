@@ -524,7 +524,7 @@ export function createAiSdkWorkspaceTools({
   if (canCopy) {
     tools.workspace_copy_file = tool({
       description:
-        'Copy a file inside the mounted workspace. The source remains intact, and the operation fails if the destination already exists.',
+        'Copy an exact observed version of a file inside the mounted workspace. The source remains intact, and the operation fails if the source changed or the destination already exists.',
       strict: true,
       inputSchema: z
         .object({
@@ -536,17 +536,19 @@ export function createAiSdkWorkspaceTools({
             'Destination file path',
             workspace.limits.maxPathBytes,
           ),
+          etag: etagSchema.describe(
+            'Exact ETag of the source returned by the latest workspace stat or read.',
+          ),
         })
         .strict(),
       needsApproval: resolveApproval('workspace_copy_file', requireApproval),
-      execute: ({ source, destination }, { abortSignal }) =>
+      execute: ({ source, destination, etag }, { abortSignal }) =>
         executeSafely(abortSignal, async () =>
           serializeFile(
-            await workspace.copyFile(
-              source,
-              destination,
-              operationOptions(abortSignal),
-            ),
+            await workspace.copyFile(source, destination, {
+              etag,
+              ...operationOptions(abortSignal),
+            }),
           ),
         ),
     });

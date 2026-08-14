@@ -93,9 +93,8 @@ describe('StorageClient', () => {
     Object.defineProperty(driver, 'capabilities', {
       value: {
         ...driver.capabilities,
-        conditionalCopy: {
+        conditionalCopySource: {
           etag: true,
-          supported: true,
           version: false,
         },
       },
@@ -124,7 +123,14 @@ describe('StorageClient', () => {
     const client = new StorageClient('media', createMemoryStorageDriver());
 
     expect(() => client.promote('staging.bin', 'final.bin', {})).toThrow(
-      'requires sourceEtag',
+      'requires a source or destination precondition',
+    );
+    expect(() =>
+      client.promote('staging.bin', 'final.bin', {
+        destination: { type: 'invalid' } as never,
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
     );
     expect(() =>
       client.promote('staging.bin', 'final.bin', { sourceEtag: 'etag' }),
@@ -164,12 +170,9 @@ describe('StorageClient', () => {
     Object.defineProperty(driver, 'capabilities', {
       value: {
         ...driver.capabilities,
-        conditionalMutation: {
-          create: true,
-          delete: true,
-          etag: true,
-          replace: true,
-        },
+        conditionalCreate: { resultEtag: true },
+        conditionalDelete: { etag: true },
+        conditionalReplace: { resultEtag: true },
       },
     });
     driver.uploadConditional = uploadConditional;
@@ -196,12 +199,9 @@ describe('StorageClient', () => {
     Object.defineProperty(driver, 'capabilities', {
       value: {
         ...driver.capabilities,
-        conditionalMutation: {
-          create: true,
-          delete: true,
-          etag: true,
-          replace: true,
-        },
+        conditionalCreate: { resultEtag: true },
+        conditionalDelete: { etag: true },
+        conditionalReplace: { resultEtag: true },
       },
     });
     driver.uploadConditional = vi.fn();

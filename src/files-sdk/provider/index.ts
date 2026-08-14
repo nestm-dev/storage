@@ -17,6 +17,7 @@ import {
   type FilesSdkDriverOptions,
   type FilesSdkStorageDriver,
 } from '../files-sdk.driver.js';
+import type { S3ProviderProfile } from '../s3/index.js';
 
 /** Slug of a storage provider this package can build a driver for. */
 export type StorageProviderName = ProviderSlug;
@@ -39,6 +40,8 @@ export interface ProviderStorageDriverOptions extends Omit<
   /** Which provider to build. Validate untrusted input with {@link isStorageProvider}. */
   provider: StorageProviderName;
   config?: StorageProviderConfig;
+  /** Verified operation profile for the `s3` slug, especially custom endpoints. */
+  s3ProviderProfile?: S3ProviderProfile;
 }
 
 /**
@@ -48,9 +51,9 @@ export interface ProviderStorageDriverOptions extends Omit<
  * `'r2'`, `'fs'`, …) and installs one native SDK, instead of the application
  * hard-coding a driver per backend.
  *
- * The `s3` slug additionally gets the conditional-promotion and signed-policy
- * capabilities {@link createS3StorageDriver} attaches; every other provider
- * exposes exactly what its adapter declares. Import
+ * The `s3` slug additionally gets the exact verified provider profile and
+ * signed-policy capabilities {@link createS3StorageDriver} attaches; every
+ * other provider exposes exactly what its adapter declares. Import
  * `@nestm/storage/files-sdk/s3` directly when the provider is known at build
  * time and the extra indirection buys nothing.
  *
@@ -60,7 +63,7 @@ export interface ProviderStorageDriverOptions extends Omit<
 export async function createProviderStorageDriver(
   options: ProviderStorageDriverOptions,
 ): Promise<FilesSdkStorageDriver> {
-  const { provider, config, ...filesOptions } = options;
+  const { provider, config, s3ProviderProfile, ...filesOptions } = options;
   if (!isStorageProvider(provider)) {
     throw unknownProvider(provider);
   }
@@ -68,13 +71,28 @@ export async function createProviderStorageDriver(
   // `loadFiles` owns the slug → adapter mapping and keeps the import lazy; the
   // client it returns is discarded so the caller's own driver options (prefix,
   // hooks, plugins, readonly, retries) apply to the instance the bridge builds.
-  const adapter = await resolveAdapter(provider, config);
-  return createFilesSdkDriver({ ...filesOptions, adapter });
+  if (s3ProviderProfile !== undefined && provider !== 's3') {
+    throw new StorageError(
+      's3ProviderProfile can only be used with the "s3" provider.',
+      { code: StorageErrorCode.INVALID_ARGUMENT, permanent: true },
+    );
+  }
+  const adapter = await resolveAdapter(provider, config, s3ProviderProfile);
+  const unverifiedCustomS3 =
+    provider === 's3' &&
+    typeof config?.endpoint === 'string' &&
+    s3ProviderProfile === undefined;
+  return createFilesSdkDriver({
+    ...filesOptions,
+    ...(unverifiedCustomS3 && { readonly: true }),
+    adapter,
+  });
 }
 
 async function resolveAdapter(
   provider: StorageProviderName,
   config: StorageProviderConfig | undefined,
+  s3ProviderProfile: S3ProviderProfile | undefined,
 ): Promise<Adapter> {
   let resolved;
   try {
@@ -103,6 +121,9 @@ async function resolveAdapter(
       }),
       ...(config?.publicBaseUrl !== undefined && {
         publicBaseUrl: config.publicBaseUrl,
+      }),
+      ...(s3ProviderProfile !== undefined && {
+        providerProfile: s3ProviderProfile,
       }),
     },
   );

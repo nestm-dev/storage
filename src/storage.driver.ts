@@ -2,6 +2,7 @@ import type {
   StorageBody,
   StorageCapabilities,
   StorageConditionalDeleteOptions,
+  StorageConditionalReadOptions,
   StorageConditionalUploadOptions,
   StorageDownloadOptions,
   StorageListOptions,
@@ -35,6 +36,10 @@ export interface StorageDriver {
   download(
     key: string,
     options?: StorageDownloadOptions,
+  ): Promise<StorageObject>;
+  downloadConditional?(
+    key: string,
+    options: StorageConditionalReadOptions,
   ): Promise<StorageObject>;
   head(
     key: string,

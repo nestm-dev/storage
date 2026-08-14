@@ -279,11 +279,33 @@ const s3Driver = createS3StorageDriver({
     region: 'us-east-1',
   },
 });
-assert.deepEqual(s3Driver.capabilities.conditionalCopy, {
+assert.deepEqual(s3Driver.capabilities.conditionalCreate, {
+  resultEtag: true,
+});
+assert.deepEqual(s3Driver.capabilities.conditionalReplace, {
+  resultEtag: true,
+});
+assert.deepEqual(s3Driver.capabilities.conditionalDelete, {
   etag: true,
-  supported: true,
+});
+assert.deepEqual(s3Driver.capabilities.conditionalRead, {
+  etag: true,
   version: true,
 });
+assert.deepEqual(s3Driver.capabilities.conditionalCopySource, {
+  etag: true,
+  version: true,
+});
+assert.deepEqual(s3Driver.capabilities.conditionalCopyDestination, {
+  atomicWithSource: true,
+  create: true,
+  replace: true,
+});
+assert.deepEqual(s3Driver.capabilities.conditionalMultipartCompletion, {
+  create: true,
+  replace: true,
+});
+assert.deepEqual(s3Driver.capabilities.physicalKey, { maxBytes: 1_024 });
 assert.deepEqual(s3Driver.capabilities.signedUploadPolicy, {
   contentType: true,
   sizeRange: true,

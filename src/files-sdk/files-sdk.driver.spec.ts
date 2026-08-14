@@ -92,12 +92,9 @@ describe('FilesSdkStorageDriver', () => {
 
   it('rejects a conditional adapter result from the wrong physical key', async () => {
     const adapter = Object.assign(memory(), {
-      conditionalMutation: {
-        create: true,
-        delete: true,
-        etag: true,
-        replace: true,
-      },
+      conditionalCreate: { resultEtag: true },
+      conditionalDelete: { etag: true },
+      conditionalReplace: { resultEtag: true },
       deleteConditional: vi.fn(async () => undefined),
       uploadConditional: vi.fn(async () => ({
         contentType: 'text/plain',

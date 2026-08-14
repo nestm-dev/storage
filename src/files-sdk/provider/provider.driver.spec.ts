@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { StorageClient } from '../../storage.client.js';
 import { StorageErrorCode } from '../../storage.error.js';
+import { defineS3ProviderProfile } from '../s3/index.js';
 import {
   createProviderStorageDriver,
   getStorageProvider,
@@ -81,19 +82,36 @@ describe('createProviderStorageDriver', () => {
         secretAccessKey: 'test',
       },
       provider: 's3',
+      readonly: false,
     });
 
-    expect(driver.capabilities.conditionalCopy).toEqual({
+    expect(driver.capabilities.conditionalCreate).toEqual({
+      resultEtag: true,
+    });
+    expect(driver.capabilities.conditionalReplace).toEqual({
+      resultEtag: true,
+    });
+    expect(driver.capabilities.conditionalDelete).toEqual({
       etag: true,
-      supported: true,
+    });
+    expect(driver.capabilities.conditionalRead).toEqual({
+      etag: true,
       version: true,
     });
-    expect(driver.capabilities.conditionalMutation).toEqual({
-      create: true,
-      delete: true,
+    expect(driver.capabilities.conditionalCopySource).toEqual({
       etag: true,
+      version: true,
+    });
+    expect(driver.capabilities.conditionalCopyDestination).toEqual({
+      atomicWithSource: true,
+      create: true,
       replace: true,
     });
+    expect(driver.capabilities.conditionalMultipartCompletion).toEqual({
+      create: true,
+      replace: true,
+    });
+    expect(driver.capabilities.physicalKey).toEqual({ maxBytes: 1_024 });
     expect(driver.capabilities.signedUploadPolicy).toEqual({
       contentType: true,
       sizeRange: true,
@@ -112,22 +130,97 @@ describe('createProviderStorageDriver', () => {
       provider: 's3',
     });
 
-    expect(driver.capabilities.conditionalMutation).toBeUndefined();
+    expect(driver.capabilities.conditionalCreate).toBeUndefined();
+    expect(driver.capabilities.conditionalReplace).toBeUndefined();
+    expect(driver.capabilities.conditionalDelete).toBeUndefined();
+    expect(driver.capabilities.conditionalRead).toBeUndefined();
+    expect(driver.capabilities.conditionalCopySource).toBeUndefined();
+    expect(driver.capabilities.conditionalCopyDestination).toBeUndefined();
+    expect(driver.capabilities.conditionalMultipartCompletion).toBeUndefined();
+    expect(driver.capabilities.physicalKey).toEqual({ maxBytes: 1_024 });
+    expect(driver.capabilities.resumableUpload).toBe(false);
+    expect(driver.capabilities.serverSideCopy).toBe(false);
+    expect(driver.capabilities.signedUpload).toBe(false);
+    expect(driver.capabilities.signedUploadPolicy).toBeUndefined();
+    expect(driver.capabilities.nativeUploadProgress).toBe(false);
+    await expect(
+      new StorageClient('unverified-provider', driver).upload(
+        'blocked.txt',
+        'blocked',
+      ),
+    ).rejects.toMatchObject({
+      code: StorageErrorCode.READ_ONLY,
+    });
   });
 
-  it('claims no conditional copy for a provider that does not declare it', async () => {
+  it('forwards an explicit verified profile to a custom S3 endpoint', async () => {
+    const driver = await createProviderStorageDriver({
+      config: {
+        accessKeyId: 'test',
+        bucket: 'artifacts',
+        endpoint: 'https://objects.example.test',
+        region: 'us-east-1',
+        secretAccessKey: 'test',
+      },
+      provider: 's3',
+      s3ProviderProfile: defineS3ProviderProfile({
+        name: 'verified-custom',
+        physicalKey: { maxBytes: 512 },
+        conditionalCreate: { resultEtag: true },
+      }),
+    });
+
+    expect(driver.capabilities.conditionalCreate).toEqual({
+      resultEtag: true,
+    });
+    expect(driver.capabilities.conditionalReplace).toBeUndefined();
+    expect(driver.capabilities.physicalKey).toEqual({ maxBytes: 512 });
+  });
+
+  it('rejects an S3 profile for a different provider', async () => {
+    await expect(
+      createProviderStorageDriver({
+        config: { root },
+        provider: 'fs',
+        s3ProviderProfile: defineS3ProviderProfile({
+          name: 'wrong-provider',
+          physicalKey: { maxBytes: 512 },
+        }),
+      }),
+    ).rejects.toMatchObject({
+      code: StorageErrorCode.INVALID_ARGUMENT,
+      permanent: true,
+    });
+  });
+
+  it('exposes the filesystem provider exact conditional capabilities', async () => {
     const driver = await createProviderStorageDriver({
       config: { root },
       provider: 'fs',
     });
 
-    expect(driver.capabilities.conditionalCopy).toBeUndefined();
-    expect(driver.capabilities.conditionalMutation).toEqual({
-      create: true,
-      delete: true,
+    expect(driver.capabilities.conditionalCreate).toEqual({
+      resultEtag: true,
+    });
+    expect(driver.capabilities.conditionalReplace).toEqual({
+      resultEtag: true,
+    });
+    expect(driver.capabilities.conditionalDelete).toEqual({ etag: true });
+    expect(driver.capabilities.conditionalRead).toEqual({
       etag: true,
+      version: false,
+    });
+    expect(driver.capabilities.conditionalCopySource).toEqual({
+      etag: true,
+      version: false,
+    });
+    expect(driver.capabilities.conditionalCopyDestination).toEqual({
+      atomicWithSource: true,
+      create: true,
       replace: true,
     });
+    expect(driver.capabilities.conditionalMultipartCompletion).toBeUndefined();
+    expect(driver.capabilities.physicalKey).toEqual({ maxBytes: 4_096 });
   });
 
   it('rejects an unknown slug before importing anything', async () => {

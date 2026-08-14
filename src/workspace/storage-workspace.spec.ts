@@ -127,7 +127,7 @@ describe('StorageWorkspace', () => {
       code: StorageErrorCode.INVALID_ARGUMENT,
     });
     await expect(
-      workspace.copyFile('link.txt', 'copied.txt'),
+      workspace.copyFile('link.txt', 'copied.txt', { etag: 'source-etag' }),
     ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
   });
 
@@ -346,10 +346,14 @@ describe('StorageWorkspace', () => {
       mode: 'create',
     });
 
-    const copied = await workspace.copyFile('source.txt', 'copy.txt');
+    const copied = await workspace.copyFile('source.txt', 'copy.txt', {
+      etag: source.etag ?? '',
+    });
     expect(copied.contentType).toBe('text/plain');
     await expect(
-      workspace.copyFile('source.txt', 'copy.txt'),
+      workspace.copyFile('source.txt', 'copy.txt', {
+        etag: source.etag ?? '',
+      }),
     ).rejects.toMatchObject({ code: StorageErrorCode.CONFLICT });
     await expect(
       workspace.moveFile('source.txt', 'moved.txt', {
@@ -485,7 +489,7 @@ describe('StorageWorkspace', () => {
     );
 
     await expect(
-      workspace.copyFile('source.txt', 'copy.txt'),
+      workspace.copyFile('source.txt', 'copy.txt', { etag: 'etag' }),
     ).rejects.toMatchObject({ code: StorageErrorCode.NOT_SUPPORTED });
     await expect(
       workspace.moveFile('source.txt', 'moved.txt', { etag: 'etag' }),

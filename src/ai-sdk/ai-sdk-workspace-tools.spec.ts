@@ -265,6 +265,20 @@ describe('createAiSdkWorkspaceTools', () => {
       copySchema.safeParse({
         source: 'from.txt',
         destination: 'to.txt',
+        etag: 'source-etag',
+      }).success,
+    ).toBe(true);
+    expect(
+      copySchema.safeParse({
+        source: 'from.txt',
+        destination: 'to.txt',
+      }).success,
+    ).toBe(false);
+    expect(
+      copySchema.safeParse({
+        source: 'from.txt',
+        destination: 'to.txt',
+        etag: 'source-etag',
         overwrite: true,
       }).success,
     ).toBe(false);
@@ -515,8 +529,11 @@ describe('createAiSdkWorkspaceTools', () => {
     await executeTool(tools, 'workspace_copy_file', {
       source: 'from.txt',
       destination: 'copied.txt',
+      etag: 'source-etag',
     });
-    expect(fixture.copyFile).toHaveBeenCalledWith('from.txt', 'copied.txt', {});
+    expect(fixture.copyFile).toHaveBeenCalledWith('from.txt', 'copied.txt', {
+      etag: 'source-etag',
+    });
 
     await executeTool(tools, 'workspace_move_file', {
       source: 'from.txt',
