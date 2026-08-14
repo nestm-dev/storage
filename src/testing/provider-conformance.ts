@@ -51,6 +51,11 @@ export interface StorageProviderConformanceCapabilities {
 export interface StorageProviderConformanceFixture {
   readonly client: StorageClient;
   /**
+   * Builds a new client and driver for the same logical store and backend
+   * configuration. The harness owns the returned client and shuts it down.
+   */
+  readonly createReplica: () => StorageClient | Promise<StorageClient>;
+  /**
    * Returns the number of operations dispatched to the provider driver. When
    * supplied, the contract proves invalid inputs fail before provider I/O.
    */
@@ -91,6 +96,7 @@ export interface StorageProviderConformanceCase {
 interface CaseContext {
   readonly client: StorageClient;
   readonly dispatchCount?: () => number;
+  createReplica(): Promise<StorageClient>;
   key(label: string): string;
   resolveVersion(key: string): Promise<string | undefined>;
   track(key: string): string;
@@ -195,47 +201,151 @@ function listCursorReplayCase(
 ): StorageProviderConformanceCase {
   return providerCase(
     options,
-    'replays list cursors without consuming or changing the page',
+    'replays portable list cursors after descendants and limit changes',
     async (context) => {
-      const firstKey = context.key('cursor-replay/01.txt');
-      const prefix = firstKey.slice(0, -'01.txt'.length);
-      await seed(context, firstKey, '01.txt');
-      for (const name of ['02.txt', '03.txt']) {
-        await seed(context, context.track(`${prefix}${name}`), name);
+      await verifyCursorReplay(context, 'cursor-replay-flat', [
+        '01.txt',
+        '02.txt',
+        '03.txt',
+        '04.txt',
+        '05.txt',
+      ]);
+      if (context.client.capabilities.delimiter) {
+        await verifyCursorReplay(
+          context,
+          'cursor-replay-delimited',
+          [
+            '01.txt',
+            '02-dir/inside.txt',
+            '03.txt',
+            '04-dir/inside.txt',
+            '05.txt',
+          ],
+          '/',
+        );
       }
-
-      const request = { limit: 1, prefix } as const;
-      const first = await context.client.list(request);
-      equal(first.items.length, 1, 'provider ignored the list page limit');
-      ok(
-        first.cursor !== undefined && first.cursor.length > 0,
-        'provider did not return a continuation cursor for a partial page',
-      );
-
-      const replayRequest = { ...request, cursor: first.cursor };
-      const expected = await context.client.list(replayRequest);
-      equal(expected.items.length, 1, 'provider ignored the replay page limit');
-      ok(
-        expected.cursor !== undefined && expected.cursor.length > 0,
-        'provider did not return a continuation cursor before the final page',
-      );
-
-      // Advance beyond the page before replaying its input token. A consuming
-      // cursor implementation will now fail or return a different page.
-      await context.client.list({ ...request, cursor: expected.cursor });
-      const replayed = await context.client.list(replayRequest);
-      deepStrictEqual(
-        comparableListPage(replayed),
-        comparableListPage(expected),
-        'reusing the same provider cursor changed its page or continuation state',
-      );
     },
   );
 }
 
+async function verifyCursorReplay(
+  context: CaseContext,
+  label: string,
+  names: readonly [string, string, string, string, string],
+  delimiter?: string,
+): Promise<void> {
+  const [firstName, ...remainingNames] = names;
+  const firstKey = context.key(`${label}/${firstName}`);
+  const prefix = firstKey.slice(0, -firstName.length);
+  await seed(context, firstKey, firstName);
+  for (const name of remainingNames) {
+    await seed(context, context.track(`${prefix}${name}`), name);
+  }
+
+  const request: CursorReplayRequest = {
+    ...(delimiter === undefined ? {} : { delimiter }),
+    limit: 1,
+    prefix,
+  };
+  const first = await context.client.list(request);
+  assertPageSize(first, 1);
+  const cursor = requiredCursor(
+    first,
+    'provider omitted a continuation cursor while matching entries remained',
+  );
+
+  const replayRequest = { ...request, cursor };
+  const expected = await context.client.list(replayRequest);
+  assertPageSize(expected, 1);
+  const descendantCursor = requiredCursor(
+    expected,
+    'provider omitted a descendant cursor while matching entries remained',
+  );
+
+  // Follow a cursor derived from the input before replaying its ancestor. A
+  // consuming cursor implementation will now fail or change the page.
+  const descendant = await context.client.list({
+    ...request,
+    cursor: descendantCursor,
+  });
+  assertPageSize(descendant, 1);
+  const replayed = await context.client.list(replayRequest);
+  assertEquivalentListPage(
+    replayed,
+    expected,
+    'reusing a provider cursor after its descendant changed the page',
+  );
+  await assertEquivalentNextPage(
+    context.client,
+    replayed,
+    descendant,
+    request,
+    'replayed cursor returned a continuation for a different position',
+  );
+
+  const wider = await context.client.list({
+    ...replayRequest,
+    limit: 2,
+  });
+  assertPageSize(wider, 2);
+  deepStrictEqual(
+    logicalEntryIds(wider),
+    [...logicalEntryIds(expected), ...logicalEntryIds(descendant)].sort(),
+    'changing the page limit changed the cursor starting position',
+  );
+  const afterWider = await context.client.list({
+    ...request,
+    cursor: requiredCursor(
+      descendant,
+      'provider ended before the wider-page continuation could be verified',
+    ),
+  });
+  await assertEquivalentNextPage(
+    context.client,
+    wider,
+    afterWider,
+    request,
+    'changed-limit cursor returned a continuation for a different position',
+  );
+
+  const replica = await context.createReplica();
+  const replicaReplay = await replica.list(replayRequest);
+  assertEquivalentListPage(
+    replicaReplay,
+    expected,
+    'an independently constructed replica resumed at a different page',
+  );
+  await assertEquivalentNextPage(
+    replica,
+    replicaReplay,
+    descendant,
+    request,
+    'replica cursor returned a continuation for a different position',
+  );
+
+  const replicaWider = await replica.list({ ...replayRequest, limit: 2 });
+  assertEquivalentListPage(
+    replicaWider,
+    wider,
+    'a replica changed the page returned with a different limit',
+  );
+  await assertEquivalentNextPage(
+    replica,
+    replicaWider,
+    afterWider,
+    request,
+    'replica changed-limit cursor returned a continuation for a different position',
+  );
+}
+
+interface CursorReplayRequest {
+  readonly delimiter?: string;
+  readonly limit: number;
+  readonly prefix: string;
+}
+
 function comparableListPage(page: StorageListResult): unknown {
   return {
-    cursor: page.cursor,
     items: page.items.map((item) => ({
       contentType: item.contentType,
       etag: item.etag,
@@ -247,6 +357,58 @@ function comparableListPage(page: StorageListResult): unknown {
     })),
     prefixes: page.prefixes,
   };
+}
+
+function assertEquivalentListPage(
+  actual: StorageListResult,
+  expected: StorageListResult,
+  message: string,
+): void {
+  deepStrictEqual(
+    comparableListPage(actual),
+    comparableListPage(expected),
+    message,
+  );
+  equal(
+    actual.cursor === undefined,
+    expected.cursor === undefined,
+    `${message}: continuation presence differed`,
+  );
+}
+
+async function assertEquivalentNextPage(
+  client: StorageClient,
+  actual: StorageListResult,
+  expectedNext: StorageListResult,
+  request: CursorReplayRequest,
+  message: string,
+): Promise<void> {
+  const cursor = requiredCursor(
+    actual,
+    `${message}: provider did not return a continuation cursor`,
+  );
+  const actualNext = await client.list({ ...request, cursor });
+  assertEquivalentListPage(actualNext, expectedNext, message);
+}
+
+function assertPageSize(page: StorageListResult, expected: number): void {
+  equal(
+    page.items.length + (page.prefixes?.length ?? 0),
+    expected,
+    'provider ignored the list page limit across items and common prefixes',
+  );
+}
+
+function requiredCursor(page: StorageListResult, message: string): string {
+  ok(page.cursor !== undefined && page.cursor.length > 0, message);
+  return page.cursor;
+}
+
+function logicalEntryIds(page: StorageListResult): string[] {
+  return [
+    ...page.items.map((item) => `item:${item.key}`),
+    ...(page.prefixes ?? []).map((prefix) => `prefix:${prefix}`),
+  ].sort();
 }
 
 function invalidPreconditionEtagCase(
@@ -1165,12 +1327,27 @@ async function withFixture(
 ): Promise<StorageProviderConformanceCaseResult> {
   const fixture = await options.createFixture();
   const keys = new Set<string>();
+  const replicas: StorageClient[] = [];
   const namespace = `nestm-conformance/${safeSegment(options.provider)}/${randomUUID()}`;
   const context: CaseContext = {
     client: fixture.client,
     ...(fixture.dispatchCount === undefined
       ? {}
       : { dispatchCount: fixture.dispatchCount }),
+    async createReplica() {
+      const replica = await fixture.createReplica();
+      ok(
+        replica !== fixture.client && !replicas.includes(replica),
+        'createReplica must return a fresh StorageClient instance',
+      );
+      replicas.push(replica);
+      equal(
+        replica.name,
+        fixture.client.name,
+        'createReplica must address the same logical store name',
+      );
+      return replica;
+    },
     key(label) {
       const key = `${namespace}/${label}`;
       keys.add(key);
@@ -1203,6 +1380,13 @@ async function withFixture(
     }
   } catch (error: unknown) {
     cleanupError = error;
+  }
+  for (const replica of replicas.reverse()) {
+    try {
+      await replica.onApplicationShutdown();
+    } catch (error: unknown) {
+      if (cleanupError === noError) cleanupError = error;
+    }
   }
   try {
     await fixture.client.onApplicationShutdown();

@@ -56,11 +56,40 @@ untrusted agent code. A tenant id, run id, prefix, provider cursor, snapshot id,
 or fork id supplied by a model is not a safe mount coordinate.
 
 The workspace accepts only canonical mount-relative POSIX paths and rechecks
-every key returned by a driver before unscoping it. Its cursors are opaque and
-bound to the mount and query. Permissions, byte limits, result limits, and
-conditional mutation preconditions are enforced inside the capability; tool
-omission and user approval are additional workflow controls, not the
-authorization boundary.
+every key returned by a driver before unscoping it. Pagination cursors are bound
+to the store, normalized physical prefix, stable mount identity, trusted
+tenant/workspace scope, operation, complete effective limits, normalized query,
+and expiry. Provider continuations and prefixes stay inside the encrypted or
+server-side payload. Both layers are non-consuming: a durable opaque token
+store must read rather than consume a record, and an embedded provider cursor
+must remain replayable through a fresh compatible driver against the same
+backend namespace while that provider cursor remains valid and available.
+Provider cursors cannot depend on process-local state; an adapter for a
+consuming or instance-bound backend token must materialize a stable continuation
+before exposing paginated `StorageDriver.list` results.
+
+Under unchanged provider-visible state, cursors are reusable while their
+provider continuation remains valid and available. The authenticated expiry is
+an authorization ceiling, not a guarantee of provider-token lifetime, snapshot
+isolation, provider/network availability, or valid credentials. Provider
+invalidation remains an operational failure, and concurrent mutations remain
+subject to provider ordering, duplicate, and omission semantics.
+
+Production pagination must configure either the built-in AES-256-GCM codec with
+a dedicated shared 32-byte key ring or an authenticated shared durable token
+store. Do not reuse an authentication, session, storage-provider, or encryption
+key from another purpose. All replicas must use the same stable identities and
+key ring, compatible driver configuration, and logical backend namespace. New
+cursors use the active key id; retain prior keys for at least the maximum cursor
+TTL during rotation. Dropping a key, changing a binding field, or restarting
+with a different ephemeral key intentionally invalidates outstanding cursors.
+Tokens and decoded payloads are bounded, and malformed, altered, expired,
+cross-query, cross-operation, cross-workspace, and cross-store cursors fail
+closed.
+
+Permissions, byte limits, result limits, and conditional mutation preconditions
+are enforced inside the capability; tool omission and user approval are
+additional workflow controls, not the authorization boundary.
 
 Conditional mutations can still have an ambiguous outcome when a remote
 provider commits and then loses or violates its response, or when a configured

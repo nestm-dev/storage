@@ -10,6 +10,8 @@ import type { StorageDriver } from '../storage.driver.js';
 import type {
   StorageBody,
   StorageCapabilities,
+  StorageListOptions,
+  StorageListResult,
   StoragePromotionOptions,
   StorageUploadOptions,
 } from '../storage.types.js';
@@ -116,13 +118,17 @@ describe('createStorageProviderConformanceCases', () => {
         const root = await mkdtemp(
           join(tmpdir(), 'nestm-restricted-conformance-'),
         );
-        const driver = withoutConditionalCapabilities(
-          createFsStorageDriver({ adapter: { root } }),
-        );
+        const createDriver = () =>
+          withoutConditionalCapabilities(
+            createFsStorageDriver({ adapter: { root } }),
+          );
+        const driver = createDriver();
         const observed = observeDispatches(driver);
         return {
           client: new StorageClient('restricted-filesystem', observed.driver),
           close: () => rm(root, { force: true, recursive: true }),
+          createReplica: () =>
+            new StorageClient('restricted-filesystem', createDriver()),
           dispatchCount: observed.dispatchCount,
         };
       },
@@ -133,6 +139,63 @@ describe('createStorageProviderConformanceCases', () => {
         status: 'passed',
       });
     }
+  });
+
+  it('fails cursor conformance for a deliberately one-shot custom driver', async () => {
+    const contracts = createStorageProviderConformanceCases({
+      provider: 'one-shot-filesystem',
+      expected: { physicalKey: { maxBytes: 4096 } },
+      async createFixture() {
+        const root = await mkdtemp(join(tmpdir(), 'nestm-one-shot-cursor-'));
+        const consumed = new Set<string>();
+        const createDriver = () =>
+          withOneShotListCursors(
+            createFsStorageDriver({ adapter: { root } }),
+            consumed,
+          );
+        return {
+          client: new StorageClient('one-shot-filesystem', createDriver()),
+          close: () => rm(root, { force: true, recursive: true }),
+          createReplica: () =>
+            new StorageClient('one-shot-filesystem', createDriver()),
+        };
+      },
+    });
+    const cursorContract = contracts.find(({ name }) =>
+      name.startsWith('replays portable list cursors'),
+    );
+    expect(cursorContract).toBeDefined();
+    if (cursorContract === undefined) return;
+
+    await expect(cursorContract.run()).rejects.toMatchObject({
+      code: StorageErrorCode.INVALID_ARGUMENT,
+      message: 'The deliberately one-shot cursor was reused.',
+    });
+  });
+
+  it('replays cursors without requesting unsupported delimiter behavior', async () => {
+    const contracts = createStorageProviderConformanceCases({
+      provider: 'flat-filesystem',
+      expected: { physicalKey: { maxBytes: 4096 } },
+      async createFixture() {
+        const root = await mkdtemp(join(tmpdir(), 'nestm-flat-cursor-'));
+        const createDriver = () =>
+          withoutDelimiterSupport(createFsStorageDriver({ adapter: { root } }));
+        return {
+          client: new StorageClient('flat-filesystem', createDriver()),
+          close: () => rm(root, { force: true, recursive: true }),
+          createReplica: () =>
+            new StorageClient('flat-filesystem', createDriver()),
+        };
+      },
+    });
+    const cursorContract = contracts.find(({ name }) =>
+      name.startsWith('replays portable list cursors'),
+    );
+    expect(cursorContract).toBeDefined();
+    if (cursorContract === undefined) return;
+
+    await expect(cursorContract.run()).resolves.toEqual({ status: 'passed' });
   });
 });
 
@@ -152,92 +215,163 @@ async function createVersionedFixture(
   atomicWithSource: boolean,
 ): Promise<StorageProviderConformanceFixture> {
   const root = await mkdtemp(join(tmpdir(), 'nestm-versioned-conformance-'));
-  const base = createFsStorageDriver({ adapter: { root } });
   const versions = new Map<string, Map<string, string>>();
   const currentVersions = new Map<string, string>();
-  const upload = base.upload.bind(base);
-  const promote = base.promote?.bind(base);
-  const capabilities: StorageCapabilities = {
-    ...base.capabilities,
-    conditionalCopyDestination: {
-      atomicWithSource,
-      create: true,
-      replace: true,
-    },
-    conditionalCopySource: { etag: true, version: true },
+  const createDriver = (): StorageDriver => {
+    const base = createFsStorageDriver({ adapter: { root } });
+    const upload = base.upload.bind(base);
+    const promote = base.promote?.bind(base);
+    const capabilities: StorageCapabilities = {
+      ...base.capabilities,
+      conditionalCopyDestination: {
+        atomicWithSource,
+        create: true,
+        replace: true,
+      },
+      conditionalCopySource: { etag: true, version: true },
+    };
+
+    return new Proxy(base, {
+      get(target, property) {
+        if (property === 'capabilities') return capabilities;
+        if (property === 'upload') {
+          return async (
+            key: string,
+            body: StorageBody,
+            options?: StorageUploadOptions,
+          ) => {
+            if (typeof body !== 'string') {
+              throw new TypeError(
+                'Fake versioned fixture accepts string bodies.',
+              );
+            }
+            const result = await upload(key, body, options);
+            const version = randomUUID();
+            const keyVersions = versions.get(key) ?? new Map<string, string>();
+            keyVersions.set(version, body);
+            versions.set(key, keyVersions);
+            currentVersions.set(key, version);
+            return result;
+          };
+        }
+        if (property === 'promote') {
+          return async (
+            sourceKey: string,
+            destinationKey: string,
+            options: StoragePromotionOptions,
+          ): Promise<void> => {
+            if (options.sourceVersion === undefined) {
+              if (promote === undefined) {
+                throw new TypeError('Filesystem promotion is unavailable.');
+              }
+              return promote(sourceKey, destinationKey, options);
+            }
+            const body = versions.get(sourceKey)?.get(options.sourceVersion);
+            if (body === undefined) {
+              throw new StorageError('Fake provider version was not found.', {
+                code: StorageErrorCode.NOT_FOUND,
+                permanent: true,
+              });
+            }
+            const destination = options.destination;
+            if (destination === undefined) {
+              throw new StorageError('Destination condition is required.', {
+                code: StorageErrorCode.INVALID_ARGUMENT,
+                permanent: true,
+              });
+            }
+            if (destination.type === 'create') {
+              await base.uploadConditional?.(destinationKey, body, {
+                condition: { type: 'create' },
+              });
+            } else {
+              await base.uploadConditional?.(destinationKey, body, {
+                condition: { etag: destination.etag, type: 'replace' },
+              });
+            }
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
   };
 
-  const versioned = new Proxy(base, {
+  const versioned = createDriver();
+  const observed = observeDispatches(versioned);
+  return {
+    client: new StorageClient('fake-versioned', observed.driver),
+    close: () => rm(root, { force: true, recursive: true }),
+    createReplica: () => new StorageClient('fake-versioned', createDriver()),
+    dispatchCount: observed.dispatchCount,
+    resolveVersion: async (key) => currentVersions.get(key),
+  };
+}
+
+function withOneShotListCursors(
+  driver: StorageDriver,
+  consumed: Set<string>,
+): StorageDriver {
+  const list = driver.list.bind(driver);
+  return new Proxy(driver, {
     get(target, property) {
-      if (property === 'capabilities') return capabilities;
-      if (property === 'upload') {
+      if (property === 'list') {
         return async (
-          key: string,
-          body: StorageBody,
-          options?: StorageUploadOptions,
-        ) => {
-          if (typeof body !== 'string') {
-            throw new TypeError(
-              'Fake versioned fixture accepts string bodies.',
-            );
-          }
-          const result = await upload(key, body, options);
-          const version = randomUUID();
-          const keyVersions = versions.get(key) ?? new Map<string, string>();
-          keyVersions.set(version, body);
-          versions.set(key, keyVersions);
-          currentVersions.set(key, version);
-          return result;
-        };
-      }
-      if (property === 'promote') {
-        return async (
-          sourceKey: string,
-          destinationKey: string,
-          options: StoragePromotionOptions,
-        ): Promise<void> => {
-          if (options.sourceVersion === undefined) {
-            if (promote === undefined) {
-              throw new TypeError('Filesystem promotion is unavailable.');
+          options?: StorageListOptions,
+        ): Promise<StorageListResult> => {
+          const cursor = options?.cursor;
+          if (cursor !== undefined) {
+            if (consumed.has(cursor)) {
+              throw new StorageError(
+                'The deliberately one-shot cursor was reused.',
+                {
+                  code: StorageErrorCode.INVALID_ARGUMENT,
+                  operation: 'list',
+                  permanent: true,
+                },
+              );
             }
-            return promote(sourceKey, destinationKey, options);
+            consumed.add(cursor);
           }
-          const body = versions.get(sourceKey)?.get(options.sourceVersion);
-          if (body === undefined) {
-            throw new StorageError('Fake provider version was not found.', {
-              code: StorageErrorCode.NOT_FOUND,
-              permanent: true,
-            });
-          }
-          const destination = options.destination;
-          if (destination === undefined) {
-            throw new StorageError('Destination condition is required.', {
-              code: StorageErrorCode.INVALID_ARGUMENT,
-              permanent: true,
-            });
-          }
-          if (destination.type === 'create') {
-            await base.uploadConditional?.(destinationKey, body, {
-              condition: { type: 'create' },
-            });
-          } else {
-            await base.uploadConditional?.(destinationKey, body, {
-              condition: { etag: destination.etag, type: 'replace' },
-            });
-          }
+          return list(options);
         };
       }
       const value = Reflect.get(target, property, target) as unknown;
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });
-  const observed = observeDispatches(versioned);
-  return {
-    client: new StorageClient('fake-versioned', observed.driver),
-    close: () => rm(root, { force: true, recursive: true }),
-    dispatchCount: observed.dispatchCount,
-    resolveVersion: async (key) => currentVersions.get(key),
+}
+
+function withoutDelimiterSupport(driver: StorageDriver): StorageDriver {
+  const capabilities: StorageCapabilities = {
+    ...driver.capabilities,
+    delimiter: false,
   };
+  const list = driver.list.bind(driver);
+  return new Proxy(driver, {
+    get(target, property) {
+      if (property === 'capabilities') return capabilities;
+      if (property === 'list') {
+        return async (
+          options?: StorageListOptions,
+        ): Promise<StorageListResult> => {
+          if (options?.delimiter !== undefined) {
+            throw new StorageError(
+              'The flat test driver does not support delimiters.',
+              {
+                code: StorageErrorCode.NOT_SUPPORTED,
+                operation: 'list',
+                permanent: true,
+              },
+            );
+          }
+          return list(options);
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
 }
 
 function withoutConditionalCapabilities(driver: StorageDriver): StorageDriver {

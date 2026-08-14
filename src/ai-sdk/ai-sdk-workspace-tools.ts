@@ -2,6 +2,7 @@ import { tool, type ToolSet } from 'ai';
 import { z } from 'zod';
 
 import {
+  STORAGE_WORKSPACE_MAX_CURSOR_BYTES,
   isStorageWorkspaceError,
   type StorageWorkspace,
   type StorageWorkspaceEntry,
@@ -128,7 +129,7 @@ const mutationToolNames = new Set<AiSdkWorkspaceMutationToolName>([
 ]);
 const utf8Encoder = new TextEncoder();
 const forbiddenUnicodeCharacter = /\p{C}/u;
-const workspaceCursor = /^[A-Za-z0-9_-]{32}$/u;
+const workspaceCursor = /^[A-Za-z0-9._-]+$/u;
 const windowsDeviceName = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu;
 
 function isLogicalPath(value: string): boolean {
@@ -198,12 +199,14 @@ function boundedEtag() {
     );
 }
 
-function continuationCursor(description: string) {
+function continuationCursor(description: string, maxBytes: number) {
   return z
     .string()
+    .min(1)
+    .max(Math.min(STORAGE_WORKSPACE_MAX_CURSOR_BYTES, maxBytes))
     .regex(
       workspaceCursor,
-      'Cursor must be the opaque base64url token returned by the workspace.',
+      'Cursor must be the bounded opaque token returned by the workspace.',
     )
     .optional()
     .describe(description);
@@ -360,7 +363,8 @@ export function createAiSdkWorkspaceTools({
             `Maximum entries to return, up to ${workspace.limits.maxPageSize}.`,
           ),
           cursor: continuationCursor(
-            'Opaque one-use cursor returned by the preceding list call. Repeat the same directory, recursive, and limit options when continuing.',
+            'Opaque cursor returned by a preceding list call. It may be replayed before expiry while its provider continuation remains valid; repeat the same directory, recursive, and limit options when continuing.',
+            workspace.limits.maxCursorBytes,
           ),
         })
         .strict(),
@@ -432,7 +436,8 @@ export function createAiSdkWorkspaceTools({
             `Maximum matches to return, up to ${workspace.limits.maxSearchResults}.`,
           ),
           cursor: continuationCursor(
-            'Opaque one-use cursor returned by the preceding search call. Repeat the same query, directory, match, caseInsensitive, and limit options when continuing.',
+            'Opaque cursor returned by a preceding search call. It may be replayed before expiry while its provider continuation remains valid; repeat the same query, directory, match, caseInsensitive, and limit options when continuing.',
+            workspace.limits.maxCursorBytes,
           ),
         })
         .strict(),

@@ -153,6 +153,11 @@ import {
   type StorageObjectMetadata,
 } from '@nestm/storage/core';
 import { createS3StorageDriver } from '@nestm/storage/files-sdk/s3';
+import {
+  Aes256GcmStorageWorkspaceCursorCodec,
+  STORAGE_WORKSPACE_MAX_CURSOR_BYTES,
+  mountStorageWorkspace,
+} from '@nestm/storage/workspace';
 
 const capabilities = {
   cacheControl: true,
@@ -181,98 +186,114 @@ function metadata(key: string): StorageObjectMetadata {
   };
 }
 
-const driver = {
-  capabilities,
-  name: 'packed-memory',
-  async upload(key, body, options) {
-    if (typeof body !== 'string') {
-      throw new TypeError('The smoke driver accepts string bodies only.');
-    }
-    const stored = {
-      body: new TextEncoder().encode(body),
-      contentType: options?.contentType ?? 'application/octet-stream',
-    };
-    objects.set(key, stored);
-    return {
-      contentType: stored.contentType,
-      key,
-      size: stored.body.byteLength,
-    };
-  },
-  async download(key) {
-    const object = metadata(key);
-    const stored = objects.get(key);
-    assert.ok(stored);
-    return {
-      ...object,
-      body: new ReadableStream<Uint8Array>({
-        start(controller) {
-          controller.enqueue(stored.body);
-          controller.close();
-        },
-      }),
-    };
-  },
-  async head(key) {
-    return metadata(key);
-  },
-  async exists(key) {
-    return objects.has(key);
-  },
-  async delete(key) {
-    objects.delete(key);
-  },
-  async copy(sourceKey, destinationKey) {
-    const source = objects.get(sourceKey);
-    if (source === undefined) {
-      throw new Error(\`Missing object: \${sourceKey}\`);
-    }
-    objects.set(destinationKey, {
-      body: source.body.slice(),
-      contentType: source.contentType,
-    });
-  },
-  async move(sourceKey, destinationKey) {
-    const source = objects.get(sourceKey);
-    if (source === undefined) {
-      throw new Error(\`Missing object: \${sourceKey}\`);
-    }
-    objects.set(destinationKey, source);
-    objects.delete(sourceKey);
-  },
-  async list(options) {
-    return {
-      items: [...objects.keys()]
-        .filter((key) => key.startsWith(options?.prefix ?? ''))
-        .map(metadata),
-    };
-  },
-  async *search(pattern, options) {
-    const expression =
-      pattern instanceof RegExp ? pattern : new RegExp(pattern.replace('*', '.*'));
-    for (const key of objects.keys()) {
-      if (!key.startsWith(options?.prefix ?? '')) {
-        continue;
+function createDriver(): StorageDriver {
+  return {
+    capabilities,
+    name: 'packed-memory',
+    async upload(key, body, options) {
+      if (typeof body !== 'string') {
+        throw new TypeError('The smoke driver accepts string bodies only.');
       }
+      const stored = {
+        body: new TextEncoder().encode(body),
+        contentType: options?.contentType ?? 'application/octet-stream',
+      };
+      objects.set(key, stored);
+      return {
+        contentType: stored.contentType,
+        key,
+        size: stored.body.byteLength,
+      };
+    },
+    async download(key) {
       const object = metadata(key);
-      if (expression.test(object.key)) {
-        yield object;
+      const stored = objects.get(key);
+      assert.ok(stored);
+      return {
+        ...object,
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(stored.body);
+            controller.close();
+          },
+        }),
+      };
+    },
+    async head(key) {
+      return metadata(key);
+    },
+    async exists(key) {
+      return objects.has(key);
+    },
+    async delete(key) {
+      objects.delete(key);
+    },
+    async copy(sourceKey, destinationKey) {
+      const source = objects.get(sourceKey);
+      if (source === undefined) {
+        throw new Error(\`Missing object: \${sourceKey}\`);
       }
-    }
-  },
-  async signDownload(key) {
-    return \`https://storage.invalid/download/\${encodeURIComponent(key)}\`;
-  },
-  async signUpload(key) {
-    return {
-      method: 'PUT',
-      url: \`https://storage.invalid/upload/\${encodeURIComponent(key)}\`,
-    };
-  },
-  async close() {
-    closeCalls += 1;
-  },
-} satisfies StorageDriver;
+      objects.set(destinationKey, {
+        body: source.body.slice(),
+        contentType: source.contentType,
+      });
+    },
+    async move(sourceKey, destinationKey) {
+      const source = objects.get(sourceKey);
+      if (source === undefined) {
+        throw new Error(\`Missing object: \${sourceKey}\`);
+      }
+      objects.set(destinationKey, source);
+      objects.delete(sourceKey);
+    },
+    async list(options) {
+      const keys = [...objects.keys()]
+        .filter((key) => key.startsWith(options?.prefix ?? ''))
+        .toSorted();
+      const startIndex =
+        options?.cursor === undefined
+          ? 0
+          : keys.findIndex((key) => key > options.cursor!);
+      const start = startIndex < 0 ? keys.length : startIndex;
+      const limit = options?.limit ?? 1_000;
+      const selected = keys.slice(start, start + limit);
+      const lastKey = selected.at(-1);
+      return {
+        items: selected.map(metadata),
+        ...(lastKey !== undefined && start + selected.length < keys.length
+          ? { cursor: lastKey }
+          : {}),
+      };
+    },
+    async *search(pattern, options) {
+      const expression =
+        pattern instanceof RegExp ? pattern : new RegExp(pattern.replace('*', '.*'));
+      for (const key of objects.keys()) {
+        if (!key.startsWith(options?.prefix ?? '')) {
+          continue;
+        }
+        const object = metadata(key);
+        if (expression.test(object.key)) {
+          yield object;
+        }
+      }
+    },
+    async signDownload(key) {
+      return \`https://storage.invalid/download/\${encodeURIComponent(key)}\`;
+    },
+    async signUpload(key) {
+      return {
+        method: 'PUT',
+        url: \`https://storage.invalid/upload/\${encodeURIComponent(key)}\`,
+      };
+    },
+    async close() {
+      closeCalls += 1;
+    },
+  } satisfies StorageDriver;
+}
+
+const driver = createDriver();
 
 let nestResolved = true;
 try {
@@ -285,6 +306,17 @@ assert.equal(nestResolved, false);
 assert.equal(DEFAULT_BUFFER_LIMIT, 10 * 1024 * 1024);
 assert.equal(StorageErrorCode.NOT_FOUND, 'NOT_FOUND');
 assert.equal(new StorageUploadControl().status, 'idle');
+assert.equal(STORAGE_WORKSPACE_MAX_CURSOR_BYTES, 4096);
+const cursorCodec = new Aes256GcmStorageWorkspaceCursorCodec({
+  activeKeyId: 'packed',
+  keys: { packed: new Uint8Array(32).fill(7) },
+});
+const cursorPayload = new TextEncoder().encode('provider-secret');
+const cursorToken = cursorCodec.encode(cursorPayload, {
+  expiresAt: Date.now() + 60_000,
+});
+assert.match(cursorToken, /^swc1\\.packed\\./u);
+assert.deepEqual(cursorCodec.decode(cursorToken), cursorPayload);
 const foreignStorageError = Object.assign(new Error('foreign'), {
   [Symbol.for('@nestm/storage/StorageError')]: true,
   aborted: false,
@@ -347,9 +379,68 @@ const uploaded = await client.upload('hello.txt', 'hello core', {
 assert.equal(uploaded.key, 'hello.txt');
 assert.equal(await client.downloadText('hello.txt'), 'hello core');
 
+const workspaceCursorConfiguration = () => ({
+  codec: new Aes256GcmStorageWorkspaceCursorCodec({
+    activeKeyId: 'packed-workspace',
+    keys: { 'packed-workspace': new Uint8Array(32).fill(8) },
+  }),
+  mountId: 'packed-artifacts',
+  scope: 'organization:packed/workspace:packed',
+});
+const workspaceClientA = new StorageClient('packed-workspace', createDriver());
+for (const name of ['a.txt', 'b.txt', 'c.txt']) {
+  await workspaceClientA.upload('scope/' + name, name);
+}
+const workspaceA = mountStorageWorkspace(workspaceClientA, {
+  cursor: workspaceCursorConfiguration(),
+  prefix: 'scope',
+});
+const firstList = await workspaceA.list({ limit: 1, recursive: true });
+const firstListCursor = firstList.cursor;
+assert.ok(firstListCursor);
+const firstSearch = await workspaceA.search('*.txt', { limit: 1 });
+const firstSearchCursor = firstSearch.cursor;
+assert.ok(firstSearchCursor);
+await workspaceClientA.onApplicationShutdown();
+
+const workspaceClientB = new StorageClient('packed-workspace', createDriver());
+const workspaceB = mountStorageWorkspace(workspaceClientB, {
+  cursor: workspaceCursorConfiguration(),
+  prefix: 'scope',
+});
+const continuedList = await workspaceB.list({ cursor: firstListCursor });
+assert.ok(continuedList.cursor);
+const continuedListDescendant = await workspaceB.list({
+  cursor: continuedList.cursor,
+});
+const replayedList = await workspaceB.list({ cursor: firstListCursor });
+assert.deepEqual(replayedList.entries, continuedList.entries);
+assert.ok(replayedList.cursor);
+assert.deepEqual(
+  (await workspaceB.list({ cursor: replayedList.cursor })).entries,
+  continuedListDescendant.entries,
+);
+const continuedSearch = await workspaceB.search('', {
+  cursor: firstSearchCursor,
+});
+assert.ok(continuedSearch.cursor);
+const continuedSearchDescendant = await workspaceB.search('', {
+  cursor: continuedSearch.cursor,
+});
+const replayedSearch = await workspaceB.search('', {
+  cursor: firstSearchCursor,
+});
+assert.deepEqual(replayedSearch.entries, continuedSearch.entries);
+assert.ok(replayedSearch.cursor);
+assert.deepEqual(
+  (await workspaceB.search('', { cursor: replayedSearch.cursor })).entries,
+  continuedSearchDescendant.entries,
+);
+await workspaceClientB.onApplicationShutdown();
+
 await client.onApplicationShutdown();
 await client.onApplicationShutdown();
-assert.equal(closeCalls, 1);
+assert.equal(closeCalls, 3);
 `;
 }
 

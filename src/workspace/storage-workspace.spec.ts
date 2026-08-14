@@ -16,8 +16,10 @@ import type { StorageDriver } from '../storage.driver.js';
 import type { StorageObject } from '../storage.types.js';
 
 import {
+  Aes256GcmStorageWorkspaceCursorCodec,
   isStorageWorkspaceError,
   mountStorageWorkspace,
+  type StorageWorkspaceCursorConfiguration,
   type StorageWorkspacePermission,
 } from './index.js';
 
@@ -31,6 +33,21 @@ const ALL_PERMISSIONS: readonly StorageWorkspacePermission[] = [
   'move',
   'delete',
 ];
+const CURSOR_KEY = new Uint8Array(32).fill(0x42);
+
+function cursorConfiguration(
+  mountId = 'artifact-files',
+  scope = 'organization:one/workspace:one',
+): StorageWorkspaceCursorConfiguration {
+  return {
+    codec: new Aes256GcmStorageWorkspaceCursorCodec({
+      activeKeyId: 'test',
+      keys: { test: CURSOR_KEY },
+    }),
+    mountId,
+    scope,
+  };
+}
 
 const MALICIOUS_ETAGS = [
   '',
@@ -58,6 +75,7 @@ function mountedFs(root: string) {
   return {
     client,
     workspace: mountStorageWorkspace(client, {
+      cursor: cursorConfiguration(),
       permissions: ALL_PERMISSIONS,
       prefix: 'runs/run-1',
     }),
@@ -85,16 +103,25 @@ describe('StorageWorkspace', () => {
     expect(workspace.allows('delete')).toBe(false);
 
     const child = workspace.mount('src', {
-      limits: { maxReadBytes: 10 },
+      limits: { maxCursorBytes: 2_048, maxReadBytes: 10 },
       permissions: ['read'],
     });
     expect([...child.permissions]).toEqual(['read']);
     expect(child.limits.maxReadBytes).toBe(10);
+    expect(child.limits.maxCursorBytes).toBe(2_048);
     expect(() => child.mount('nested', { permissions: ['create'] })).toThrow(
       expect.objectContaining({ code: StorageErrorCode.UNAUTHORIZED }),
     );
     expect(() =>
       child.mount('nested', { limits: { maxReadBytes: 11 } }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
+    );
+    expect(() =>
+      mountStorageWorkspace(client, {
+        limits: { maxCursorBytes: 4_097 },
+        prefix: 'runs/two',
+      }),
     ).toThrow(
       expect.objectContaining({ code: StorageErrorCode.INVALID_ARGUMENT }),
     );
@@ -301,12 +328,12 @@ describe('StorageWorkspace', () => {
       recursive: true,
     });
     expect(first.entries).toHaveLength(1);
-    expect(first.cursor).toMatch(/^[A-Za-z0-9_-]{32}$/u);
+    expect(first.cursor).toMatch(/^swc1\.test\.[A-Za-z0-9_-]+$/u);
     const second = await workspace.list({ cursor: first.cursor });
     expect(second.entries).toHaveLength(1);
     await expect(
       workspace.list({ cursor: first.cursor }),
-    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    ).resolves.toMatchObject({ entries: second.entries });
 
     const searched = await workspace.search('*.ts', {
       directory: 'src',
@@ -338,6 +365,344 @@ describe('StorageWorkspace', () => {
     await expect(
       workspace.list({ cursor: '../not-a-token' }),
     ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(workspace.list({ cursor: '' })).rejects.toMatchObject({
+      code: StorageErrorCode.INVALID_ARGUMENT,
+    });
+  });
+
+  it('continues across replicas while binding store, mount, scope, prefix, and limits', async () => {
+    const createClient = (name = 'artifacts') =>
+      new StorageClient(name, createFsStorageDriver({ adapter: { root } }));
+    const client = createClient();
+    let defaultClient = client;
+    for (const name of ['a.txt', 'b.txt', 'c.txt']) {
+      await client.upload(`scope/${name}`, name);
+    }
+    const mount = (
+      overrides: {
+        client?: StorageClient;
+        mountId?: string;
+        prefix?: string;
+        scope?: string;
+        maxReadBytes?: number;
+      } = {},
+    ) =>
+      mountStorageWorkspace(overrides.client ?? defaultClient, {
+        cursor: cursorConfiguration(
+          overrides.mountId ?? 'artifact-files',
+          overrides.scope ?? 'organization:one/workspace:one',
+        ),
+        limits: { maxReadBytes: overrides.maxReadBytes ?? 100 },
+        prefix: overrides.prefix ?? 'scope',
+      });
+    const firstMount = mount();
+    const first = await firstMount.list({ limit: 1, recursive: true });
+    expect(first.cursor).toBeTypeOf('string');
+    const searched = await firstMount.search('*.txt', { limit: 1 });
+    expect(searched.cursor).toBeTypeOf('string');
+
+    await client.onApplicationShutdown();
+    const replicaClient = createClient();
+    defaultClient = replicaClient;
+
+    const replica = mount();
+    const listedContinuation = await replica.list({ cursor: first.cursor });
+    expect(listedContinuation).toMatchObject({
+      entries: [expect.objectContaining({ kind: 'file' })],
+    });
+    expect(listedContinuation.cursor).toBeTypeOf('string');
+    const listedDescendant = await replica.list({
+      cursor: listedContinuation.cursor,
+    });
+    const listedReplay = await replica.list({ cursor: first.cursor });
+    expect(listedReplay).toMatchObject({ entries: listedContinuation.entries });
+    expect(listedReplay.cursor).toBeTypeOf('string');
+    await expect(
+      replica.list({ cursor: listedReplay.cursor }),
+    ).resolves.toMatchObject({ entries: listedDescendant.entries });
+    const searchContinuation = await replica.search('', {
+      cursor: searched.cursor,
+    });
+    expect(searchContinuation).toMatchObject({
+      entries: [expect.objectContaining({ kind: 'file' })],
+    });
+    expect(searchContinuation.cursor).toBeTypeOf('string');
+    const searchDescendant = await replica.search('', {
+      cursor: searchContinuation.cursor,
+    });
+    const searchReplay = await replica.search('', { cursor: searched.cursor });
+    expect(searchReplay).toMatchObject({ entries: searchContinuation.entries });
+    expect(searchReplay.cursor).toBeTypeOf('string');
+    await expect(
+      replica.search('', { cursor: searchReplay.cursor }),
+    ).resolves.toMatchObject({ entries: searchDescendant.entries });
+    const otherStoreClient = createClient('other-store');
+    await expect(
+      mount({ client: otherStoreClient }).list({ cursor: first.cursor }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(
+      mount({ mountId: 'other-mount' }).list({ cursor: first.cursor }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(
+      mount({ scope: 'organization:one/workspace:two' }).list({
+        cursor: first.cursor,
+      }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(
+      mount({ prefix: 'other-scope' }).list({ cursor: first.cursor }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(
+      mount({ maxReadBytes: 99 }).list({ cursor: first.cursor }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await otherStoreClient.onApplicationShutdown();
+    await replicaClient.onApplicationShutdown();
+  });
+
+  it('rejects every explicitly conflicting normalized list and search field', async () => {
+    const driver = createMemoryStorageDriver({
+      adapter: {
+        initial: {
+          'scope/src/a.ts': 'a',
+          'scope/src/b.ts': 'b',
+          'scope/src/c.ts': 'c',
+          'scope/other/d.ts': 'd',
+        },
+      },
+    });
+    const workspace = mountStorageWorkspace(
+      new StorageClient('queries', driver),
+      { cursor: cursorConfiguration(), prefix: 'scope' },
+    );
+    const listed = await workspace.list({
+      directory: 'src',
+      limit: 1,
+      recursive: true,
+    });
+    expect(listed.cursor).toBeTypeOf('string');
+    for (const options of [
+      { cursor: listed.cursor, directory: 'other' },
+      { cursor: listed.cursor, limit: 2 },
+      { cursor: listed.cursor, recursive: false },
+    ]) {
+      await expect(workspace.list(options)).rejects.toMatchObject({
+        code: StorageErrorCode.INVALID_ARGUMENT,
+      });
+    }
+
+    const searched = await workspace.search('*.ts', {
+      caseInsensitive: false,
+      directory: 'src',
+      limit: 1,
+      match: 'glob',
+    });
+    expect(searched.cursor).toBeTypeOf('string');
+    const mismatches = [
+      workspace.search('*.md', { cursor: searched.cursor }),
+      workspace.search('', { cursor: searched.cursor, directory: 'other' }),
+      workspace.search('', { cursor: searched.cursor, limit: 2 }),
+      workspace.search('', {
+        caseInsensitive: true,
+        cursor: searched.cursor,
+      }),
+      workspace.search('', { cursor: searched.cursor, match: 'substring' }),
+    ];
+    for (const mismatch of mismatches) {
+      await expect(mismatch).rejects.toMatchObject({
+        code: StorageErrorCode.INVALID_ARGUMENT,
+      });
+    }
+  });
+
+  it('rejects expired and altered cursors without exposing provider state', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-14T12:00:00.000Z'));
+    try {
+      const driver = createMemoryStorageDriver({
+        adapter: {
+          initial: { 'private/a.txt': 'a', 'private/b.txt': 'b' },
+        },
+      });
+      const workspace = mountStorageWorkspace(
+        new StorageClient('expiry', driver),
+        {
+          cursor: cursorConfiguration(),
+          limits: { cursorTtlMs: 100 },
+          prefix: 'private',
+        },
+      );
+      const first = await workspace.list({ limit: 1, recursive: true });
+      expect(first.cursor).toBeTypeOf('string');
+      expect(first.cursor).not.toContain('private');
+      const final = first.cursor?.at(-1);
+      const altered = `${first.cursor?.slice(0, -1)}${final === 'A' ? 'B' : 'A'}`;
+      await expect(workspace.list({ cursor: altered })).rejects.toMatchObject({
+        code: StorageErrorCode.INVALID_ARGUMENT,
+      });
+
+      vi.advanceTimersByTime(99);
+      await expect(
+        workspace.list({ cursor: first.cursor }),
+      ).resolves.toBeDefined();
+      vi.advanceTimersByTime(1);
+      await expect(
+        workspace.list({ cursor: first.cursor }),
+      ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('requires cursor configuration only when a continuation is used', async () => {
+    const single = mountStorageWorkspace(
+      new StorageClient(
+        'single-page',
+        createMemoryStorageDriver({
+          adapter: { initial: { 'scope/only.txt': 'only' } },
+        }),
+      ),
+      { prefix: 'scope' },
+    );
+    await expect(single.list({ recursive: true })).resolves.toMatchObject({
+      entries: [expect.objectContaining({ path: 'only.txt' })],
+    });
+
+    const driver = createMemoryStorageDriver();
+    driver.list = vi.fn(async () => ({
+      cursor: 'provider-secret-continuation',
+      items: [
+        {
+          contentType: 'text/plain',
+          key: 'scope/a.txt',
+          name: 'scope/a.txt',
+          size: 1,
+        },
+      ],
+    }));
+    const unconfigured = mountStorageWorkspace(
+      new StorageClient('unconfigured', driver),
+      { prefix: 'scope' },
+    );
+    await expect(
+      unconfigured.list({ limit: 1, recursive: true }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.NOT_SUPPORTED });
+    await expect(unconfigured.list({ cursor: 'opaque' })).rejects.toMatchObject(
+      {
+        code: StorageErrorCode.NOT_SUPPORTED,
+      },
+    );
+  });
+
+  it('bounds issued cursor state and sanitizes codec failures', async () => {
+    const driver = createMemoryStorageDriver();
+    driver.list = vi.fn(async () => ({
+      cursor: 'p'.repeat(3_000),
+      items: [
+        {
+          contentType: 'text/plain',
+          key: 'scope/a.txt',
+          name: 'scope/a.txt',
+          size: 1,
+        },
+      ],
+    }));
+    const workspace = mountStorageWorkspace(
+      new StorageClient('oversized', driver),
+      { cursor: cursorConfiguration(), prefix: 'scope' },
+    );
+    await expect(
+      workspace.list({ limit: 1, recursive: true }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.LIMIT_EXCEEDED });
+
+    driver.list = vi.fn(async () => ({
+      cursor: 'provider-cursor',
+      items: [
+        {
+          contentType: 'text/plain',
+          key: 'scope/a.txt',
+          name: 'scope/a.txt',
+          size: 1,
+        },
+      ],
+    }));
+    const narrowDecode = vi.fn(() => new Uint8Array([1]));
+    const narrow = mountStorageWorkspace(
+      new StorageClient('narrow-cursor', driver),
+      {
+        cursor: {
+          codec: {
+            decode: narrowDecode,
+            encode: () => 'a'.repeat(65),
+          },
+          mountId: 'artifact-files',
+          scope: 'organization:one/workspace:one',
+        },
+        limits: { maxCursorBytes: 64 },
+        prefix: 'scope',
+      },
+    );
+    await expect(
+      narrow.list({ limit: 1, recursive: true }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.LIMIT_EXCEEDED });
+    await expect(narrow.list({ cursor: 'a'.repeat(65) })).rejects.toMatchObject(
+      {
+        code: StorageErrorCode.INVALID_ARGUMENT,
+      },
+    );
+    expect(narrowDecode).not.toHaveBeenCalled();
+
+    const failing = mountStorageWorkspace(
+      new StorageClient('failing-codec', driver),
+      {
+        cursor: {
+          codec: {
+            decode: () => {
+              throw new Error('private decode failure');
+            },
+            encode: () => {
+              throw new Error('private encode failure');
+            },
+          },
+          mountId: 'artifact-files',
+          scope: 'organization:one/workspace:one',
+        },
+        prefix: 'scope',
+      },
+    );
+    const error = await failing
+      .list({ limit: 1, recursive: true })
+      .catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: StorageErrorCode.PROVIDER });
+    expect((error as Error).message).not.toContain('private encode failure');
+    await expect(failing.list({ cursor: 'opaque' })).rejects.toMatchObject({
+      code: StorageErrorCode.PROVIDER,
+    });
+  });
+
+  it('rejects malformed decoded envelopes before calling the provider', async () => {
+    const driver = createMemoryStorageDriver();
+    const list = vi.spyOn(driver, 'list');
+    const workspace = mountStorageWorkspace(
+      new StorageClient('malformed-envelope', driver),
+      {
+        cursor: {
+          codec: {
+            decode: async () =>
+              new TextEncoder().encode(
+                JSON.stringify({ b: 'forged', e: Date.now() + 1_000, v: 2 }),
+              ),
+            encode: async () => 'opaque',
+          },
+          mountId: 'artifact-files',
+          scope: 'organization:one/workspace:one',
+        },
+        prefix: 'scope',
+      },
+    );
+
+    await expect(workspace.list({ cursor: 'opaque' })).rejects.toMatchObject({
+      code: StorageErrorCode.INVALID_ARGUMENT,
+    });
+    expect(list).not.toHaveBeenCalled();
   });
 
   it('fails closed on out-of-scope and wrong-coordinate provider results', async () => {
@@ -542,7 +907,7 @@ describe('StorageWorkspace', () => {
     }));
     const workspace = mountStorageWorkspace(
       new StorageClient('malformed-list', driver),
-      { prefix: 'scope' },
+      { cursor: cursorConfiguration(), prefix: 'scope' },
     );
 
     await expect(

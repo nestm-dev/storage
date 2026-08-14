@@ -7,7 +7,13 @@ import type {
   StorageUploadResult,
 } from '../storage.types.js';
 
-import { StorageWorkspaceCursorStore } from './storage-workspace.cursor.js';
+import {
+  STORAGE_WORKSPACE_MAX_CURSOR_BYTES,
+  decodeStorageWorkspaceCursor,
+  issueStorageWorkspaceCursor,
+  resolveStorageWorkspaceCursorConfiguration,
+} from './storage-workspace.cursor.js';
+import type { StorageWorkspaceCursorConfiguration } from './storage-workspace.cursor.js';
 import {
   sanitizeWorkspaceError,
   workspaceError,
@@ -57,25 +63,12 @@ const WORKSPACE_CONSTRUCTOR = Symbol('StorageWorkspace.constructor');
 
 interface WorkspaceState {
   readonly client: StorageClient;
-  readonly cursorStore: StorageWorkspaceCursorStore;
-  readonly id: string;
+  readonly cursor: Readonly<StorageWorkspaceCursorConfiguration> | undefined;
   readonly prefix: string;
 }
 
-interface ListCursorState {
-  readonly backendCursor: string;
-  readonly directory: string;
-  readonly limit: number;
-  readonly recursive: boolean;
-}
-
-interface SearchCursorState {
+interface SearchPageState {
   readonly backendCursor: string | undefined;
-  readonly caseInsensitive: boolean;
-  readonly directory: string;
-  readonly limit: number;
-  readonly match: StorageWorkspaceSearchMatch;
-  readonly query: string;
   readonly scanned: number;
 }
 
@@ -120,6 +113,7 @@ function resolveLimits(
   const baseline = parent ?? DEFAULT_STORAGE_WORKSPACE_LIMITS;
   const next: StorageWorkspaceLimits = {
     cursorTtlMs: requested?.cursorTtlMs ?? baseline.cursorTtlMs,
+    maxCursorBytes: requested?.maxCursorBytes ?? baseline.maxCursorBytes,
     maxPageSize: requested?.maxPageSize ?? baseline.maxPageSize,
     maxPathBytes: requested?.maxPathBytes ?? baseline.maxPathBytes,
     maxReadBytes: requested?.maxReadBytes ?? baseline.maxReadBytes,
@@ -137,6 +131,13 @@ function resolveLimits(
         { permanent: true },
       );
     }
+  }
+  if (next.maxCursorBytes > STORAGE_WORKSPACE_MAX_CURSOR_BYTES) {
+    throw workspaceError(
+      StorageErrorCode.INVALID_ARGUMENT,
+      `limits.maxCursorBytes cannot exceed ${STORAGE_WORKSPACE_MAX_CURSOR_BYTES}.`,
+      { permanent: true },
+    );
   }
   return Object.freeze(next);
 }
@@ -503,12 +504,15 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
     options: StorageWorkspaceListOptions = {},
   ): Promise<StorageWorkspacePage> {
     this.#require('list');
-    const continuation = options.cursor
-      ? this.#state.cursorStore.consume<ListCursorState>(
-          options.cursor,
-          this.#binding('list'),
-        )
-      : undefined;
+    const continuation =
+      options.cursor !== undefined
+        ? await decodeStorageWorkspaceCursor(
+            this.#state.cursor,
+            this.#cursorBinding(),
+            'list',
+            options.cursor,
+          )
+        : undefined;
     if (
       continuation !== undefined &&
       ((options.directory !== undefined &&
@@ -531,7 +535,6 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
       this.#limits.maxPageSize,
     );
     const recursive = continuation?.recursive ?? options.recursive === true;
-    const binding = this.#binding('list');
     const scopedDirectory = this.#scopeDirectory(directory);
     try {
       const page = await this.#state.client.list({
@@ -589,15 +592,16 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
       }
       return {
         ...(page.cursor !== undefined && {
-          cursor: this.#state.cursorStore.issue(
-            binding,
+          cursor: await issueStorageWorkspaceCursor(
+            this.#state.cursor,
+            this.#cursorBinding(),
             {
               backendCursor: page.cursor,
               directory,
               limit,
+              operation: 'list',
               recursive,
-            } satisfies ListCursorState,
-            this.#limits.cursorTtlMs,
+            },
           ),
         }),
         entries,
@@ -615,12 +619,15 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
     options: StorageWorkspaceSearchOptions = {},
   ): Promise<StorageWorkspacePage> {
     this.#require('search');
-    const continuation = options.cursor
-      ? this.#state.cursorStore.consume<SearchCursorState>(
-          options.cursor,
-          this.#binding('search'),
-        )
-      : undefined;
+    const continuation =
+      options.cursor !== undefined
+        ? await decodeStorageWorkspaceCursor(
+            this.#state.cursor,
+            this.#cursorBinding(),
+            'search',
+            options.cursor,
+          )
+        : undefined;
     if (
       continuation !== undefined &&
       ((query.length > 0 && query !== continuation.query) ||
@@ -676,18 +683,11 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
       continuation?.limit ?? options.limit,
       this.#limits.maxSearchResults,
     );
-    const binding = this.#binding('search');
-    const prior = continuation ?? {
-      backendCursor: undefined,
-      caseInsensitive,
-      directory,
-      limit,
-      match,
-      query,
-      scanned: 0,
+    const prior: SearchPageState = {
+      backendCursor: continuation?.backendCursor,
+      scanned: continuation?.scanned ?? 0,
     };
     return this.#searchPage(query, {
-      binding,
       caseInsensitive,
       directory,
       limit,
@@ -884,7 +884,6 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
       WORKSPACE_CONSTRUCTOR,
       {
         ...this.#state,
-        id: `${this.#state.id}/${path}`,
         prefix: joinWorkspacePath(this.#state.prefix, path),
       },
       resolvePermissions(options.permissions, this.#permissions),
@@ -943,13 +942,12 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
   async #searchPage(
     query: string,
     context: {
-      binding: string;
       caseInsensitive: boolean;
       directory: string;
       limit: number;
       match: StorageWorkspaceSearchMatch;
       operation: StorageOperationOptions | undefined;
-      state: SearchCursorState;
+      state: SearchPageState;
     },
   ): Promise<StorageWorkspacePage> {
     const entries: StorageWorkspaceEntry[] = [];
@@ -1034,20 +1032,22 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
           { permanent: true },
         );
       }
+      const nextBackendCursor = backendCursor;
       return {
-        ...(hasMore && {
-          cursor: this.#state.cursorStore.issue(
-            context.binding,
+        ...(nextBackendCursor !== undefined && {
+          cursor: await issueStorageWorkspaceCursor(
+            this.#state.cursor,
+            this.#cursorBinding(),
             {
-              backendCursor,
+              backendCursor: nextBackendCursor,
               caseInsensitive: context.caseInsensitive,
               directory: context.directory,
               limit: context.limit,
               match: context.match,
+              operation: 'search',
               query,
               scanned,
-            } satisfies SearchCursorState,
-            this.#limits.cursorTtlMs,
+            },
           ),
         }),
         entries,
@@ -1141,8 +1141,16 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
     return limit;
   }
 
-  #binding(operation: string): string {
-    return `${this.#state.id}:${operation}`;
+  #cursorBinding(): {
+    readonly limits: Readonly<StorageWorkspaceLimits>;
+    readonly prefix: string;
+    readonly store: string;
+  } {
+    return {
+      limits: this.#limits,
+      prefix: this.#state.prefix,
+      store: this.#state.client.name,
+    };
   }
 }
 
@@ -1159,8 +1167,7 @@ export function mountStorageWorkspace(
     WORKSPACE_CONSTRUCTOR,
     {
       client,
-      cursorStore: new StorageWorkspaceCursorStore(),
-      id: `workspace:${crypto.randomUUID()}`,
+      cursor: resolveStorageWorkspaceCursorConfiguration(options.cursor),
       prefix,
     },
     resolvePermissions(options.permissions),
