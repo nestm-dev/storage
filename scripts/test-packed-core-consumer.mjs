@@ -29,9 +29,17 @@ const tarballPath = join(temporaryRoot, 'nestm-storage.tgz');
 const rootPackage = JSON.parse(
   readFileSync(join(projectRoot, 'package.json'), 'utf8'),
 );
-const minimumS3PeerVersion = caretMinimum(
-  rootPackage.peerDependencies?.['@aws-sdk/client-s3'],
+const awsPeerNames = [
   '@aws-sdk/client-s3',
+  '@aws-sdk/lib-storage',
+  '@aws-sdk/s3-presigned-post',
+  '@aws-sdk/s3-request-presigner',
+];
+const minimumAwsPeerVersions = Object.fromEntries(
+  awsPeerNames.map((name) => [
+    name,
+    caretMinimum(rootPackage.peerDependencies?.[name], name),
+  ]),
 );
 
 try {
@@ -47,10 +55,13 @@ try {
         private: true,
         type: 'module',
         dependencies: {
-          '@aws-sdk/client-s3': minimumS3PeerVersion,
-          '@aws-sdk/lib-storage': minimumS3PeerVersion,
-          '@aws-sdk/s3-presigned-post': minimumS3PeerVersion,
-          '@aws-sdk/s3-request-presigner': minimumS3PeerVersion,
+          '@aws-sdk/client-s3': minimumAwsPeerVersions['@aws-sdk/client-s3'],
+          '@aws-sdk/lib-storage':
+            minimumAwsPeerVersions['@aws-sdk/lib-storage'],
+          '@aws-sdk/s3-presigned-post':
+            minimumAwsPeerVersions['@aws-sdk/s3-presigned-post'],
+          '@aws-sdk/s3-request-presigner':
+            minimumAwsPeerVersions['@aws-sdk/s3-request-presigner'],
           '@nestm/storage': `file:${tarballPath}`,
         },
         devDependencies: {
@@ -90,7 +101,7 @@ try {
   writeFileSync(join(consumerRoot, 'src', 'smoke.ts'), getConsumerSource());
   writeFileSync(
     join(consumerRoot, 's3-minimum-peer.mjs'),
-    getS3MinimumPeerSource(minimumS3PeerVersion),
+    getS3MinimumPeerSource(minimumAwsPeerVersions),
   );
 
   run(
@@ -342,7 +353,7 @@ assert.equal(closeCalls, 1);
 `;
 }
 
-function getS3MinimumPeerSource(minimumVersion) {
+function getS3MinimumPeerSource(minimumVersions) {
   return `import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
@@ -353,6 +364,7 @@ import {
 } from '@nestm/storage/core';
 import { createFilesSdkDriver } from '@nestm/storage/files-sdk';
 import {
+  CLOUDFLARE_R2_PROVIDER_PROFILE,
   createS3StorageDriver,
   defineS3ProviderProfile,
   s3,
@@ -360,8 +372,10 @@ import {
 } from '@nestm/storage/files-sdk/s3';
 
 const require = createRequire(import.meta.url);
-const clientS3Package = require('@aws-sdk/client-s3/package.json');
-assert.equal(clientS3Package.version, '${minimumVersion}');
+for (const [name, expected] of Object.entries(${JSON.stringify(minimumVersions)})) {
+  const installed = require(name + '/package.json');
+  assert.equal(installed.version, expected, name + ' minimum peer drifted');
+}
 
 const serializedRequests = [];
 const instrumentedClients = new WeakSet();
@@ -572,6 +586,89 @@ try {
     replaceRequest.headers['x-amz-copy-source-if-match'],
     '"source-etag"',
   );
+
+  const typedPut = await client.signUpload('typed.txt', {
+    contentType: 'text/plain',
+    expiresIn: 60,
+  });
+  assert.equal(typedPut.method, 'PUT');
+  assert.deepEqual(typedPut.headers, { 'Content-Type': 'text/plain' });
+  assert.equal(
+    new URL(typedPut.url).searchParams.get('X-Amz-SignedHeaders'),
+    'content-type;host',
+  );
+
+  const boundedPost = await client.signUpload('bounded.txt', {
+    contentType: 'text/plain',
+    expiresIn: 60,
+    maxSize: 1000,
+    minSize: 100,
+  });
+  assert.equal(boundedPost.method, 'POST');
+  const boundedPolicy = JSON.parse(
+    Buffer.from(boundedPost.fields.Policy, 'base64').toString('utf8'),
+  );
+  assert.ok(
+    boundedPolicy.conditions.some(
+      (condition) =>
+        Array.isArray(condition) &&
+        condition[0] === 'content-length-range' &&
+        condition[1] === 100 &&
+        condition[2] === 1000,
+    ),
+  );
+  assert.ok(
+    boundedPolicy.conditions.some(
+      (condition) =>
+        Array.isArray(condition) &&
+        condition[0] === 'eq' &&
+        condition[1] === '$Content-Type' &&
+        condition[2] === 'text/plain',
+    ),
+  );
+  await assert.rejects(
+    () => client.signUpload('min-only.txt', { expiresIn: 60, minSize: 1 }),
+    (error) => error?.code === StorageErrorCode.NOT_SUPPORTED,
+  );
+  await assert.rejects(
+    () =>
+      client.signUpload('\${filename}', {
+        expiresIn: 60,
+        maxSize: 1000,
+      }),
+    (error) => error?.code === StorageErrorCode.INVALID_ARGUMENT,
+  );
+
+  const r2 = new StorageClient(
+    'minimum-peer-r2',
+    createS3StorageDriver({
+      adapter: {
+        ...baseAdapterOptions,
+        endpoint: 'https://account.r2.cloudflarestorage.com',
+        region: 'auto',
+      },
+      providerProfile: CLOUDFLARE_R2_PROVIDER_PROFILE,
+    }),
+  );
+  const r2TypedPut = await r2.signUpload('typed.txt', {
+    contentType: 'text/plain',
+    expiresIn: 60,
+  });
+  assert.equal(r2TypedPut.method, 'PUT');
+  assert.equal(
+    new URL(r2TypedPut.url).searchParams.get('X-Amz-SignedHeaders'),
+    'content-type;host',
+  );
+  await assert.rejects(
+    () =>
+      r2.signUpload('bounded.txt', {
+        expiresIn: 60,
+        maxSize: 1000,
+      }),
+    (error) => error?.code === StorageErrorCode.NOT_SUPPORTED,
+  );
+  await r2.onApplicationShutdown();
+  assert.equal(serializedRequests.length, 2);
 
   await client.onApplicationShutdown();
 } finally {

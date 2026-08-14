@@ -460,6 +460,42 @@ describe.each<AdapterName>(['express', 'fastify'])(
         await app.close();
       }
     });
+
+    it('rejects AWS POST filename templates after key scoping', async () => {
+      const credentials = vi.fn(async () => ({
+        accessKeyId: 'test',
+        secretAccessKey: 'test',
+      }));
+      const app = await createApp(adapterName, 1024, {
+        defaultSignedUrlExpiresIn: 60,
+        driver: createS3StorageDriver({
+          adapter: {
+            bucket: 'private-bucket',
+            credentials: credentials as never,
+            region: 'us-east-1',
+          },
+        }),
+        maxSignedUploadBytes: 8,
+        maxSignedUrlExpiresIn: 60,
+        mode: 'signed',
+        operations: [StorageGatewayOperation.SIGN_UPLOAD],
+        signedUploadContentTypes: ['image/png'],
+      });
+      try {
+        const response = await request(app.getHttpServer())
+          .post('/storage/sign-upload')
+          .send({
+            contentType: 'image/png',
+            key: '${filename}',
+            maxSize: 8,
+          })
+          .expect(400);
+        expect(response.body.error.code).toBe('INVALID_ARGUMENT');
+        expect(credentials).not.toHaveBeenCalled();
+      } finally {
+        await app.close();
+      }
+    });
   },
 );
 

@@ -144,6 +144,16 @@ declares `{ contentType: true, sizeRange: false }` for signed uploads because
 Cloudflare supports content-type-bound presigned PUT requests but explicitly
 does not support POST form uploads. The storage gateway requires both claims
 and therefore rejects R2 signed POST uploads before calling the driver.
+Direct R2 requests carrying `minSize` or `maxSize` also fail with
+`NOT_SUPPORTED` before signing.
+
+The S3 wrapper enforces these claims per request. Content-type-constrained PUT
+URLs include `content-type` in the SigV4 signed-header set. Bounded AWS uploads
+use POST policies containing both the requested byte range and exact MIME
+condition. A lower-only `minSize`, a constraint absent from the selected
+profile, or a bounded physical key ending in AWS's `${filename}` POST variable
+fails before signing; the latter prevents the SDK from replacing an exact key
+condition with a broader prefix condition.
 
 ### Custom S3-compatible / MinIO-style endpoint
 

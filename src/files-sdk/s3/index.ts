@@ -8,6 +8,11 @@ import {
   PutObjectCommand,
   UploadPartCommand,
 } from '@aws-sdk/client-s3';
+import {
+  createPresignedPost,
+  type PresignedPostOptions,
+} from '@aws-sdk/s3-presigned-post';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { Readable } from 'node:stream';
 import {
   mapS3Error,
@@ -1140,15 +1145,126 @@ export function withS3Capabilities(
     constructionMetadata?.publicBaseUrlConfigured === true;
   const bucket = base.bucket;
   const requestAdapter: S3RequestAdapter = { bucket, raw };
+  const signedUploadUrl: S3Adapter['signedUploadUrl'] = async (
+    key,
+    signOptions,
+  ) => {
+    if (
+      signOptions.minSize !== undefined &&
+      signOptions.maxSize === undefined
+    ) {
+      throw new StorageError(
+        'S3 signed uploads cannot enforce minSize without maxSize.',
+        {
+          code: StorageErrorCode.NOT_SUPPORTED,
+          key,
+          operation: 'signUpload',
+          permanent: true,
+        },
+      );
+    }
+    if (signOptions.maxSize !== undefined && key.endsWith('${filename}')) {
+      throw new StorageError(
+        'Signed POST keys must not end with the AWS ${filename} template.',
+        {
+          code: StorageErrorCode.INVALID_ARGUMENT,
+          key,
+          operation: 'signUpload',
+          permanent: true,
+        },
+      );
+    }
+    if (
+      signOptions.contentType !== undefined &&
+      profile.signedUploadPolicy.contentType !== true
+    ) {
+      throw new StorageError(
+        `S3 provider profile "${profile.name}" cannot enforce signed-upload contentType.`,
+        {
+          code: StorageErrorCode.NOT_SUPPORTED,
+          key,
+          operation: 'signUpload',
+          permanent: true,
+        },
+      );
+    }
+    if (
+      signOptions.maxSize !== undefined &&
+      profile.signedUploadPolicy.sizeRange !== true
+    ) {
+      throw new StorageError(
+        `S3 provider profile "${profile.name}" cannot enforce signed-upload sizeRange.`,
+        {
+          code: StorageErrorCode.NOT_SUPPORTED,
+          key,
+          operation: 'signUpload',
+          permanent: true,
+        },
+      );
+    }
+
+    try {
+      if (signOptions.maxSize !== undefined) {
+        const conditions: NonNullable<PresignedPostOptions['Conditions']> = [
+          [
+            'content-length-range',
+            signOptions.minSize ?? 1,
+            signOptions.maxSize,
+          ],
+        ];
+        if (signOptions.contentType !== undefined) {
+          conditions.push(['eq', '$Content-Type', signOptions.contentType]);
+        }
+        const post = await createPresignedPost(raw, {
+          Bucket: bucket,
+          Conditions: conditions,
+          Expires: signOptions.expiresIn,
+          Key: key,
+          ...(signOptions.contentType !== undefined && {
+            Fields: { 'Content-Type': signOptions.contentType },
+          }),
+        });
+        return { fields: post.fields, method: 'POST', url: post.url };
+      }
+
+      const url = await getSignedUrl(
+        raw,
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          ...(signOptions.contentType !== undefined && {
+            ContentType: signOptions.contentType,
+          }),
+        }),
+        {
+          expiresIn: signOptions.expiresIn,
+          ...(signOptions.contentType !== undefined && {
+            signableHeaders: new Set(['content-type']),
+          }),
+        },
+      );
+      return {
+        ...(signOptions.contentType !== undefined && {
+          headers: { 'Content-Type': signOptions.contentType },
+        }),
+        method: 'PUT',
+        url,
+      };
+    } catch (error: unknown) {
+      throw mapS3Error(error);
+    }
+  };
   const adapter = Object.assign(base, {
     physicalKey: profile.physicalKey,
     signedUploadPolicy: profile.signedUploadPolicy,
+    signedUploadUrl,
     signedDownloadPolicy: Object.freeze({
       expiresIn: constructionMetadata !== undefined && !publicBaseUrlConfigured,
     }),
   } satisfies FilesSdkPhysicalKeyAdapter &
     FilesSdkSignedDownloadPolicyAdapter &
-    FilesSdkSignedUploadPolicyAdapter) as S3StorageAdapter;
+    FilesSdkSignedUploadPolicyAdapter &
+    Pick<S3Adapter, 'signedUploadUrl'>) as S3StorageAdapter;
 
   if (
     profile.conditionalCopySource !== undefined ||

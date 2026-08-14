@@ -74,3 +74,10 @@ Treat the built-in AWS profile as an immutable ceiling for every SDK client
 with native endpoint provenance, independent of mutable adapter display names.
 Explicit profiles may narrow its operations, policy bits, and key limit but
 cannot raise the 1,024-byte physical-key budget or add unsupported claims.
+
+Enforce every requested signed-upload constraint at URL creation time.
+Content-type-constrained PUT URLs now sign the `content-type` header; bounded
+AWS uploads use exact POST MIME and byte-range conditions; unsupported profile
+constraints and lower-only S3 ranges fail before signing. Bounded POST uploads
+also reject physical keys ending in AWS's `${filename}` template so an exact
+authorized key cannot be widened into a prefix policy.

@@ -626,11 +626,23 @@ policy is `{ contentType: true, sizeRange: false }` and the gateway refuses to
 mint its POST upload form. Cloudflare documents that presigned `POST` form
 uploads are not supported in its
 [presigned URL contract](https://developers.cloudflare.com/r2/api/s3/presigned-urls/).
+Direct R2 signed-upload calls that request a size bound likewise fail with
+`NOT_SUPPORTED` before signing.
 Custom S3-compatible endpoints start with no conditional operations and the
 entire driver is forced read-only until an explicit conformance-verified
 `S3ProviderProfile` is supplied. Omitting `signedUploadPolicy` while defining a
 custom profile normalizes both policy claims to `false`; providers may opt in
 only to constraints their conformance evidence proves.
+
+Successful S3 signed uploads enforce every requested constraint. A request
+with `contentType` and no `maxSize` uses a presigned PUT whose signature
+includes the `content-type` header. A request with `maxSize` uses a POST policy
+with `content-length-range` and, when present, an exact `Content-Type`
+condition. S3 cannot express a lower-only `minSize` through this contract, so
+that shape fails with `NOT_SUPPORTED`; an unclaimed profile constraint also
+fails before credentials are resolved or a URL is minted. Literal physical
+keys ending in AWS's `${filename}` POST template are rejected for bounded
+uploads because the SDK otherwise widens the exact key condition to a prefix.
 
 `withS3Capabilities()` decorates a raw S3 adapter in place and may be applied
 only once. Construct a fresh raw adapter when selecting a different profile;

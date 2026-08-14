@@ -882,6 +882,195 @@ describe('createS3StorageDriver', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it('binds AWS PUT content type and enforces bounded POST constraints', async () => {
+    const client = new StorageClient(
+      'aws-signed-upload',
+      createS3StorageDriver({ adapter }),
+    );
+
+    try {
+      const put = await client.signUpload('typed.txt', {
+        contentType: 'text/plain',
+        expiresIn: 60,
+      });
+      expect(put).toMatchObject({
+        headers: { 'Content-Type': 'text/plain' },
+        method: 'PUT',
+      });
+      expect(new URL(put.url).searchParams.get('X-Amz-SignedHeaders')).toBe(
+        'content-type;host',
+      );
+
+      const post = await client.signUpload('bounded.txt', {
+        contentType: 'text/plain',
+        expiresIn: 60,
+        maxSize: 1000,
+        minSize: 100,
+      });
+      expect(post.method).toBe('POST');
+      if (post.method !== 'POST') throw new Error('Expected signed POST.');
+      expect(post.fields['Content-Type']).toBe('text/plain');
+      const policy = JSON.parse(
+        Buffer.from(post.fields.Policy ?? '', 'base64').toString('utf8'),
+      ) as { readonly conditions?: readonly unknown[] };
+      expect(policy.conditions).toContainEqual([
+        'content-length-range',
+        100,
+        1000,
+      ]);
+      expect(policy.conditions).toContainEqual([
+        'eq',
+        '$Content-Type',
+        'text/plain',
+      ]);
+    } finally {
+      await client.onApplicationShutdown();
+    }
+  });
+
+  it('rejects S3 lower-only ranges and POST key templates before signing', async () => {
+    const credentials = vi.fn(async () => ({
+      accessKeyId: 'test',
+      secretAccessKey: 'test',
+    }));
+    const directClient = new StorageClient(
+      'aws-signed-upload-preflight',
+      createS3StorageDriver({
+        adapter: { ...adapter, credentials: credentials as never },
+      }),
+    );
+    const prefixedClient = new StorageClient(
+      'aws-prefixed-signed-upload-preflight',
+      createS3StorageDriver({
+        adapter: { ...adapter, credentials: credentials as never },
+        prefix: 'tenant',
+      }),
+    );
+    const clients = [directClient, prefixedClient];
+
+    try {
+      await expect(
+        directClient.signUpload('min-only.txt', {
+          expiresIn: 60,
+          minSize: 100,
+        }),
+      ).rejects.toMatchObject({
+        code: StorageErrorCode.NOT_SUPPORTED,
+        permanent: true,
+      });
+      for (const client of clients) {
+        await expect(
+          client.signUpload('${filename}', {
+            expiresIn: 60,
+            maxSize: 1000,
+          }),
+        ).rejects.toMatchObject({
+          code: StorageErrorCode.INVALID_ARGUMENT,
+          permanent: true,
+        });
+      }
+      expect(credentials).not.toHaveBeenCalled();
+    } finally {
+      await Promise.all(
+        clients.map((client) => client.onApplicationShutdown()),
+      );
+    }
+  });
+
+  it('signs R2 PUT content type but rejects unsupported size bounds', async () => {
+    const client = new StorageClient(
+      'r2-signed-upload',
+      createS3StorageDriver({
+        adapter: {
+          ...adapter,
+          endpoint: 'https://account.r2.cloudflarestorage.com',
+        },
+        providerProfile: CLOUDFLARE_R2_PROVIDER_PROFILE,
+      }),
+    );
+    const boundedCredentials = vi.fn(async () => ({
+      accessKeyId: 'test',
+      secretAccessKey: 'test',
+    }));
+    const boundedClient = new StorageClient(
+      'r2-bounded-signed-upload',
+      createS3StorageDriver({
+        adapter: {
+          ...adapter,
+          credentials: boundedCredentials as never,
+          endpoint: 'https://account.r2.cloudflarestorage.com',
+        },
+        providerProfile: CLOUDFLARE_R2_PROVIDER_PROFILE,
+      }),
+    );
+
+    try {
+      const put = await client.signUpload('typed.txt', {
+        contentType: 'text/plain',
+        expiresIn: 60,
+      });
+      expect(put).toMatchObject({
+        headers: { 'Content-Type': 'text/plain' },
+        method: 'PUT',
+      });
+      expect(new URL(put.url).searchParams.get('X-Amz-SignedHeaders')).toBe(
+        'content-type;host',
+      );
+      await expect(
+        boundedClient.signUpload('bounded.txt', {
+          contentType: 'text/plain',
+          expiresIn: 60,
+          maxSize: 1000,
+        }),
+      ).rejects.toMatchObject({
+        code: StorageErrorCode.NOT_SUPPORTED,
+        permanent: true,
+      });
+      expect(boundedCredentials).not.toHaveBeenCalled();
+    } finally {
+      await Promise.all([
+        client.onApplicationShutdown(),
+        boundedClient.onApplicationShutdown(),
+      ]);
+    }
+  });
+
+  it('rejects requested signed-upload constraints absent from a custom profile', async () => {
+    const credentials = vi.fn(async () => ({
+      accessKeyId: 'test',
+      secretAccessKey: 'test',
+    }));
+    const client = new StorageClient(
+      'custom-signed-upload',
+      createS3StorageDriver({
+        adapter: {
+          ...adapter,
+          credentials: credentials as never,
+          endpoint: 'https://objects.example.test',
+        },
+        providerProfile: defineS3ProviderProfile({
+          name: 'custom-without-signed-upload-constraints',
+          physicalKey: { maxBytes: 1024 },
+        }),
+      }),
+    );
+
+    try {
+      await expect(
+        client.signUpload('typed.txt', {
+          contentType: 'text/plain',
+          expiresIn: 60,
+        }),
+      ).rejects.toMatchObject({
+        code: StorageErrorCode.NOT_SUPPORTED,
+        permanent: true,
+      });
+      expect(credentials).not.toHaveBeenCalled();
+    } finally {
+      await client.onApplicationShutdown();
+    }
+  });
+
   it('hides mutation capabilities for readonly stores but retains exact reads', () => {
     const readOnly = createS3StorageDriver({ adapter, readonly: true });
 
