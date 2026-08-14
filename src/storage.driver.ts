@@ -70,6 +70,25 @@ export interface StorageDriver {
     destinationKey: string,
     options: StoragePromotionOptions,
   ): Promise<void>;
+  /**
+   * Lists one page and, when more entries remain, returns an opaque cursor for
+   * the next logical position. Cursors are bound to the request's `prefix` and
+   * `delimiter`; callers may choose a different supported `limit` when they
+   * resume.
+   *
+   * A cursor is non-consuming. Reusing it, including after following any
+   * descendant cursor, must resume from the same logical position while the
+   * provider namespace is unchanged. It must also work with an independently
+   * constructed compatible driver and client that address the same store with
+   * the same backend configuration while the provider token remains valid and
+   * available. Drivers must not make cursor state local to one process, client,
+   * or session.
+   *
+   * This contract does not provide snapshot isolation: concurrent namespace
+   * mutations may change subsequent pages. It does not guarantee provider
+   * token lifetime or backend availability, and provider invalidation remains
+   * an ordinary list-operation failure.
+   */
   list(options?: StorageListOptions): Promise<StorageListResult>;
   search(
     pattern: string | RegExp,

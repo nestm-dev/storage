@@ -3,6 +3,15 @@ export {
   isStorageWorkspaceError,
 } from './storage-workspace.error.js';
 export {
+  Aes256GcmStorageWorkspaceCursorCodec,
+  STORAGE_WORKSPACE_CURSOR_VERSION,
+  STORAGE_WORKSPACE_MAX_CURSOR_BYTES,
+  type Aes256GcmStorageWorkspaceCursorCodecOptions,
+  type StorageWorkspaceCursorCodec,
+  type StorageWorkspaceCursorConfiguration,
+  type StorageWorkspaceCursorEncodeOptions,
+} from './storage-workspace.cursor.js';
+export {
   createStorageWorkspace,
   mountStorageWorkspace,
 } from './storage-workspace.js';

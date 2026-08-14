@@ -94,6 +94,7 @@ function createWorkspaceDouble(
   const workspace = {
     permissions: permissionSet,
     limits: {
+      maxCursorBytes: 4_096,
       maxPathBytes,
       maxReadBytes: 100,
       maxWriteBytes: 200,
@@ -324,7 +325,7 @@ describe('createAiSdkWorkspaceTools', () => {
     const searchSchema = z.toJSONSchema(
       viewTool(tools, 'workspace_search').inputSchema,
     );
-    const cursor = 'a'.repeat(32);
+    const cursor = `swc1.test.${'a'.repeat(32)}`;
 
     expect(
       viewTool(tools, 'workspace_list').inputSchema.safeParse({ cursor })
@@ -332,7 +333,12 @@ describe('createAiSdkWorkspaceTools', () => {
     ).toBe(true);
     expect(
       viewTool(tools, 'workspace_list').inputSchema.safeParse({
-        cursor: 'a'.repeat(31),
+        cursor: '',
+      }).success,
+    ).toBe(false);
+    expect(
+      viewTool(tools, 'workspace_list').inputSchema.safeParse({
+        cursor: 'a'.repeat(4_097),
       }).success,
     ).toBe(false);
     expect(
@@ -346,7 +352,7 @@ describe('createAiSdkWorkspaceTools', () => {
       properties: {
         cursor: {
           description:
-            'Opaque one-use cursor returned by the preceding list call. Repeat the same directory, recursive, and limit options when continuing.',
+            'Opaque cursor returned by a preceding list call. It may be replayed before expiry while its provider continuation remains valid; repeat the same directory, recursive, and limit options when continuing.',
         },
       },
     });
@@ -354,7 +360,7 @@ describe('createAiSdkWorkspaceTools', () => {
       properties: {
         cursor: {
           description:
-            'Opaque one-use cursor returned by the preceding search call. Repeat the same query, directory, match, caseInsensitive, and limit options when continuing.',
+            'Opaque cursor returned by a preceding search call. It may be replayed before expiry while its provider continuation remains valid; repeat the same query, directory, match, caseInsensitive, and limit options when continuing.',
         },
       },
     });

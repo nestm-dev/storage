@@ -142,9 +142,13 @@ export interface StorageBufferedDownloadOptions extends StorageDownloadOptions {
 export interface StorageListOptions extends StorageOperationOptions {
   prefix?: string;
   /**
-   * Opaque, non-consuming continuation token returned by `list`. Replaying a
-   * cursor with the same options against unchanged provider state must return
-   * an equivalent page and continuation cursor.
+   * Opaque, non-consuming continuation token returned by `list`.
+   *
+   * The token is bound to the original `prefix` and `delimiter`, but callers
+   * may change `limit` when resuming. While the provider token remains valid
+   * and available, replaying it against unchanged provider state must return
+   * the same logical position; token bytes returned for the following position
+   * need not be stable.
    */
   cursor?: string;
   limit?: number;
@@ -154,7 +158,10 @@ export interface StorageListOptions extends StorageOperationOptions {
 export interface StorageListResult {
   items: StorageObjectMetadata[];
   prefixes?: string[];
-  /** Opaque replayable continuation token for the next page, when present. */
+  /**
+   * Opaque, replayable continuation token for the next logical position.
+   * See `StorageDriver.list` for the complete portability contract.
+   */
   cursor?: string;
 }
 

@@ -1,5 +1,7 @@
 import type { StorageBody, StorageOperationOptions } from '../storage.types.js';
 
+import type { StorageWorkspaceCursorConfiguration } from './storage-workspace.cursor.js';
+
 export const STORAGE_WORKSPACE_PERMISSIONS = [
   'list',
   'read',
@@ -15,6 +17,8 @@ export type StorageWorkspacePermission =
   (typeof STORAGE_WORKSPACE_PERMISSIONS)[number];
 
 export interface StorageWorkspaceLimits {
+  /** Maximum UTF-8 byte length of an opaque continuation cursor. */
+  maxCursorBytes: number;
   /** Maximum UTF-8 byte length of a workspace-relative path. */
   maxPathBytes: number;
   /** Maximum bytes returned by a buffered text read. */
@@ -27,13 +31,17 @@ export interface StorageWorkspaceLimits {
   maxSearchResults: number;
   /** Maximum objects inspected by one search query across all pages. */
   maxSearchScan: number;
-  /** Lifetime of an opaque in-memory continuation cursor. */
+  /**
+   * Authorization ceiling for an opaque continuation cursor. It does not
+   * extend the lifetime or availability of an embedded provider cursor.
+   */
   cursorTtlMs: number;
 }
 
 export const DEFAULT_STORAGE_WORKSPACE_LIMITS: Readonly<StorageWorkspaceLimits> =
   Object.freeze({
     cursorTtlMs: 5 * 60 * 1000,
+    maxCursorBytes: 4_096,
     maxPageSize: 100,
     maxPathBytes: 1024,
     maxReadBytes: 1024 * 1024,
@@ -78,6 +86,8 @@ export interface StorageWorkspaceMountOptions {
 export interface MountStorageWorkspaceOptions extends StorageWorkspaceMountOptions {
   /** Trusted backend namespace. It is never exposed through the workspace. */
   prefix: string;
+  /** Stable server-owned cursor configuration shared across serving replicas. */
+  cursor?: StorageWorkspaceCursorConfiguration;
 }
 
 export interface StorageWorkspaceReadOptions extends StorageOperationOptions {

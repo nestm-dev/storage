@@ -156,12 +156,13 @@ describe('custom provider conformance declarations', () => {
 registerConformanceSuite('Filesystem provider conformance', {
   async createFixture(): Promise<StorageProviderConformanceFixture> {
     const root = await mkdtemp(join(tmpdir(), 'nestm-storage-conformance-'));
-    const observed = observeDispatches(
-      createFsStorageDriver({ adapter: { root } }),
-    );
+    const createDriver = () => createFsStorageDriver({ adapter: { root } });
+    const observed = observeDispatches(createDriver());
     return {
       client: new StorageClient('filesystem-conformance', observed.driver),
       close: () => rm(root, { force: true, recursive: true }),
+      createReplica: () =>
+        new StorageClient('filesystem-conformance', createDriver()),
       dispatchCount: observed.dispatchCount,
     };
   },
@@ -254,18 +255,24 @@ async function createS3Fixture(
   profile: Readonly<S3ProviderProfile>,
   versionAwareCleanup: boolean,
 ): Promise<StorageProviderConformanceFixture> {
-  const observed = observeDispatches(
+  const createDriver = () =>
     createS3StorageDriver({
       adapter: adapterConfiguration(configuration),
       providerProfile: profile,
-    }),
-  );
+    });
+  const observed = observeDispatches(createDriver());
   const client = new StorageClient(
     `${profile.name}-conformance`,
     observed.driver,
   );
+  const createReplica = () =>
+    new StorageClient(`${profile.name}-conformance`, createDriver());
   if (!versionAwareCleanup) {
-    return { client, dispatchCount: observed.dispatchCount };
+    return {
+      client,
+      createReplica,
+      dispatchCount: observed.dispatchCount,
+    };
   }
 
   const raw = new S3Client(sdkConfiguration(configuration));
@@ -273,6 +280,7 @@ async function createS3Fixture(
     client,
     cleanup: (keys) => deleteS3ObjectVersions(raw, configuration.bucket, keys),
     close: () => raw.destroy(),
+    createReplica,
     dispatchCount: observed.dispatchCount,
     async resolveVersion(key): Promise<string | undefined> {
       const result = await raw.send(

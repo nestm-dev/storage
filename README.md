@@ -123,12 +123,46 @@ control characters, repeated separators, and `.` or `..` segments are rejected
 rather than normalized. Keys and provider cursors returned by a driver are also
 checked before they are converted back to logical paths.
 
+Pagination requires a server-owned cursor configuration. The built-in
+`Aes256GcmStorageWorkspaceCursorCodec` produces versioned, authenticated,
+encrypted tokens that can resume on another request, process, or replica when
+every replica constructs an equivalent codec from the same key ring and uses
+the same stable store identity, physical prefix, mount ID, trusted scope, and
+effective limits. Use one codec instance per process, use a dedicated 32-byte
+key, retain rotated decryption keys for at least one cursor TTL, and derive
+`mountId` and `scope` only from authenticated server context.
+
+The underlying driver must also implement the universal replayable list-cursor
+contract against the same logical backend namespace: its cursor cannot be
+consumed or tied to one driver instance. While the provider cursor remains
+valid and available, an outer cursor can be retried until its authenticated
+expiry. That expiry is only an authorization ceiling: it does not extend a
+provider token's lifetime or promise snapshot isolation, provider availability,
+network access, or valid credentials. Provider invalidation is an operational
+list failure, and concurrent object changes remain subject to provider
+continuation semantics. Without a codec, single-page operations still work but
+a continuation fails closed.
+
 ```ts
-import { mountStorageWorkspace } from '@nestm/storage/workspace';
+import {
+  Aes256GcmStorageWorkspaceCursorCodec,
+  mountStorageWorkspace,
+} from '@nestm/storage/workspace';
+
+// cursorKey is a separately validated 32-byte secret from deployment config.
+const cursorCodec = new Aes256GcmStorageWorkspaceCursorCodec({
+  activeKeyId: 'v1',
+  keys: { v1: cursorKey },
+});
 
 const workspace = mountStorageWorkspace(agentFiles, {
   // Use an opaque server-derived run id, never a value selected by the model.
   prefix: `workspaces/${runId}`,
+  cursor: {
+    codec: cursorCodec,
+    mountId: `agent-workspace:${runId}`,
+    scope: `organization:${organizationId}/workspace:${workspaceId}`,
+  },
   permissions: [
     'list',
     'read',
@@ -140,6 +174,8 @@ const workspace = mountStorageWorkspace(agentFiles, {
     'delete',
   ],
   limits: {
+    cursorTtlMs: 5 * 60 * 1000,
+    maxCursorBytes: 4096,
     maxReadBytes: 1024 * 1024,
     maxWriteBytes: 1024 * 1024,
     maxPageSize: 100,
@@ -233,6 +269,8 @@ import type { ToolSet } from 'ai';
                 // A validated, opaque coordinate from trusted auth/run state.
                 // It is never accepted from a prompt or tool input.
                 prefix: context.storagePrefix,
+                // Includes the singleton codec plus stable mountId and scope.
+                cursor: context.cursorConfiguration,
                 permissions: [
                   'list',
                   'read',
@@ -514,10 +552,22 @@ receive no inferred conditional capabilities.
 - pause/resume/abort through `StorageUploadControl`.
 
 Provider list cursors are opaque, non-consuming continuation tokens. Replaying
-the same cursor with the same list options against unchanged provider state
-must return an equivalent page and continuation cursor. This contract lets a
-caller safely retry or replay pagination; it does not promise snapshot
-isolation across concurrent provider mutations.
+the same cursor and page limit against unchanged provider-visible state must
+return an equivalent page and continuation position, even after a descendant
+cursor has been used. A cursor is bound to the logical store, `prefix`, and
+`delimiter`, but not to `limit`, retries, timeout, or abort signal; callers may
+change those transport/page-size options while resuming the same position.
+
+The cursor must work through a newly constructed compatible driver targeting
+the same backend namespace while the provider token remains valid and
+available; it cannot depend on process-, client-, or session-local state. An
+adapter for a consuming or instance-bound provider token must materialize a
+stable continuation before it can provide conforming paginated
+`StorageDriver.list` results. This contract lets a caller safely retry, replay,
+or resume pagination on another replica. It does not promise a provider-token
+lifetime, snapshot isolation across concurrent mutations, or provider,
+network, credential, or authorization availability. Provider invalidation is
+an ordinary list-operation failure.
 
 Downloads are streaming by default:
 

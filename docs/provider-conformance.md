@@ -4,8 +4,8 @@
 `createStorageProviderConformanceCases()`, a runner-agnostic contract harness
 for the conditional storage boundary. It verifies the exact declared
 capability matrix, supported operations, fail-closed unsupported operations,
-the complete physical-key byte budget, conflict normalization, and public
-error sanitation.
+replayable and replica-portable list cursors, the complete physical-key byte
+budget, conflict normalization, and public error sanitation.
 
 Every failure observed by the harness must be log-safe as a nested object, via
 `util.inspect`, and via JSON serialization. Provider bodies, request/host IDs,
@@ -50,16 +50,41 @@ discarded and refreshed from provider metadata before mutation tests run.
 
 ## List cursor replay contract
 
-Provider list cursors are opaque and non-consuming. Reusing the same cursor
-with the same prefix, delimiter, and page limit against unchanged provider
-state must return an equivalent page and the same continuation state. The
-conformance harness creates three objects, advances beyond a cursor-backed
-page, then replays the original cursor and compares the full page metadata and
-next cursor. A consuming or unstable provider cursor fails conformance; callers
-must not advertise replayable higher-level cursors for that provider.
+Provider list cursors are opaque, non-consuming, and portable. They are bound
+to the original `prefix` and `delimiter`, but not to `limit`: callers may choose
+a different supported page size when they resume. Against unchanged provider
+state, reusing a cursor must resume from the same logical position even after a
+caller has followed a descendant cursor.
 
-This is an idempotent-replay guarantee, not snapshot isolation. Results may
-change when another actor mutates the provider namespace between list calls.
+The same token must work through an independently constructed compatible
+`StorageDriver` and `StorageClient` that address the same logical store with the
+same backend configuration while the provider cursor remains valid and
+available. A driver therefore cannot keep cursor state only in process memory
+or bind it to one client/session.
+
+Equivalent continuation positions do not require byte-identical continuation
+tokens. The harness always runs a delimiter-free case and additionally covers
+common prefixes when the driver advertises delimiter support. It follows a
+one-entry page and its descendant, replays the ancestor, changes the page limit,
+and repeats both page sizes through a fresh replica. It compares page metadata,
+common prefixes, and the page reached by each returned continuation instead of
+comparing opaque token bytes. A partial page with matching entries remaining
+must include a cursor; silently omitting one is a contract failure, not an
+opt-out. Fixtures must provide `createReplica()` using a new driver and client
+for the same root, bucket, logical store name, and provider configuration; the
+harness shuts that client down even when a case fails.
+
+A one-shot, session-bound, or otherwise consuming custom driver violates the
+public `StorageDriver.list` contract and fails this case. Such a driver must be
+adapted to issue stable portable cursors before it can implement
+`StorageDriver`.
+
+This is an idempotent-replay guarantee, not snapshot isolation or a cursor
+lifetime/uptime SLA. Results may change when another actor mutates the provider
+namespace between list calls. Provider token invalidation and ordinary backend,
+network, credential, or authorization failures may still make a list request
+fail. The deterministic harness proves immediate replay and replica portability;
+it does not time-prove provider cursor retention.
 
 ## Combined copy atomicity
 
@@ -220,7 +245,8 @@ register each returned case with their test runner. A case may return
 `{ status: "skipped", reason }` for a provider prerequisite such as bucket
 versioning; translate that result into the runner's native skip mechanism.
 
-Fixtures can supply provider-aware cleanup and a version resolver:
+Fixtures supply an independently constructed replica for cursor portability
+checks and may also supply provider-aware cleanup and a version resolver:
 
 ```ts
 import {
@@ -233,6 +259,7 @@ const options: StorageProviderConformanceOptions = {
   expected: verifiedCapabilities,
   createFixture: async () => ({
     client: await createDedicatedTestClient(),
+    createReplica: createAnotherClientForTheSameStore,
     cleanup: deleteEveryTestObjectIdentity,
     resolveVersion: resolveCurrentProviderVersion,
   }),
