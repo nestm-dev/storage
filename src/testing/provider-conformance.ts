@@ -20,6 +20,7 @@ import type {
   StorageObject,
   StorageListResult,
   StoragePhysicalKeyCapability,
+  StorageSignedUploadPolicyCapability,
   StorageUploadResult,
 } from '../storage.types.js';
 
@@ -44,6 +45,7 @@ export interface StorageProviderConformanceCapabilities {
   readonly conditionalCopyDestination?: StorageConditionalCopyDestinationCapability;
   readonly conditionalMultipartCompletion?: StorageConditionalMultipartCompletionCapability;
   readonly physicalKey: StoragePhysicalKeyCapability;
+  readonly signedUploadPolicy?: StorageSignedUploadPolicyCapability;
 }
 
 export interface StorageProviderConformanceFixture {
@@ -123,7 +125,7 @@ export function createStorageProviderConformanceCases(
   return Object.freeze([
     providerCase(
       options,
-      'declares the exact conditional capability matrix',
+      'declares the exact provider capability matrix',
       ({ client }) => {
         deepStrictEqual(
           conditionalCapabilitiesOf(client.capabilities),
@@ -1250,6 +1252,9 @@ function conditionalCapabilitiesOf(
   return {
     ...conditional,
     physicalKey: capabilities.physicalKey,
+    ...(capabilities.signedUploadPolicy === undefined
+      ? {}
+      : { signedUploadPolicy: capabilities.signedUploadPolicy }),
   };
 }
 

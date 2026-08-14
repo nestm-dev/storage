@@ -61,3 +61,16 @@ semantics instead of duplicating its matcher logic. The innermost dispatch guard
 repeats these checks after supported in-process plugins have transformed an
 operation; adapters and plugins remain trusted code rather than a sandbox
 boundary.
+
+Derive signed-upload policy claims from the branded provider profile instead
+of granting them to every S3-compatible endpoint. Native AWS proves content
+type and POST size-range enforcement; Cloudflare R2 proves content type but not
+POST form size ranges; omitted custom declarations normalize to false/false so
+the gateway fails closed. Profile authority is backed by a package-private
+WeakSet after deep freezing, so reflecting and copying the nominal brand symbol
+cannot forge conformance evidence.
+
+Treat the built-in AWS profile as an immutable ceiling for every SDK client
+with native endpoint provenance, independent of mutable adapter display names.
+Explicit profiles may narrow its operations, policy bits, and key limit but
+cannot raise the 1,024-byte physical-key budget or add unsupported claims.

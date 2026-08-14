@@ -105,6 +105,7 @@ describe('custom provider conformance declarations', () => {
       },
       conditionalMultipartCompletion: { create: true, replace: false },
       physicalKey: { maxBytes: 2048 },
+      signedUploadPolicy: { contentType: false, sizeRange: false },
     });
   });
 
@@ -389,6 +390,7 @@ function capabilitiesFromProfile(
 ): StorageProviderConformanceCapabilities {
   return {
     physicalKey: profile.physicalKey,
+    signedUploadPolicy: profile.signedUploadPolicy,
     ...(profile.conditionalCreate === undefined
       ? {}
       : { conditionalCreate: profile.conditionalCreate }),

@@ -130,6 +130,94 @@ describe('createS3StorageDriver', () => {
     });
   });
 
+  it('rejects canonical and renamed native profiles that widen the immutable AWS key ceiling before dispatch', () => {
+    const send = vi.spyOn(S3Client.prototype, 'send');
+    const widened = defineS3ProviderProfile({
+      name: 'invalid-widened-native-aws',
+      physicalKey: { maxBytes: 2048 },
+    });
+    const canonical = s3(adapter);
+    const renamedBase = s3(adapter);
+    const renamed = { ...renamedBase, name: 'renamed-native-s3' };
+
+    try {
+      expect(() =>
+        withS3Capabilities(canonical, { providerProfile: widened }),
+      ).toThrow(/cannot widen aws-s3-general-purpose physicalKey\.maxBytes/u);
+      expect(() =>
+        withS3Capabilities(renamed, { providerProfile: widened }),
+      ).toThrow(/cannot widen aws-s3-general-purpose physicalKey\.maxBytes/u);
+      const recovered = withS3Capabilities(canonical, {
+        providerProfile: defineS3ProviderProfile({
+          name: 'valid-after-rejected-widening',
+          physicalKey: { maxBytes: 512 },
+        }),
+      });
+      expect(recovered.physicalKey).toEqual({ maxBytes: 512 });
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      canonical.raw.destroy();
+      renamedBase.raw.destroy();
+      send.mockRestore();
+    }
+  });
+
+  it('allows an explicit native profile that narrows every AWS claim', async () => {
+    const send = vi.spyOn(S3Client.prototype, 'send');
+    const narrow = defineS3ProviderProfile({
+      name: 'narrow-native-aws',
+      physicalKey: { maxBytes: 512 },
+      signedUploadPolicy: { contentType: true, sizeRange: false },
+      conditionalRead: { etag: true, version: false },
+    });
+    const driver = createS3StorageDriver({
+      adapter,
+      providerProfile: narrow,
+    });
+    const client = new StorageClient('narrow-native', driver);
+
+    try {
+      expect(driver.capabilities).toMatchObject({
+        conditionalRead: { etag: true, version: false },
+        physicalKey: { maxBytes: 512 },
+        signedUploadPolicy: { contentType: true, sizeRange: false },
+      });
+      expect(driver.capabilities.conditionalCreate).toBeUndefined();
+      await expect(
+        client.upload('x'.repeat(513), 'blocked'),
+      ).rejects.toMatchObject({
+        code: StorageErrorCode.LIMIT_EXCEEDED,
+        permanent: true,
+      });
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      await client.onApplicationShutdown();
+      send.mockRestore();
+    }
+  });
+
+  it('does not apply the native AWS key ceiling to an explicitly verified custom endpoint', () => {
+    const custom = s3({
+      ...adapter,
+      endpoint: 'https://audited.objects.example.test',
+    });
+    try {
+      const decorated = withS3Capabilities(custom, {
+        providerProfile: defineS3ProviderProfile({
+          name: 'custom-larger-key-budget',
+          physicalKey: { maxBytes: 2048 },
+        }),
+      });
+      expect(decorated.physicalKey).toEqual({ maxBytes: 2048 });
+      expect(decorated.signedUploadPolicy).toEqual({
+        contentType: false,
+        sizeRange: false,
+      });
+    } finally {
+      custom.raw.destroy();
+    }
+  });
+
   it.each([
     ['AWS_ENDPOINT_URL', 'https://global-redirect.invalid'],
     ['AWS_ENDPOINT_URL_S3', 'https://service-redirect.invalid'],
@@ -220,6 +308,10 @@ describe('createS3StorageDriver', () => {
         providerProfile: verified,
       });
       expect(audited.conditionalRead).toEqual({ etag: true, version: false });
+      expect(audited.signedUploadPolicy).toEqual({
+        contentType: false,
+        sizeRange: false,
+      });
       expect(await resolvedHeadHostname(auditedCustom.raw)).toBe(
         'private-bucket.audited.objects.example.test',
       );
@@ -774,6 +866,7 @@ describe('createS3StorageDriver', () => {
       conditionalRead: { etag: true, version: false },
       conditionalReplace: { resultEtag: true },
       physicalKey: { maxBytes: 1024 },
+      signedUploadPolicy: { contentType: true, sizeRange: false },
     });
     expect(r2.capabilities.conditionalDelete).toBeUndefined();
     expect(r2.capabilities.conditionalCopyDestination).toBeUndefined();
@@ -909,6 +1002,15 @@ describe('createS3StorageDriver', () => {
 
   it('validates dependent profile capabilities', () => {
     expect(Object.isFrozen(AWS_S3_PROVIDER_PROFILE)).toBe(true);
+    const conservativeUpload = defineS3ProviderProfile({
+      name: 'default-signed-upload-policy',
+      physicalKey: { maxBytes: 1024 },
+    });
+    expect(conservativeUpload.signedUploadPolicy).toEqual({
+      contentType: false,
+      sizeRange: false,
+    });
+    expect(Object.isFrozen(conservativeUpload.signedUploadPolicy)).toBe(true);
     expect(() =>
       createS3StorageDriver({
         adapter: { ...adapter, endpoint: 'https://objects.example.test' },
@@ -918,6 +1020,13 @@ describe('createS3StorageDriver', () => {
         } as never,
       }),
     ).toThrow(/must be created with defineS3ProviderProfile/u);
+    expect(() =>
+      defineS3ProviderProfile({
+        name: 'incomplete-signed-upload-policy',
+        physicalKey: { maxBytes: 1024 },
+        signedUploadPolicy: { contentType: true } as never,
+      }),
+    ).toThrow(/signedUploadPolicy\.sizeRange must be a boolean/u);
     expect(() =>
       defineS3ProviderProfile({
         name: 'incomplete-read',
@@ -944,6 +1053,38 @@ describe('createS3StorageDriver', () => {
         },
       }),
     ).toThrow(/enable at least one source-copy condition/u);
+  });
+
+  it('rejects reflected profile-brand forgeries for native and custom endpoints', () => {
+    const brand = Object.getOwnPropertySymbols(AWS_S3_PROVIDER_PROFILE)[0];
+    expect(brand).toBeDefined();
+    const forged = {
+      ...AWS_S3_PROVIDER_PROFILE,
+      name: 'forged-profile',
+      physicalKey: { maxBytes: 1024 },
+      signedUploadPolicy: { contentType: true, sizeRange: true },
+    };
+    Object.defineProperty(forged, brand as symbol, {
+      enumerable: false,
+      value: true,
+    });
+    const native = s3(adapter);
+    const custom = s3({
+      ...adapter,
+      endpoint: 'https://objects.example.test',
+    });
+
+    try {
+      expect(() =>
+        withS3Capabilities(native, { providerProfile: forged as never }),
+      ).toThrow(/must be created with defineS3ProviderProfile/u);
+      expect(() =>
+        withS3Capabilities(custom, { providerProfile: forged as never }),
+      ).toThrow(/must be created with defineS3ProviderProfile/u);
+    } finally {
+      native.raw.destroy();
+      custom.raw.destroy();
+    }
   });
 
   it('does not claim expiring downloads for a permanent public base URL', () => {

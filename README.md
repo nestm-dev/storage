@@ -620,9 +620,17 @@ source or destination predicate.
 Cloudflare R2 has a separate stable profile: create, replace, ETag-conditioned
 read, and ETag-conditioned source copy are enabled, while conditional delete,
 destination copy, atomic promotion, version predicates, and conditional
-multipart completion remain absent. Custom S3-compatible endpoints start with
-no conditional operations and the entire driver is forced read-only until an
-explicit conformance-verified `S3ProviderProfile` is supplied.
+multipart completion remain absent. R2 proves content-type binding for
+presigned PUT requests but not POST-form size ranges, so its signed-upload
+policy is `{ contentType: true, sizeRange: false }` and the gateway refuses to
+mint its POST upload form. Cloudflare documents that presigned `POST` form
+uploads are not supported in its
+[presigned URL contract](https://developers.cloudflare.com/r2/api/s3/presigned-urls/).
+Custom S3-compatible endpoints start with no conditional operations and the
+entire driver is forced read-only until an explicit conformance-verified
+`S3ProviderProfile` is supplied. Omitting `signedUploadPolicy` while defining a
+custom profile normalizes both policy claims to `false`; providers may opt in
+only to constraints their conformance evidence proves.
 
 `withS3Capabilities()` decorates a raw S3 adapter in place and may be applied
 only once. Construct a fresh raw adapter when selecting a different profile;
@@ -631,6 +639,12 @@ a later narrower declaration. The selected profile is bound to the exact
 reserved capability and operation members installed by that decoration;
 same-client aliases may change display metadata but cannot add or replace those
 members to widen the profile.
+
+An explicit profile applied to a native AWS SDK endpoint may only narrow the
+immutable `AWS_S3_PROVIDER_PROFILE`. It cannot raise the complete-key budget
+above 1,024 bytes or claim an operation/policy bit absent from the built-in
+profile. This containment follows actual SDK endpoint provenance even when an
+adapter alias changes its display name.
 
 The package-owned `s3()` factory also retains whether `publicBaseUrl` was
 configured even when the second `withS3Capabilities()` options object is
@@ -778,8 +792,11 @@ by `maxSignedUploadBytes`, and require an exact lowercase MIME type from
 `attachment` or `inline` response disposition; arbitrary response-header text
 and filenames are rejected. A driver must also advertise
 `signedUploadPolicy.contentType` and `signedUploadPolicy.sizeRange`; otherwise
-the gateway refuses to mint the URL. `createS3StorageDriver()` advertises both
-and uses S3 POST policy conditions. Signed downloads similarly require
+the gateway refuses to mint the URL. Native AWS advertises both and uses S3
+POST policy conditions. R2 advertises content-type enforcement but not a POST
+size range, while omitted custom declarations normalize both claims to false;
+the gateway therefore fails closed for those profiles. Signed downloads
+similarly require
 `signedDownloadPolicy.expiresIn`. The S3 factory advertises it only when no
 permanent `publicBaseUrl` was configured, preventing a configured TTL from
 silently returning a non-expiring public link.

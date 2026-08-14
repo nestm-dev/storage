@@ -121,7 +121,10 @@ STORAGE_CONFORMANCE_AWS_SECRET_ACCESS_KEY=replace-with-test-secret-key
 The suite uses `AWS_S3_PROVIDER_PROFILE` and therefore exercises conditional
 create, replace, delete, ETag/version reads, source- and
 destination-conditioned promotion, atomic combined promotion, and conditional
-multipart completion.
+multipart completion. AWS also declares provider-enforced content type and size
+range constraints for signed POST uploads. An explicit profile applied to a
+native AWS endpoint may narrow this built-in profile but cannot raise its
+1,024-byte physical-key ceiling or add any operation/policy claim.
 
 ### Cloudflare R2
 
@@ -136,7 +139,11 @@ STORAGE_CONFORMANCE_R2_SECRET_ACCESS_KEY=replace-with-test-secret-key
 
 The suite uses `CLOUDFLARE_R2_PROVIDER_PROFILE`. It verifies R2 independently
 and asserts that unclaimed delete, destination-promotion, version, and
-multipart-completion operations fail with `NOT_SUPPORTED` before mutation.
+multipart-completion operations fail with `NOT_SUPPORTED` before mutation. R2
+declares `{ contentType: true, sizeRange: false }` for signed uploads because
+Cloudflare supports content-type-bound presigned PUT requests but explicitly
+does not support POST form uploads. The storage gateway requires both claims
+and therefore rejects R2 signed POST uploads before calling the driver.
 
 ### Custom S3-compatible / MinIO-style endpoint
 
@@ -176,6 +183,12 @@ tokens are:
 - `atomic-promotion`
 - `multipart-create`
 - `multipart-replace`
+
+The conformance test's custom profile omits `signedUploadPolicy`, which the
+branded profile builder normalizes to `{ contentType: false, sizeRange: false }`.
+Applications may declare either policy bit only after independently verifying
+the endpoint's actual signed-upload implementation; the conditional-operation
+token list does not attest signed POST policy behavior.
 
 `atomic-promotion` requires at least one `copy-source-*` token and one
 `copy-destination-*` token. Destination-copy support may be declared on its

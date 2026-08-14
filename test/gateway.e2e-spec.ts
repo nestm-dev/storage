@@ -24,7 +24,10 @@ import {
 } from '../src/gateway/index.js';
 import { StorageModule } from '../src/storage.module.js';
 import type { StorageDriver } from '../src/storage.driver.js';
-import { createS3StorageDriver } from '../src/files-sdk/s3/index.js';
+import {
+  CLOUDFLARE_R2_PROVIDER_PROFILE,
+  createS3StorageDriver,
+} from '../src/files-sdk/s3/index.js';
 import { createMemoryStorageDriver } from '../src/testing/index.js';
 
 let guardCalls = 0;
@@ -414,6 +417,45 @@ describe.each<AdapterName>(['express', 'fastify'])(
           .expect(201);
         const url = new URL(download.body.data.url);
         expect(url.searchParams.get('X-Amz-Expires')).toBe('60');
+      } finally {
+        await app.close();
+      }
+    });
+
+    it('refuses to mint an R2 POST upload when size limits are not provider-enforced', async () => {
+      const driver = createS3StorageDriver({
+        adapter: {
+          bucket: 'private-bucket',
+          credentials: {
+            accessKeyId: 'test',
+            secretAccessKey: 'test',
+          },
+          endpoint: 'https://account.r2.cloudflarestorage.com',
+          region: 'auto',
+        },
+        providerProfile: CLOUDFLARE_R2_PROVIDER_PROFILE,
+      });
+      const signUpload = vi.spyOn(driver, 'signUpload');
+      const app = await createApp(adapterName, 1024, {
+        defaultSignedUrlExpiresIn: 60,
+        driver,
+        maxSignedUploadBytes: 8,
+        maxSignedUrlExpiresIn: 60,
+        mode: 'signed',
+        operations: [StorageGatewayOperation.SIGN_UPLOAD],
+        signedUploadContentTypes: ['image/png'],
+      });
+      try {
+        const response = await request(app.getHttpServer())
+          .post('/storage/sign-upload')
+          .send({ contentType: 'image/png', key: 'image.png', maxSize: 8 })
+          .expect(501);
+        expect(response.body.error.code).toBe('NOT_SUPPORTED');
+        expect(driver.capabilities.signedUploadPolicy).toEqual({
+          contentType: true,
+          sizeRange: false,
+        });
+        expect(signUpload).not.toHaveBeenCalled();
       } finally {
         await app.close();
       }

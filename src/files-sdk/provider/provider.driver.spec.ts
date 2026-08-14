@@ -123,6 +123,32 @@ describe('createProviderStorageDriver', () => {
     });
   });
 
+  it('rejects a native S3 profile that widens the AWS key ceiling before dispatch', async () => {
+    const send = vi.spyOn(S3Client.prototype, 'send');
+    try {
+      await expect(
+        createProviderStorageDriver({
+          config: {
+            accessKeyId: 'test',
+            bucket: 'artifacts',
+            region: 'us-east-1',
+            secretAccessKey: 'test',
+          },
+          provider: 's3',
+          s3ProviderProfile: defineS3ProviderProfile({
+            name: 'invalid-widened-provider-native',
+            physicalKey: { maxBytes: 2048 },
+          }),
+        }),
+      ).rejects.toThrow(
+        /cannot widen aws-s3-general-purpose physicalKey\.maxBytes/u,
+      );
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      send.mockRestore();
+    }
+  });
+
   it('forces a configJson-resolved unverified S3 endpoint read-only without dispatch', async () => {
     const send = vi
       .spyOn(S3Client.prototype, 'send')
@@ -239,6 +265,10 @@ describe('createProviderStorageDriver', () => {
     expect(driver.capabilities.conditionalReplace).toBeUndefined();
     expect(driver.capabilities.physicalKey).toEqual({ maxBytes: 512 });
     expect(driver.capabilities.signedUpload).toBe('runtime');
+    expect(driver.capabilities.signedUploadPolicy).toEqual({
+      contentType: false,
+      sizeRange: false,
+    });
   });
 
   it('rejects an S3 profile for a different provider', async () => {

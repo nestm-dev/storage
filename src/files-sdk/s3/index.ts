@@ -64,8 +64,9 @@ export interface S3StorageDriverOptions extends Omit<
   adapter: S3AdapterOptions;
   /**
    * Exact, conformance-verified provider behavior. Native AWS S3 uses the
-   * built-in AWS profile when no endpoint override is present. Endpoint
-   * overrides without an explicit profile force the whole driver read-only.
+   * built-in AWS profile when no endpoint override is present; an explicit
+   * native profile may only narrow that immutable ceiling. Endpoint overrides
+   * without an explicit profile force the whole driver read-only.
    */
   providerProfile?: S3ProviderProfile;
 }
@@ -80,19 +81,31 @@ type S3ProfileCapabilities = Pick<
   | 'conditionalCopyDestination'
   | 'conditionalMultipartCompletion'
   | 'physicalKey'
+  | 'signedUploadPolicy'
 >;
 
 const verifiedS3ProviderProfile = Symbol('verifiedS3ProviderProfile');
+const verifiedS3ProviderProfiles = new WeakSet<object>();
 
 export interface S3ProviderProfileInput extends S3ProfileCapabilities {
   /** Stable profile identity for configuration, diagnostics, and audit. */
   readonly name: string;
   /** Every S3-compatible profile must declare its complete-key byte budget. */
   readonly physicalKey: NonNullable<S3ProfileCapabilities['physicalKey']>;
+  /** Constraints the provider proves; omission defaults both claims to false. */
+  readonly signedUploadPolicy?: NonNullable<
+    S3ProfileCapabilities['signedUploadPolicy']
+  >;
 }
 
 /** A validated profile created by {@link defineS3ProviderProfile}. */
-export type S3ProviderProfile = Readonly<S3ProviderProfileInput> & {
+export type S3ProviderProfile = Readonly<
+  Omit<S3ProviderProfileInput, 'signedUploadPolicy'> & {
+    readonly signedUploadPolicy: NonNullable<
+      S3ProfileCapabilities['signedUploadPolicy']
+    >;
+  }
+> & {
   readonly [verifiedS3ProviderProfile]: true;
 };
 
@@ -122,6 +135,16 @@ export function defineS3ProviderProfile(
   }
 
   const booleanFields = [
+    [
+      profile.signedUploadPolicy !== undefined,
+      'signedUploadPolicy.contentType',
+      profile.signedUploadPolicy?.contentType,
+    ],
+    [
+      profile.signedUploadPolicy !== undefined,
+      'signedUploadPolicy.sizeRange',
+      profile.signedUploadPolicy?.sizeRange,
+    ],
     [
       profile.conditionalCreate !== undefined,
       'conditionalCreate.resultEtag',
@@ -221,9 +244,18 @@ export function defineS3ProviderProfile(
     );
   }
 
-  const clone: S3ProviderProfileInput = {
+  const clone: Omit<S3ProviderProfileInput, 'signedUploadPolicy'> & {
+    readonly signedUploadPolicy: NonNullable<
+      S3ProfileCapabilities['signedUploadPolicy']
+    >;
+  } = {
     name: profile.name.trim(),
     physicalKey: Object.freeze({ ...profile.physicalKey }),
+    signedUploadPolicy: Object.freeze(
+      profile.signedUploadPolicy === undefined
+        ? { contentType: false, sizeRange: false }
+        : { ...profile.signedUploadPolicy },
+    ),
     ...(profile.conditionalCreate !== undefined && {
       conditionalCreate: Object.freeze({ ...profile.conditionalCreate }),
     }),
@@ -258,23 +290,151 @@ export function defineS3ProviderProfile(
     value: true,
     writable: false,
   });
-  return Object.freeze(clone) as S3ProviderProfile;
+  const verified = Object.freeze(clone) as S3ProviderProfile;
+  verifiedS3ProviderProfiles.add(verified);
+  return verified;
 }
 
 function assertVerifiedS3ProviderProfile(profile: S3ProviderProfile): void {
-  const candidate = profile as unknown as {
-    readonly [verifiedS3ProviderProfile]?: unknown;
-  };
-  if (candidate[verifiedS3ProviderProfile] !== true) {
+  if (
+    typeof profile !== 'object' ||
+    profile === null ||
+    !verifiedS3ProviderProfiles.has(profile)
+  ) {
     throw new TypeError(
       'providerProfile must be created with defineS3ProviderProfile().',
     );
   }
 }
 
+function assertS3ProviderProfileContainedBy(
+  profile: S3ProviderProfile,
+  ceiling: S3ProviderProfile,
+): void {
+  if (profile.physicalKey.maxBytes > ceiling.physicalKey.maxBytes) {
+    throw new TypeError(
+      `S3 provider profile "${profile.name}" cannot widen ${ceiling.name} physicalKey.maxBytes beyond ${ceiling.physicalKey.maxBytes}.`,
+    );
+  }
+
+  const operationCapabilities = [
+    ['conditionalCreate', profile.conditionalCreate, ceiling.conditionalCreate],
+    [
+      'conditionalReplace',
+      profile.conditionalReplace,
+      ceiling.conditionalReplace,
+    ],
+    ['conditionalDelete', profile.conditionalDelete, ceiling.conditionalDelete],
+    ['conditionalRead', profile.conditionalRead, ceiling.conditionalRead],
+    [
+      'conditionalCopySource',
+      profile.conditionalCopySource,
+      ceiling.conditionalCopySource,
+    ],
+    [
+      'conditionalCopyDestination',
+      profile.conditionalCopyDestination,
+      ceiling.conditionalCopyDestination,
+    ],
+    [
+      'conditionalMultipartCompletion',
+      profile.conditionalMultipartCompletion,
+      ceiling.conditionalMultipartCompletion,
+    ],
+  ] as const;
+  for (const [name, declared, supported] of operationCapabilities) {
+    if (declared !== undefined && supported === undefined) {
+      throw new TypeError(
+        `S3 provider profile "${profile.name}" cannot widen ${ceiling.name} with ${name}.`,
+      );
+    }
+  }
+
+  const booleanClaims = [
+    [
+      'signedUploadPolicy.contentType',
+      profile.signedUploadPolicy.contentType,
+      ceiling.signedUploadPolicy.contentType,
+    ],
+    [
+      'signedUploadPolicy.sizeRange',
+      profile.signedUploadPolicy.sizeRange,
+      ceiling.signedUploadPolicy.sizeRange,
+    ],
+    [
+      'conditionalCreate.resultEtag',
+      profile.conditionalCreate?.resultEtag,
+      ceiling.conditionalCreate?.resultEtag,
+    ],
+    [
+      'conditionalReplace.resultEtag',
+      profile.conditionalReplace?.resultEtag,
+      ceiling.conditionalReplace?.resultEtag,
+    ],
+    [
+      'conditionalDelete.etag',
+      profile.conditionalDelete?.etag,
+      ceiling.conditionalDelete?.etag,
+    ],
+    [
+      'conditionalRead.etag',
+      profile.conditionalRead?.etag,
+      ceiling.conditionalRead?.etag,
+    ],
+    [
+      'conditionalRead.version',
+      profile.conditionalRead?.version,
+      ceiling.conditionalRead?.version,
+    ],
+    [
+      'conditionalCopySource.etag',
+      profile.conditionalCopySource?.etag,
+      ceiling.conditionalCopySource?.etag,
+    ],
+    [
+      'conditionalCopySource.version',
+      profile.conditionalCopySource?.version,
+      ceiling.conditionalCopySource?.version,
+    ],
+    [
+      'conditionalCopyDestination.create',
+      profile.conditionalCopyDestination?.create,
+      ceiling.conditionalCopyDestination?.create,
+    ],
+    [
+      'conditionalCopyDestination.replace',
+      profile.conditionalCopyDestination?.replace,
+      ceiling.conditionalCopyDestination?.replace,
+    ],
+    [
+      'conditionalCopyDestination.atomicWithSource',
+      profile.conditionalCopyDestination?.atomicWithSource,
+      ceiling.conditionalCopyDestination?.atomicWithSource,
+    ],
+    [
+      'conditionalMultipartCompletion.create',
+      profile.conditionalMultipartCompletion?.create,
+      ceiling.conditionalMultipartCompletion?.create,
+    ],
+    [
+      'conditionalMultipartCompletion.replace',
+      profile.conditionalMultipartCompletion?.replace,
+      ceiling.conditionalMultipartCompletion?.replace,
+    ],
+  ] as const;
+  for (const [name, declared, supported] of booleanClaims) {
+    if (declared === true && supported !== true) {
+      throw new TypeError(
+        `S3 provider profile "${profile.name}" cannot widen ${ceiling.name} with ${name}.`,
+      );
+    }
+  }
+}
+
 export const AWS_S3_PROVIDER_PROFILE = defineS3ProviderProfile({
   name: 'aws-s3-general-purpose',
   physicalKey: { maxBytes: 1024 },
+  signedUploadPolicy: { contentType: true, sizeRange: true },
   conditionalCreate: { resultEtag: true },
   conditionalReplace: { resultEtag: true },
   conditionalDelete: { etag: true },
@@ -291,6 +451,7 @@ export const AWS_S3_PROVIDER_PROFILE = defineS3ProviderProfile({
 export const CLOUDFLARE_R2_PROVIDER_PROFILE = defineS3ProviderProfile({
   name: 'cloudflare-r2-stable',
   physicalKey: { maxBytes: 1024 },
+  signedUploadPolicy: { contentType: true, sizeRange: false },
   conditionalCreate: { resultEtag: true },
   conditionalReplace: { resultEtag: true },
   conditionalRead: { etag: true, version: false },
@@ -300,6 +461,7 @@ export const CLOUDFLARE_R2_PROVIDER_PROFILE = defineS3ProviderProfile({
 const UNVERIFIED_S3_PROVIDER_PROFILE = defineS3ProviderProfile({
   name: 'unverified-s3-compatible',
   physicalKey: { maxBytes: 1024 },
+  signedUploadPolicy: { contentType: false, sizeRange: false },
 });
 
 type S3StorageAdapterBase = S3Adapter &
@@ -926,7 +1088,8 @@ export function s3(options: S3AdapterOptions): S3Adapter {
 /**
  * Adds only the exact operations declared by one verified provider profile.
  * Each raw adapter may be decorated once so capability state cannot depend on
- * profile application order.
+ * profile application order. A native AWS SDK endpoint also bounds every
+ * explicit profile by the built-in AWS capability ceiling.
  */
 export function withS3Capabilities(
   base: S3Adapter,
@@ -960,6 +1123,9 @@ export function withS3Capabilities(
       ? AWS_S3_PROVIDER_PROFILE
       : UNVERIFIED_S3_PROVIDER_PROFILE);
   assertVerifiedS3ProviderProfile(profile);
+  if (!sdkHasCustomEndpoint) {
+    assertS3ProviderProfileContainedBy(profile, AWS_S3_PROVIDER_PROFILE);
+  }
   const provenance =
     options.providerProfile === undefined
       ? inferredNativeAws
@@ -976,7 +1142,7 @@ export function withS3Capabilities(
   const requestAdapter: S3RequestAdapter = { bucket, raw };
   const adapter = Object.assign(base, {
     physicalKey: profile.physicalKey,
-    signedUploadPolicy: Object.freeze({ contentType: true, sizeRange: true }),
+    signedUploadPolicy: profile.signedUploadPolicy,
     signedDownloadPolicy: Object.freeze({
       expiresIn: constructionMetadata !== undefined && !publicBaseUrlConfigured,
     }),

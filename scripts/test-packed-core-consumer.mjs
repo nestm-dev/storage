@@ -397,6 +397,23 @@ try {
     region: 'us-east-1',
   };
 
+  const widenedNative = s3(baseAdapterOptions);
+  try {
+    assert.throws(
+      () =>
+        withS3Capabilities(widenedNative, {
+          providerProfile: defineS3ProviderProfile({
+            name: 'invalid-widened-minimum-peer-native',
+            physicalKey: { maxBytes: 2048 },
+          }),
+        }),
+      /cannot widen aws-s3-general-purpose physicalKey\\.maxBytes/u,
+    );
+  } finally {
+    widenedNative.raw.destroy();
+  }
+  assert.equal(serializedRequests.length, 0);
+
   const forgedUndecorated = s3(baseAdapterOptions);
   try {
     Object.defineProperty(
@@ -490,6 +507,10 @@ try {
     }),
   });
   try {
+    assert.deepEqual(narrowAdapter.signedUploadPolicy, {
+      contentType: false,
+      sizeRange: false,
+    });
     assert.throws(
       () =>
         createFilesSdkDriver({
