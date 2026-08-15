@@ -1,6 +1,6 @@
 {
   "name": "@nestm/storage",
-  "version": "0.1.0-alpha.7",
+  "version": "0.1.0-alpha.8",
   "description": "Framework-neutral storage clients, capability-scoped agent workspaces, NestJS 12 integration, and guarded HTTP access.",
   "license": "MIT",
   "author": "Kauan Guesser",
