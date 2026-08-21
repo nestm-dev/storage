@@ -555,6 +555,41 @@ run the reusable
 against dedicated test credentials. Unknown endpoints are forced read-only and
 receive no inferred conditional capabilities.
 
+## Files SDK responsibility boundary
+
+Files SDK is the upstream authority for the generic storage data plane:
+provider adapters, generic CRUD, bulk and list operations, retries, transfers
+and sync, its plugin pipeline, and framework-neutral gateway mechanics.
+`@nestm/storage` retains the guarantees that Files SDK does not currently
+provide: NestJS 12 named stores, exact native conditional/CAS capabilities,
+`StorageWorkspace` permissions and limits, bounded storage errors, and
+capability-scoped AI tools.
+
+On the alpha.8 base, ordinary `FilesSdkStorageDriver` operations already
+delegate to the Files SDK pipeline. The exception is the native conditional
+adapter extensions: the current Files SDK operation union does not include
+them, so they cannot run through caller-configured Files plugins, hooks, or
+receipts. Until Files SDK provides one interception boundary for ordinary and
+conditional operations, the driver applies this interim fail-closed
+compatibility rule:
+
+| Caller Files configuration                        | Ordinary operations                  | Conditional operations                                   |
+| ------------------------------------------------- | ------------------------------------ | -------------------------------------------------------- |
+| No plugins, active hooks, or receipts             | Files pipeline                       | Advertised when the adapter supports the exact primitive |
+| One or more plugins                               | Files pipeline, including transforms | Hidden; direct invocation returns `NOT_SUPPORTED`        |
+| Any active hook                                   | Files pipeline and hook callbacks    | Hidden; direct invocation returns `NOT_SUPPORTED`        |
+| Receipts enabled with `true` or an options object | Files pipeline and receipts          | Hidden; direct invocation returns `NOT_SUPPORTED`        |
+
+An empty plugin list, an empty hooks object, and `receipts: false` do not trigger
+the gate. NestM's internal physical-key guard does not trigger it either. When
+available, direct conditional paths independently apply prefixing, the
+physical-key budget, mutation read-only restrictions, default
+retry/signal/timeout options, and bounded error mapping. `StoragePlugin` remains
+a separate veto/observation boundary; it is not a substitute for Files body or
+result transforms. This compatibility gate is intended to be removed once
+native CAS can traverse the upstream operation and plugin pipeline rather than
+becoming a second generic CRUD facade here.
+
 ## Storage API
 
 `StorageClient` exposes:

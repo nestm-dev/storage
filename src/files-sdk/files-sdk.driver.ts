@@ -64,6 +64,23 @@ import { getFilesSdkUploadControl } from '../storage-upload-control.js';
 export type FilesSdkDriverOptions<AdapterType extends Adapter> =
   FilesOptions<AdapterType>;
 
+/**
+ * Interim compatibility gate until Files SDK exposes native conditional/CAS
+ * verbs through the same operation pipeline as its generic data plane.
+ */
+function hasCallerFilesOperationPolicy<AdapterType extends Adapter>(
+  options: FilesSdkDriverOptions<AdapterType>,
+): boolean {
+  const hooks = options.hooks;
+  return (
+    (options.plugins?.length ?? 0) > 0 ||
+    typeof hooks?.onAction === 'function' ||
+    typeof hooks?.onError === 'function' ||
+    typeof hooks?.onRetry === 'function' ||
+    (options.receipts !== undefined && options.receipts !== false)
+  );
+}
+
 export type FilesSdkS3AdapterProvenance = 'native' | 'verified' | 'unverified';
 
 const FILES_SDK_S3_RESERVED_EXTENSION_KEYS = [
@@ -1253,6 +1270,7 @@ export class FilesSdkStorageDriver<
   readonly #conditionalDelete: FilesSdkConditionalDeleteAdapter | undefined;
   readonly #conditionalRead: FilesSdkConditionalReadAdapter | undefined;
   readonly #conditionalUpload: FilesSdkConditionalUploadAdapter | undefined;
+  readonly #conditionalOperationsBlockedByFilesPolicy: boolean;
   readonly #physicalKey: FilesSdkPhysicalKeyAdapter | undefined;
   readonly #prefix: string;
   readonly #readOnly: boolean;
@@ -1326,6 +1344,16 @@ export class FilesSdkStorageDriver<
     }
     const readOnly =
       options.readonly === true || s3Provenance?.provenance === 'unverified';
+    // Evaluate caller policy before appending NestM's internal key guard below.
+    this.#conditionalOperationsBlockedByFilesPolicy =
+      hasCallerFilesOperationPolicy(options);
+    // Files retains the hooks object by reference. Snapshot it so an initially
+    // inactive object cannot be mutated after this compatibility decision and
+    // start observing only ordinary operations.
+    const hooks =
+      options.hooks === undefined
+        ? undefined
+        : Object.freeze({ ...options.hooks });
     this.#physicalKey = physicalKeyAdapterOf(adapterForFiles);
     const guardedPrefix = normalizeFilesSdkPrefix(options.prefix);
     const plugins = [
@@ -1338,6 +1366,7 @@ export class FilesSdkStorageDriver<
     this.#files = new Files({
       ...options,
       adapter: adapterForFiles,
+      ...(hooks !== undefined && { hooks }),
       plugins,
       readonly: readOnly,
     });
@@ -1375,7 +1404,8 @@ export class FilesSdkStorageDriver<
       rangeRead: capabilities.rangeRead,
       resumableUpload: !this.#readOnly && capabilities.multipart,
       serverSideCopy: !this.#readOnly && capabilities.serverSideCopy,
-      ...(this.#conditionalCopy !== undefined &&
+      ...(!this.#conditionalOperationsBlockedByFilesPolicy &&
+        this.#conditionalCopy !== undefined &&
         !this.#readOnly && {
           ...(this.#conditionalCopy.conditionalCopySource !== undefined && {
             conditionalCopySource: {
@@ -1389,16 +1419,19 @@ export class FilesSdkStorageDriver<
             },
           }),
         }),
-      ...(this.#conditionalDelete !== undefined &&
+      ...(!this.#conditionalOperationsBlockedByFilesPolicy &&
+        this.#conditionalDelete !== undefined &&
         !this.#readOnly && {
           conditionalDelete: {
             ...this.#conditionalDelete.conditionalDelete,
           },
         }),
-      ...(this.#conditionalRead !== undefined && {
-        conditionalRead: { ...this.#conditionalRead.conditionalRead },
-      }),
-      ...(this.#conditionalUpload !== undefined &&
+      ...(!this.#conditionalOperationsBlockedByFilesPolicy &&
+        this.#conditionalRead !== undefined && {
+          conditionalRead: { ...this.#conditionalRead.conditionalRead },
+        }),
+      ...(!this.#conditionalOperationsBlockedByFilesPolicy &&
+        this.#conditionalUpload !== undefined &&
         !this.#readOnly && {
           ...(this.#conditionalUpload.conditionalCreate !== undefined && {
             conditionalCreate: {
@@ -1462,6 +1495,9 @@ export class FilesSdkStorageDriver<
       return Promise.reject(
         invalidConditionalEtag('condition.etag', key, 'upload'),
       );
+    }
+    if (this.#conditionalOperationsBlockedByFilesPolicy) {
+      return Promise.reject(this.#conditionalFilesPolicyError(key, 'upload'));
     }
     if (this.#readOnly) {
       return Promise.reject(
@@ -1559,6 +1595,9 @@ export class FilesSdkStorageDriver<
         invalidConditionalEtag('condition.etag', key, 'download'),
       );
     }
+    if (this.#conditionalOperationsBlockedByFilesPolicy) {
+      return Promise.reject(this.#conditionalFilesPolicyError(key, 'download'));
+    }
     const adapter = this.#conditionalRead;
     if (
       adapter === undefined ||
@@ -1646,6 +1685,9 @@ export class FilesSdkStorageDriver<
       return Promise.reject(
         invalidConditionalEtag('condition.etag', key, 'delete'),
       );
+    }
+    if (this.#conditionalOperationsBlockedByFilesPolicy) {
+      return Promise.reject(this.#conditionalFilesPolicyError(key, 'delete'));
     }
     if (this.#readOnly) {
       return Promise.reject(
@@ -1739,6 +1781,11 @@ export class FilesSdkStorageDriver<
     ) {
       return Promise.reject(
         invalidConditionalEtag('destination.etag', destinationKey, 'promote'),
+      );
+    }
+    if (this.#conditionalOperationsBlockedByFilesPolicy) {
+      return Promise.reject(
+        this.#conditionalFilesPolicyError(sourceKey, 'promote'),
       );
     }
     if (this.#readOnly) {
@@ -1919,6 +1966,21 @@ export class FilesSdkStorageDriver<
       {
         code: StorageErrorCode.LIMIT_EXCEEDED,
         ...(logicalKey !== undefined && { key: logicalKey }),
+        permanent: true,
+      },
+    );
+  }
+
+  #conditionalFilesPolicyError(
+    key: string,
+    operation: 'delete' | 'download' | 'promote' | 'upload',
+  ): StorageError {
+    return new StorageError(
+      'Conditional storage operations are unavailable while Files SDK plugins, hooks, or receipts are configured.',
+      {
+        code: StorageErrorCode.NOT_SUPPORTED,
+        key,
+        operation,
         permanent: true,
       },
     );

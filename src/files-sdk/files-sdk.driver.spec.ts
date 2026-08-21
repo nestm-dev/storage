@@ -1,7 +1,7 @@
 import { Readable } from 'node:stream';
 import { inspect } from 'node:util';
 
-import { createStoredFile, handlers } from 'files-sdk';
+import { createStoredFile, handlers, type FilesHooks } from 'files-sdk';
 import { memory } from 'files-sdk/memory';
 
 import {
@@ -656,6 +656,209 @@ describe('FilesSdkStorageDriver', () => {
 
     expect(upload).not.toHaveBeenCalled();
     expect(list).not.toHaveBeenCalled();
+  });
+
+  it('keeps ordinary uploads in the Files plugin pipeline and fails conditional uploads closed', async () => {
+    const adapter = Object.assign(memory(), {
+      conditionalCreate: { resultEtag: true },
+      uploadConditional: vi.fn(async (key: string) => ({
+        contentType: 'text/plain',
+        etag: 'conditional-etag',
+        key,
+        size: 10,
+      })),
+    });
+    const upload = vi.spyOn(adapter, 'upload');
+    const transform = vi.fn();
+    const driver = createFilesSdkDriver({
+      adapter,
+      plugins: [
+        {
+          name: 'body-transform',
+          wrap: handlers({
+            upload: (operation, next) => {
+              transform(operation.body);
+              return next({ ...operation, body: 'ciphertext' });
+            },
+          }),
+        },
+      ],
+    });
+
+    expect(driver.capabilities.conditionalCreate).toBeUndefined();
+    await expect(driver.upload('ordinary.txt', 'plaintext')).resolves.toEqual(
+      expect.objectContaining({ key: 'ordinary.txt' }),
+    );
+    expect(transform).toHaveBeenCalledOnce();
+    expect(transform).toHaveBeenCalledWith('plaintext');
+    expect(upload.mock.calls[0]?.[1]).toBe('ciphertext');
+
+    await expect(
+      driver.uploadConditional('conditional.txt', 'plaintext', {
+        condition: { type: 'create' },
+      }),
+    ).rejects.toMatchObject({
+      code: StorageErrorCode.NOT_SUPPORTED,
+      permanent: true,
+    });
+    expect(transform).toHaveBeenCalledOnce();
+    expect(adapter.uploadConditional).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      filesPolicy: {
+        plugins: [{ name: 'no-op', wrap: handlers({}) }],
+      },
+      policyName: 'a nonempty plugin list',
+    },
+    {
+      filesPolicy: { hooks: { onAction: vi.fn() } },
+      policyName: 'an active action hook',
+    },
+    {
+      filesPolicy: { hooks: { onError: vi.fn() } },
+      policyName: 'an active error hook',
+    },
+    {
+      filesPolicy: { hooks: { onRetry: vi.fn() } },
+      policyName: 'an active retry hook',
+    },
+    {
+      filesPolicy: { receipts: true },
+      policyName: 'receipts',
+    },
+    {
+      filesPolicy: { receipts: { sha256: false } },
+      policyName: 'receipt options',
+    },
+  ])(
+    'hides and blocks every conditional operation with $policyName',
+    async ({ filesPolicy }) => {
+      const adapter = Object.assign(memory(), {
+        conditionalCopyDestination: {
+          atomicWithSource: true,
+          create: true,
+          replace: true,
+        },
+        conditionalCopySource: { etag: true, version: true },
+        conditionalCreate: { resultEtag: true },
+        conditionalDelete: { etag: true },
+        conditionalMultipartCompletion: { create: true, replace: true },
+        conditionalRead: { etag: true, version: true },
+        conditionalReplace: { resultEtag: true },
+        deleteConditional: vi.fn(),
+        downloadConditional: vi.fn(),
+        promote: vi.fn(),
+        uploadConditional: vi.fn(),
+      });
+      const driver = createFilesSdkDriver({ adapter, ...filesPolicy });
+
+      expect(driver.capabilities.conditionalCopyDestination).toBeUndefined();
+      expect(driver.capabilities.conditionalCopySource).toBeUndefined();
+      expect(driver.capabilities.conditionalCreate).toBeUndefined();
+      expect(driver.capabilities.conditionalDelete).toBeUndefined();
+      expect(
+        driver.capabilities.conditionalMultipartCompletion,
+      ).toBeUndefined();
+      expect(driver.capabilities.conditionalRead).toBeUndefined();
+      expect(driver.capabilities.conditionalReplace).toBeUndefined();
+
+      await expect(
+        driver.uploadConditional('create.txt', 'plaintext', {
+          condition: { type: 'create' },
+        }),
+      ).rejects.toMatchObject({
+        code: StorageErrorCode.NOT_SUPPORTED,
+        permanent: true,
+      });
+      await expect(
+        driver.downloadConditional('read.txt', {
+          condition: { etag: 'current-etag' },
+        }),
+      ).rejects.toMatchObject({
+        code: StorageErrorCode.NOT_SUPPORTED,
+        permanent: true,
+      });
+      await expect(
+        driver.deleteConditional('delete.txt', {
+          condition: { etag: 'current-etag' },
+        }),
+      ).rejects.toMatchObject({
+        code: StorageErrorCode.NOT_SUPPORTED,
+        permanent: true,
+      });
+      await expect(
+        driver.promote('source.txt', 'destination.txt', {
+          destination: { type: 'create' },
+          sourceEtag: 'source-etag',
+        }),
+      ).rejects.toMatchObject({
+        code: StorageErrorCode.NOT_SUPPORTED,
+        permanent: true,
+      });
+
+      expect(adapter.uploadConditional).not.toHaveBeenCalled();
+      expect(adapter.downloadConditional).not.toHaveBeenCalled();
+      expect(adapter.deleteConditional).not.toHaveBeenCalled();
+      expect(adapter.promote).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps conditional operations compatible with explicitly inactive Files options', async () => {
+    const adapter = Object.assign(memory(), {
+      conditionalCreate: { resultEtag: true },
+      uploadConditional: vi.fn(async (key: string) => ({
+        contentType: 'text/plain',
+        etag: 'conditional-etag',
+        key,
+        size: 4,
+      })),
+    });
+    const driver = createFilesSdkDriver({
+      adapter,
+      hooks: {},
+      plugins: [],
+      receipts: false,
+    });
+
+    expect(driver.capabilities.conditionalCreate).toEqual({
+      resultEtag: true,
+    });
+    await expect(
+      driver.uploadConditional('conditional.txt', 'body', {
+        condition: { type: 'create' },
+      }),
+    ).resolves.toMatchObject({ key: 'conditional.txt' });
+    expect(adapter.uploadConditional).toHaveBeenCalledOnce();
+  });
+
+  it('snapshots an inactive hooks object before deciding conditional compatibility', async () => {
+    const adapter = Object.assign(memory(), {
+      conditionalCreate: { resultEtag: true },
+      uploadConditional: vi.fn(async (key: string) => ({
+        contentType: 'text/plain',
+        etag: 'conditional-etag',
+        key,
+        size: 4,
+      })),
+    });
+    const hooks: FilesHooks = {};
+    const driver = createFilesSdkDriver({ adapter, hooks });
+    const onAction = vi.fn();
+    hooks.onAction = onAction;
+
+    await expect(driver.upload('ordinary.txt', 'body')).resolves.toMatchObject({
+      key: 'ordinary.txt',
+    });
+    await expect(
+      driver.uploadConditional('conditional.txt', 'body', {
+        condition: { type: 'create' },
+      }),
+    ).resolves.toMatchObject({ key: 'conditional.txt' });
+
+    expect(onAction).not.toHaveBeenCalled();
+    expect(adapter.uploadConditional).toHaveBeenCalledOnce();
   });
 
   it('rejects a raw undecorated s3 adapter before dispatch', () => {
