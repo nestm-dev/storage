@@ -1,6 +1,7 @@
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -9,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { handlers } from 'files-sdk';
+import { encryption } from 'files-sdk/encryption';
 
 import { createFsStorageDriver } from '../files-sdk/fs/index.js';
 import { StorageClient } from '../storage.client.js';
@@ -29,6 +31,7 @@ const ALL_PERMISSIONS: readonly StorageWorkspacePermission[] = [
   'list',
   'read',
   'search',
+  'write',
   'create',
   'replace',
   'copy',
@@ -250,6 +253,240 @@ describe('StorageWorkspace', () => {
     );
   });
 
+  it('routes overwrite reads and writes through the Files encryption plugin', async () => {
+    const driver = createFsStorageDriver({
+      adapter: { root },
+      plugins: [encryption(new Uint8Array(32).fill(0x5a))],
+    });
+    const workspace = mountStorageWorkspace(
+      new StorageClient('encrypted-overwrite', driver),
+      {
+        permissions: ['read', 'write', 'copy', 'delete'],
+        prefix: 'runs/run-1',
+      },
+    );
+
+    await workspace.writeFile('protected.txt', 'first plaintext', {
+      mode: 'overwrite',
+    });
+    await workspace.writeFile('protected.txt', 'second plaintext', {
+      mode: 'overwrite',
+    });
+
+    await expect(workspace.readText('protected.txt')).resolves.toMatchObject({
+      text: 'second plaintext',
+    });
+    const raw = readFileSync(join(root, 'runs/run-1/protected.txt'));
+    expect(raw.includes(Buffer.from('first plaintext'))).toBe(false);
+    expect(raw.includes(Buffer.from('second plaintext'))).toBe(false);
+
+    await workspace.copyFile('protected.txt', 'copied.txt', {
+      mode: 'overwrite',
+    });
+    await expect(workspace.readText('copied.txt')).resolves.toMatchObject({
+      text: 'second plaintext',
+    });
+    const copiedRaw = readFileSync(join(root, 'runs/run-1/copied.txt'));
+    expect(copiedRaw.includes(Buffer.from('second plaintext'))).toBe(false);
+    expect(copiedRaw.equals(raw)).toBe(false);
+
+    await workspace.deleteFile('copied.txt', { mode: 'unconditional' });
+    await expect(workspace.stat('copied.txt')).rejects.toMatchObject({
+      code: StorageErrorCode.NOT_FOUND,
+    });
+  });
+
+  it('supports explicit last-write-wins copy and delete variants', async () => {
+    const { workspace } = mountedFs(root);
+    await workspace.writeFile('source.txt', 'latest', {
+      metadata: { owner: 'workspace' },
+      mode: 'overwrite',
+    });
+    await workspace.writeFile('copy.txt', 'stale-copy', { mode: 'overwrite' });
+
+    await expect(
+      workspace.copyFile('source.txt', 'copy.txt', { mode: 'overwrite' }),
+    ).resolves.toMatchObject({ path: 'copy.txt' });
+    await expect(workspace.readText('copy.txt')).resolves.toMatchObject({
+      text: 'latest',
+    });
+
+    await workspace.deleteFile('copy.txt', { mode: 'unconditional' });
+    await expect(workspace.stat('copy.txt')).rejects.toMatchObject({
+      code: StorageErrorCode.NOT_FOUND,
+    });
+  });
+
+  it('bounds last-write-wins copy by streamed bytes before upload', async () => {
+    const driver = createMemoryStorageDriver();
+    driver.download = vi.fn(async (key): Promise<StorageObject> => ({
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+          controller.enqueue(new Uint8Array([4, 5, 6]));
+          controller.close();
+        },
+      }),
+      contentType: 'application/octet-stream',
+      key,
+      name: key,
+      size: 1,
+    }));
+    const upload = vi.spyOn(driver, 'upload');
+    const workspace = mountStorageWorkspace(
+      new StorageClient('bounded-overwrite-copy', driver),
+      {
+        limits: { maxWriteBytes: 5 },
+        permissions: ['copy', 'read', 'write'],
+        prefix: 'scope',
+      },
+    );
+
+    await expect(
+      workspace.copyFile('source.bin', 'destination.bin', {
+        mode: 'overwrite',
+      }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.LIMIT_EXCEEDED });
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  it('keeps write authority separate from conditional create and replace', async () => {
+    const driver = createMemoryStorageDriver();
+    const upload = vi.spyOn(driver, 'upload');
+    const client = new StorageClient('write-permission', driver);
+    const conditionalOnly = mountStorageWorkspace(client, {
+      permissions: ['create', 'replace'],
+      prefix: 'conditional',
+    });
+    const overwriteOnly = mountStorageWorkspace(client, {
+      permissions: ['write'],
+      prefix: 'overwrite',
+    });
+
+    await expect(
+      conditionalOnly.writeFile('file.txt', 'body', { mode: 'overwrite' }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.UNAUTHORIZED });
+    expect(upload).not.toHaveBeenCalled();
+
+    await expect(
+      overwriteOnly.writeFile('file.txt', 'body', { mode: 'overwrite' }),
+    ).resolves.toMatchObject({ path: 'file.txt' });
+    await expect(
+      overwriteOnly.writeFile('conditional.txt', 'body', { mode: 'create' }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.UNAUTHORIZED });
+  });
+
+  it('requires both delete and write before an unconditional delete', async () => {
+    const driver = createMemoryStorageDriver({
+      adapter: { initial: { 'scope/target.txt': 'body' } },
+    });
+    const deleteObject = vi.spyOn(driver, 'delete');
+    const deleteConditional = vi.spyOn(driver, 'deleteConditional');
+    const workspace = mountStorageWorkspace(
+      new StorageClient('unconditional-delete-permissions', driver),
+      { permissions: ['delete'], prefix: 'scope' },
+    );
+
+    await expect(
+      workspace.deleteFile('target.txt', { mode: 'unconditional' }),
+    ).rejects.toMatchObject({ code: StorageErrorCode.UNAUTHORIZED });
+    expect(deleteObject).not.toHaveBeenCalled();
+    expect(deleteConditional).not.toHaveBeenCalled();
+  });
+
+  it('rejects unknown explicit mutation modes before provider I/O', async () => {
+    const driver = createMemoryStorageDriver({
+      adapter: { initial: { 'scope/source.txt': 'body' } },
+    });
+    const upload = vi.spyOn(driver, 'upload');
+    const uploadConditional = vi.spyOn(driver, 'uploadConditional');
+    const download = vi.spyOn(driver, 'download');
+    const deleteObject = vi.spyOn(driver, 'delete');
+    const deleteConditional = vi.spyOn(driver, 'deleteConditional');
+    const workspace = mountStorageWorkspace(
+      new StorageClient('invalid-modes', driver),
+      { permissions: ALL_PERMISSIONS, prefix: 'scope' },
+    );
+
+    await expect(
+      workspace.writeFile('target.txt', 'body', {
+        mode: 'unknown',
+      } as never),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(
+      workspace.copyFile('source.txt', 'copy.txt', {
+        mode: 'unknown',
+      } as never),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(
+      workspace.moveFile('source.txt', 'move.txt', {
+        mode: 'unknown',
+      } as never),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(
+      workspace.deleteFile('source.txt', { mode: 'unknown' } as never),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(
+      workspace.writeFile('target.txt', 'body', {
+        etag: 'ignored-etag',
+        mode: 'create',
+      } as never),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(
+      workspace.writeFile('target.txt', 'body', {
+        etag: 'ignored-etag',
+        mode: 'overwrite',
+      } as never),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(
+      workspace.copyFile('source.txt', 'copy.txt', {
+        etag: 'ignored-etag',
+        mode: 'overwrite',
+      } as never),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(
+      workspace.moveFile('source.txt', 'move.txt', {
+        mode: 'overwrite',
+      } as never),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(
+      workspace.moveFile('source.txt', 'move.txt', {
+        etag: 'ignored-etag',
+        mode: 'overwrite',
+      } as never),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+    await expect(
+      workspace.deleteFile('source.txt', {
+        etag: 'ignored-etag',
+        mode: 'unconditional',
+      } as never),
+    ).rejects.toMatchObject({ code: StorageErrorCode.INVALID_ARGUMENT });
+
+    expect(upload).not.toHaveBeenCalled();
+    expect(uploadConditional).not.toHaveBeenCalled();
+    expect(download).not.toHaveBeenCalled();
+    expect(deleteObject).not.toHaveBeenCalled();
+    expect(deleteConditional).not.toHaveBeenCalled();
+  });
+
+  it('reads bounded binary files without requiring UTF-8', async () => {
+    const { workspace } = mountedFs(root);
+    const bytes = new Uint8Array([0, 0xff, 1, 0x80]);
+    await workspace.writeFile('binary.dat', bytes, {
+      contentType: 'application/octet-stream',
+      mode: 'overwrite',
+    });
+
+    await expect(workspace.readBytes('binary.dat')).resolves.toMatchObject({
+      bytes,
+      contentType: 'application/octet-stream',
+      path: 'binary.dat',
+    });
+    await expect(workspace.readText('binary.dat')).rejects.toMatchObject({
+      code: StorageErrorCode.INVALID_ARGUMENT,
+    });
+  });
+
   it('rejects non-canonical ETags for every conditional mutation', async () => {
     const driver = createFsStorageDriver({ adapter: { root } });
     const workspace = mountStorageWorkspace(
@@ -341,6 +578,10 @@ describe('StorageWorkspace', () => {
     );
 
     await expect(workspace.readText('large.txt')).rejects.toMatchObject({
+      code: StorageErrorCode.LIMIT_EXCEEDED,
+      key: 'large.txt',
+    });
+    await expect(workspace.readBytes('large.txt')).rejects.toMatchObject({
       code: StorageErrorCode.LIMIT_EXCEEDED,
       key: 'large.txt',
     });

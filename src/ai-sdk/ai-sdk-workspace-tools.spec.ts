@@ -5,6 +5,7 @@ import { StorageErrorCode } from '../storage.error.js';
 import {
   StorageWorkspaceError,
   type StorageWorkspace,
+  type StorageWorkspaceByteFile,
   type StorageWorkspaceEntry,
   type StorageWorkspaceFile,
   type StorageWorkspacePermission,
@@ -16,6 +17,7 @@ import {
 } from './ai-sdk-workspace-tools.js';
 
 interface ToolView {
+  description?: string;
   execute?: (
     input: unknown,
     options: {
@@ -35,6 +37,7 @@ interface WorkspaceDouble {
   list: ReturnType<typeof vi.fn>;
   stat: ReturnType<typeof vi.fn>;
   readText: ReturnType<typeof vi.fn>;
+  readBytes: ReturnType<typeof vi.fn>;
   search: ReturnType<typeof vi.fn>;
   writeFile: ReturnType<typeof vi.fn>;
   copyFile: ReturnType<typeof vi.fn>;
@@ -55,6 +58,11 @@ const FILE: StorageWorkspaceFile = {
 const TEXT_FILE: StorageWorkspaceTextFile = {
   ...FILE,
   text: 'hello',
+};
+
+const BYTE_FILE: StorageWorkspaceByteFile = {
+  ...FILE,
+  bytes: new TextEncoder().encode('hello'),
 };
 
 const MALICIOUS_ETAGS = [
@@ -83,6 +91,7 @@ function createWorkspaceDouble(
   const list = vi.fn(async () => ({ entries: [] as StorageWorkspaceEntry[] }));
   const stat = vi.fn(async () => FILE);
   const readText = vi.fn(async () => TEXT_FILE);
+  const readBytes = vi.fn(async () => BYTE_FILE);
   const search = vi.fn(async () => ({
     entries: [] as StorageWorkspaceEntry[],
   }));
@@ -108,6 +117,7 @@ function createWorkspaceDouble(
     list,
     stat,
     readText,
+    readBytes,
     search,
     writeFile,
     copyFile,
@@ -120,6 +130,7 @@ function createWorkspaceDouble(
     list,
     stat,
     readText,
+    readBytes,
     search,
     writeFile,
     copyFile,
@@ -205,6 +216,118 @@ describe('createAiSdkWorkspaceTools', () => {
     const tools = createAiSdkWorkspaceTools({ workspace: copyOnly.workspace });
     expect('workspace_copy_file' in tools).toBe(true);
     expect('workspace_move_file' in tools).toBe(false);
+  });
+
+  it('uses write-authorized last-write-wins schemas and omits unsafe move', async () => {
+    const fixture = createWorkspaceDouble([
+      'read',
+      'write',
+      'create',
+      'copy',
+      'move',
+      'delete',
+    ]);
+    const tools = createAiSdkWorkspaceTools({
+      mutationMode: 'last-write-wins',
+      workspace: fixture.workspace,
+    });
+
+    const writeSchema = viewTool(tools, 'workspace_write_file').inputSchema;
+    const copySchema = viewTool(tools, 'workspace_copy_file').inputSchema;
+    const deleteSchema = viewTool(tools, 'workspace_delete_file').inputSchema;
+    expect('workspace_move_file' in tools).toBe(false);
+    expect(viewTool(tools, 'workspace_stat').description).toContain(
+      'informational',
+    );
+    expect(
+      writeSchema.safeParse({ path: 'written.txt', content: 'body' }).success,
+    ).toBe(true);
+    expect(
+      writeSchema.safeParse({
+        path: 'written.txt',
+        content: 'body',
+        mode: 'overwrite',
+      }).success,
+    ).toBe(false);
+    expect(
+      copySchema.safeParse({
+        source: 'written.txt',
+        destination: 'copied.txt',
+      }).success,
+    ).toBe(true);
+    expect(
+      copySchema.safeParse({
+        source: 'written.txt',
+        destination: 'copied.txt',
+        etag: 'source-etag',
+      }).success,
+    ).toBe(false);
+    expect(
+      deleteSchema.safeParse({ path: 'copied.txt', etag: 'old-etag' }).success,
+    ).toBe(false);
+
+    await executeTool(tools, 'workspace_write_file', {
+      path: 'written.txt',
+      content: 'body',
+    });
+    expect(fixture.writeFile).toHaveBeenCalledWith('written.txt', 'body', {
+      mode: 'overwrite',
+    });
+    await executeTool(tools, 'workspace_copy_file', {
+      source: 'written.txt',
+      destination: 'copied.txt',
+    });
+    expect(fixture.copyFile).toHaveBeenCalledWith('written.txt', 'copied.txt', {
+      mode: 'overwrite',
+    });
+    await expect(
+      executeTool(tools, 'workspace_delete_file', { path: 'copied.txt' }),
+    ).resolves.toEqual({ deleted: true, path: 'copied.txt' });
+    expect(fixture.deleteFile).toHaveBeenCalledWith('copied.txt', {
+      mode: 'unconditional',
+    });
+
+    const withoutWrite = createWorkspaceDouble([
+      'read',
+      'copy',
+      'move',
+      'delete',
+    ]);
+    const narrowed = createAiSdkWorkspaceTools({
+      mutationMode: 'last-write-wins',
+      workspace: withoutWrite.workspace,
+    });
+    expect('workspace_write_file' in narrowed).toBe(false);
+    expect('workspace_copy_file' in narrowed).toBe(false);
+    expect('workspace_move_file' in narrowed).toBe(false);
+    expect('workspace_delete_file' in narrowed).toBe(false);
+
+    const withoutDelete = createWorkspaceDouble(['write']);
+    const writeOnly = createAiSdkWorkspaceTools({
+      mutationMode: 'last-write-wins',
+      workspace: withoutDelete.workspace,
+    });
+    expect('workspace_delete_file' in writeOnly).toBe(false);
+  });
+
+  it('rejects invalid mutation policy combinations before inspecting permissions', () => {
+    const fixture = createWorkspaceDouble(['write']);
+    const allows = vi.spyOn(fixture.workspace, 'allows');
+
+    expect(() =>
+      createAiSdkWorkspaceTools({
+        mutationMode: 'unknown' as never,
+        workspace: fixture.workspace,
+      }),
+    ).toThrow(/mutationMode/u);
+    expect(() =>
+      createAiSdkWorkspaceTools({
+        mapCreateConflict: ({ path }) => ({ path }),
+        mutationMode: 'last-write-wins',
+        workspace: fixture.workspace,
+      }),
+    ).toThrow(/mapCreateConflict/u);
+    expect(allows).not.toHaveBeenCalled();
   });
 
   it('requires approval for mutations by default and supports granular overrides', () => {
@@ -765,7 +888,7 @@ describe('createAiSdkWorkspaceTools', () => {
     ).rejects.toMatchObject({
       code: StorageErrorCode.CONFLICT,
       message:
-        'The operation conflicts with current workspace state. Refresh metadata and retry with the current ETag or a new destination.',
+        'The operation conflicts with current workspace state. Inspect the affected paths before retrying.',
     });
   });
 

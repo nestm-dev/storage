@@ -167,6 +167,7 @@ const workspace = mountStorageWorkspace(agentFiles, {
     'list',
     'read',
     'search',
+    'write',
     'create',
     'replace',
     'copy',
@@ -199,7 +200,15 @@ await workspace.writeFile('src/main.ts', 'export const ready = false;\n', {
   etag: created.etag,
   contentType: 'text/typescript',
 });
+
+const image = await workspace.readBytes('assets/logo.png');
+console.log(image.bytes.byteLength);
 ```
+
+`readBytes` is now a required member of the exported `StorageWorkspace`
+interface. Workspaces returned by `mountStorageWorkspace` provide it
+automatically; custom implementations and typed test doubles must add the
+method when adopting this alpha minor.
 
 Create, replace, and delete are conditional operations. A driver that cannot
 enforce the requested not-exists or ETag precondition fails with
@@ -214,6 +223,32 @@ delete. If source deletion cannot be confirmed, the destination is retained and
 the call returns `CONFLICT`; inspect both logical paths before retrying. This
 preserves at least one copy across provider timeouts and post-operation hook
 failures, but does not pretend a multi-object move is transactionally atomic.
+
+Callers that prefer the ordinary Files pipeline can opt into explicit
+last-write-wins variants. The `write` permission is separate from conditional
+`create` and `replace` authority:
+
+```ts
+await workspace.writeFile('notes.txt', 'latest contents', {
+  mode: 'overwrite',
+});
+await workspace.copyFile('notes.txt', 'backup.txt', { mode: 'overwrite' });
+await workspace.deleteFile('backup.txt', { mode: 'unconditional' });
+```
+
+Overwrite copy reads the latest source through the ordinary download pipeline,
+enforces `maxWriteBytes` while collecting it, and uploads it through the
+ordinary upload pipeline. It never substitutes the provider's server-side
+copy. These paths compose with Files SDK plugins, hooks, and receipts, including
+the built-in `encryption()` plugin. That plugin is useful compatibility
+evidence, not an Artifact-specific security policy: strict encrypted-only
+reads, tenant/path-bound AAD, key custody and rotation, and copy/move rules
+remain application-owned.
+
+Move remains conditional-only. A last-write-wins download/upload/delete
+sequence could copy one source generation and then delete a newer generation
+written during the transfer. Use the ETag-conditional `moveFile` variant when a
+move is required.
 
 A child mount may further restrict a directory, permissions, or limits, but it
 cannot widen any of them:
@@ -275,6 +310,7 @@ import type { ToolSet } from 'ai';
                   'list',
                   'read',
                   'search',
+                  'write',
                   'create',
                   'replace',
                   'copy',
@@ -312,6 +348,13 @@ workspace capability remains the authorization boundary even when approval is
 disabled. The module's `AiSdkService.files()` API is the model provider's file
 upload facility and is unrelated to storage workspaces.
 
+`mutationMode` defaults to `'conditional'`. A trusted composition can instead
+select `{ mutationMode: 'last-write-wins' }`; generated mutation schemas then
+omit ETags and modes, hardcode the explicit overwrite/unconditional workspace
+variants, and require `write` permission for destination mutations.
+Unconditional delete requires both `write` and `delete`. The move tool is
+omitted in last-write-wins mode because Workspace move remains conditional-only.
+
 Atomic create collisions remain sanitized tool errors by default. Applications
 that model an existing destination as a normal tool result can map that one
 case while preserving replace/ETag conflicts as failures:
@@ -328,7 +371,8 @@ const tools = createAiSdkWorkspaceTools({
 ```
 
 The mapper receives only the logical workspace path; provider errors, object
-keys, and mount coordinates are never exposed.
+keys, and mount coordinates are never exposed. `mapCreateConflict` is valid
+only in conditional mode and is rejected with last-write-wins mode.
 
 This logical confinement is sufficient for a `ToolLoopAgent` whose only file
 capabilities are these tools. It cannot constrain a coding harness that already
@@ -589,6 +633,12 @@ a separate veto/observation boundary; it is not a substitute for Files body or
 result transforms. This compatibility gate is intended to be removed once
 native CAS can traverse the upstream operation and plugin pipeline rather than
 becoming a second generic CRUD facade here.
+
+`StorageWorkspace` therefore exposes both contracts without weakening either:
+its existing create/replace, exact-read copy/move, and conditional-delete paths
+retain native CAS and this fail-closed gate, while explicit overwrite and
+unconditional-delete variants use the ordinary Files pipeline. Lower-level
+conditional client and driver APIs remain available to callers that need them.
 
 ## Storage API
 
