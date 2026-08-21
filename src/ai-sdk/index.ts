@@ -9,6 +9,7 @@ export {
   type AiSdkWorkspaceDirectoryResult,
   type AiSdkWorkspaceEntryResult,
   type AiSdkWorkspaceFileResult,
+  type AiSdkWorkspaceMutationMode,
   type AiSdkWorkspaceMutationToolName,
   type AiSdkWorkspacePageResult,
   type AiSdkWorkspaceTextFileResult,

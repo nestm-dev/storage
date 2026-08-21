@@ -6,6 +6,7 @@ export const STORAGE_WORKSPACE_PERMISSIONS = [
   'list',
   'read',
   'search',
+  'write',
   'create',
   'replace',
   'copy',
@@ -21,7 +22,7 @@ export interface StorageWorkspaceLimits {
   maxCursorBytes: number;
   /** Maximum UTF-8 byte length of a workspace-relative path. */
   maxPathBytes: number;
-  /** Maximum bytes returned by a buffered text read. */
+  /** Maximum bytes returned by one buffered text or binary read. */
   maxReadBytes: number;
   /** Maximum bytes accepted by one write. */
   maxWriteBytes: number;
@@ -73,6 +74,10 @@ export interface StorageWorkspaceTextFile extends StorageWorkspaceFile {
   text: string;
 }
 
+export interface StorageWorkspaceByteFile extends StorageWorkspaceFile {
+  bytes: Uint8Array;
+}
+
 export interface StorageWorkspacePage {
   entries: StorageWorkspaceEntry[];
   cursor?: string;
@@ -119,6 +124,8 @@ interface StorageWorkspaceWriteCommon extends StorageOperationOptions {
 export type StorageWorkspaceWriteOptions = StorageWorkspaceWriteCommon &
   (
     | { mode: 'create' }
+    /** Unconditionally writes the destination through the ordinary Files path. */
+    | { mode: 'overwrite' }
     | {
         mode: 'replace';
         etag: string;
@@ -128,6 +135,22 @@ export type StorageWorkspaceWriteOptions = StorageWorkspaceWriteCommon &
 export interface StorageWorkspaceMutationOptions extends StorageOperationOptions {
   etag: string;
 }
+
+export interface StorageWorkspaceOverwriteOptions extends StorageOperationOptions {
+  /** Unconditionally overwrites the destination through the ordinary Files path. */
+  mode: 'overwrite';
+}
+
+export interface StorageWorkspaceUnconditionalDeleteOptions extends StorageOperationOptions {
+  /** Deletes the current destination without an ETag precondition. */
+  mode: 'unconditional';
+}
+
+export type StorageWorkspaceCopyOptions =
+  StorageWorkspaceMutationOptions | StorageWorkspaceOverwriteOptions;
+
+export type StorageWorkspaceDeleteOptions =
+  StorageWorkspaceMutationOptions | StorageWorkspaceUnconditionalDeleteOptions;
 
 export type StorageWorkspaceBody = Extract<StorageBody, string | Uint8Array>;
 
@@ -143,6 +166,10 @@ export interface StorageWorkspace {
     path: string,
     options?: StorageWorkspaceReadOptions,
   ): Promise<StorageWorkspaceTextFile>;
+  readBytes(
+    path: string,
+    options?: StorageWorkspaceReadOptions,
+  ): Promise<StorageWorkspaceByteFile>;
   list(options?: StorageWorkspaceListOptions): Promise<StorageWorkspacePage>;
   search(
     query: string,
@@ -156,7 +183,7 @@ export interface StorageWorkspace {
   copyFile(
     source: string,
     destination: string,
-    options: StorageWorkspaceMutationOptions,
+    options: StorageWorkspaceCopyOptions,
   ): Promise<StorageWorkspaceFile>;
   moveFile(
     source: string,
@@ -165,7 +192,7 @@ export interface StorageWorkspace {
   ): Promise<StorageWorkspaceFile>;
   deleteFile(
     path: string,
-    options: StorageWorkspaceMutationOptions,
+    options: StorageWorkspaceDeleteOptions,
   ): Promise<void>;
   mount(
     directory: string,

@@ -33,6 +33,9 @@ import type {
   MountStorageWorkspaceOptions,
   StorageWorkspace as StorageWorkspaceContract,
   StorageWorkspaceBody,
+  StorageWorkspaceByteFile,
+  StorageWorkspaceCopyOptions,
+  StorageWorkspaceDeleteOptions,
   StorageWorkspaceDirectory,
   StorageWorkspaceEntry,
   StorageWorkspaceFile,
@@ -40,6 +43,7 @@ import type {
   StorageWorkspaceListOptions,
   StorageWorkspaceMountOptions,
   StorageWorkspaceMutationOptions,
+  StorageWorkspaceOverwriteOptions,
   StorageWorkspacePage,
   StorageWorkspacePermission,
   StorageWorkspaceReadOptions,
@@ -104,6 +108,60 @@ function assertEtag(etag: string, operation: string): void {
       { permanent: true },
     );
   }
+}
+
+function writeModeOf(
+  options: StorageWorkspaceWriteOptions,
+): StorageWorkspaceWriteOptions['mode'] {
+  const candidate = options as { mode?: unknown; etag?: unknown } | undefined;
+  const mode = candidate?.mode;
+  if (mode === 'create' || mode === 'overwrite' || mode === 'replace') {
+    if (mode !== 'replace' && candidate !== undefined && 'etag' in candidate) {
+      throw workspaceError(
+        StorageErrorCode.INVALID_ARGUMENT,
+        'Workspace write options may include an etag only in replace mode.',
+        { permanent: true },
+      );
+    }
+    return mode;
+  }
+  throw workspaceError(
+    StorageErrorCode.INVALID_ARGUMENT,
+    'Workspace write mode must be create, overwrite, or replace.',
+    { permanent: true },
+  );
+}
+
+function hasExplicitMode(
+  options: unknown,
+  expected: 'overwrite' | 'unconditional',
+  operation: string,
+): boolean {
+  if (typeof options !== 'object' || options === null) {
+    throw workspaceError(
+      StorageErrorCode.INVALID_ARGUMENT,
+      `${operation} options must be an object.`,
+      { permanent: true },
+    );
+  }
+  if (!('mode' in options)) {
+    return false;
+  }
+  if (options.mode !== expected) {
+    throw workspaceError(
+      StorageErrorCode.INVALID_ARGUMENT,
+      `${operation} mode must be ${expected}.`,
+      { permanent: true },
+    );
+  }
+  if ('etag' in options) {
+    throw workspaceError(
+      StorageErrorCode.INVALID_ARGUMENT,
+      `${operation} ${expected} options must not include an etag.`,
+      { permanent: true },
+    );
+  }
+  return true;
 }
 
 function resolveLimits(
@@ -364,7 +422,7 @@ async function collectBoundedBytes(
     await stream.cancel().catch(() => undefined);
     throw workspaceError(
       StorageErrorCode.LIMIT_EXCEEDED,
-      `Workspace file "${path}" exceeds the ${maxBytes}-byte copy limit.`,
+      `Workspace file "${path}" exceeds the ${maxBytes}-byte limit.`,
       { path, permanent: true },
     );
   }
@@ -389,7 +447,7 @@ async function collectBoundedBytes(
         await reader.cancel().catch(() => undefined);
         throw workspaceError(
           StorageErrorCode.LIMIT_EXCEEDED,
-          `Workspace file "${path}" exceeded the ${maxBytes}-byte copy limit.`,
+          `Workspace file "${path}" exceeded the ${maxBytes}-byte limit.`,
           { path, permanent: true },
         );
       }
@@ -492,6 +550,42 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
         logicalPath,
       );
       return { ...logicalFile(object, logicalPath), text };
+    } catch (error) {
+      throw sanitizeWorkspaceError(error, {
+        operation: 'read',
+        path: logicalPath,
+      });
+    }
+  }
+
+  async readBytes(
+    path: string,
+    options?: StorageWorkspaceReadOptions,
+  ): Promise<StorageWorkspaceByteFile> {
+    this.#require('read');
+    const logicalPath = this.#filePath(path);
+    const maxBytes = options?.maxBytes ?? this.#limits.maxReadBytes;
+    positiveSafeInteger(maxBytes, 'maxBytes');
+    if (maxBytes > this.#limits.maxReadBytes) {
+      throw workspaceError(
+        StorageErrorCode.LIMIT_EXCEEDED,
+        `maxBytes cannot exceed the ${this.#limits.maxReadBytes}-byte workspace read limit.`,
+        { path: logicalPath, permanent: true },
+      );
+    }
+    try {
+      const object = await this.#state.client.downloadStream(
+        this.#scope(logicalPath),
+        operationOptions(options),
+      );
+      this.#assertResultPath(object.key, logicalPath);
+      const bytes = await collectBoundedBytes(
+        object.body,
+        object.size,
+        maxBytes,
+        logicalPath,
+      );
+      return { ...logicalFile(object, logicalPath), bytes };
     } catch (error) {
       throw sanitizeWorkspaceError(error, {
         operation: 'read',
@@ -702,7 +796,8 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
     body: StorageWorkspaceBody,
     options: StorageWorkspaceWriteOptions,
   ): Promise<StorageWorkspaceFile> {
-    this.#require(options.mode);
+    const mode = writeModeOf(options);
+    this.#require(mode === 'overwrite' ? 'write' : mode);
     const logicalPath = this.#filePath(path);
     if (typeof body !== 'string' && !(body instanceof Uint8Array)) {
       throw workspaceError(
@@ -722,9 +817,6 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
         { path: logicalPath, permanent: true },
       );
     }
-    if (options.mode === 'replace') {
-      assertEtag(options.etag, 'Replace');
-    }
     try {
       const common = {
         ...(options.contentType !== undefined && {
@@ -733,26 +825,36 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
         ...(options.metadata !== undefined && { metadata: options.metadata }),
         ...operationOptions(options),
       };
-      const result =
-        options.mode === 'create'
-          ? await this.#state.client.uploadConditional(
-              this.#scope(logicalPath),
-              body,
-              { ...common, condition: { type: 'create' } },
-            )
-          : await this.#state.client.uploadConditional(
-              this.#scope(logicalPath),
-              body,
-              {
-                ...common,
-                condition: { etag: options.etag, type: 'replace' },
-              },
-            );
+      let result: StorageUploadResult;
+      if (mode === 'overwrite') {
+        result = await this.#state.client.upload(
+          this.#scope(logicalPath),
+          body,
+          common,
+        );
+      } else if (mode === 'create') {
+        result = await this.#state.client.uploadConditional(
+          this.#scope(logicalPath),
+          body,
+          { ...common, condition: { type: 'create' } },
+        );
+      } else {
+        const etag = (options as { etag: string }).etag;
+        assertEtag(etag, 'Replace');
+        result = await this.#state.client.uploadConditional(
+          this.#scope(logicalPath),
+          body,
+          {
+            ...common,
+            condition: { etag, type: 'replace' },
+          },
+        );
+      }
       this.#assertResultPath(result.key, logicalPath);
       return logicalFile(result, logicalPath);
     } catch (error) {
       throw sanitizeWorkspaceError(error, {
-        operation: options.mode,
+        operation: mode,
         path: logicalPath,
       });
     }
@@ -761,11 +863,12 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
   async copyFile(
     source: string,
     destination: string,
-    options: StorageWorkspaceMutationOptions,
+    options: StorageWorkspaceCopyOptions,
   ): Promise<StorageWorkspaceFile> {
     this.#require('copy');
     this.#require('read');
-    this.#require('create');
+    const overwrite = hasExplicitMode(options, 'overwrite', 'Copy');
+    this.#require(overwrite ? 'write' : 'create');
     const sourcePath = this.#filePath(source, 'source path');
     const destinationPath = this.#filePath(destination, 'destination path');
     if (sourcePath === destinationPath) {
@@ -775,7 +878,15 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
         { path: destinationPath, permanent: true },
       );
     }
-    assertEtag(options.etag, 'Copy');
+    if (overwrite) {
+      return this.#copyOverwrite(
+        sourcePath,
+        destinationPath,
+        options as StorageWorkspaceOverwriteOptions,
+      );
+    }
+    const conditional = options as StorageWorkspaceMutationOptions;
+    assertEtag(conditional.etag, 'Copy');
     const capabilities = this.#state.client.capabilities;
     if (
       capabilities.conditionalCreate?.resultEtag !== true ||
@@ -787,7 +898,7 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
         { operation: 'copy', path: destinationPath, permanent: true },
       );
     }
-    return this.#copyCreate(sourcePath, destinationPath, options);
+    return this.#copyCreate(sourcePath, destinationPath, conditional);
   }
 
   async moveFile(
@@ -799,6 +910,22 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
     this.#require('read');
     this.#require('create');
     this.#require('delete');
+    if (typeof options !== 'object' || options === null || 'mode' in options) {
+      throw workspaceError(
+        StorageErrorCode.INVALID_ARGUMENT,
+        'Workspace move supports only an ETag-conditional mutation.',
+        { permanent: true },
+      );
+    }
+    const sourcePath = this.#filePath(source, 'source path');
+    const destinationPath = this.#filePath(destination, 'destination path');
+    if (sourcePath === destinationPath) {
+      throw workspaceError(
+        StorageErrorCode.CONFLICT,
+        'Move destination must differ from its source.',
+        { path: destinationPath, permanent: true },
+      );
+    }
     const capabilities = this.#state.client.capabilities;
     if (
       capabilities.conditionalCreate?.resultEtag !== true ||
@@ -809,15 +936,6 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
         StorageErrorCode.NOT_SUPPORTED,
         'Safe move requires exact-ETag reads, create-only uploads that return an ETag, and conditional delete.',
         { operation: 'move', permanent: true },
-      );
-    }
-    const sourcePath = this.#filePath(source, 'source path');
-    const destinationPath = this.#filePath(destination, 'destination path');
-    if (sourcePath === destinationPath) {
-      throw workspaceError(
-        StorageErrorCode.CONFLICT,
-        'Move destination must differ from its source.',
-        { path: destinationPath, permanent: true },
       );
     }
     assertEtag(options.etag, 'Move');
@@ -850,16 +968,28 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
 
   async deleteFile(
     path: string,
-    options: StorageWorkspaceMutationOptions,
+    options: StorageWorkspaceDeleteOptions,
   ): Promise<void> {
     this.#require('delete');
     const logicalPath = this.#filePath(path);
-    assertEtag(options.etag, 'Delete');
+    const unconditional = hasExplicitMode(options, 'unconditional', 'Delete');
+    if (unconditional) {
+      this.#require('write');
+    }
     try {
-      await this.#state.client.deleteConditional(this.#scope(logicalPath), {
-        condition: { etag: options.etag },
-        ...operationOptions(options),
-      });
+      if (unconditional) {
+        await this.#state.client.delete(
+          this.#scope(logicalPath),
+          operationOptions(options),
+        );
+      } else {
+        const conditional = options as StorageWorkspaceMutationOptions;
+        assertEtag(conditional.etag, 'Delete');
+        await this.#state.client.deleteConditional(this.#scope(logicalPath), {
+          condition: { etag: conditional.etag },
+          ...operationOptions(conditional),
+        });
+      }
     } catch (error) {
       throw sanitizeWorkspaceError(error, {
         operation: 'delete',
@@ -924,6 +1054,42 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
         bytes,
         {
           condition: { type: 'create' },
+          contentType: source.contentType,
+          ...(source.metadata !== undefined && { metadata: source.metadata }),
+          ...operationOptions(options),
+        },
+      );
+      this.#assertResultPath(result.key, destinationPath);
+      return logicalFile(result, destinationPath);
+    } catch (error) {
+      throw sanitizeWorkspaceError(error, {
+        operation: 'copy',
+        path: destinationPath,
+      });
+    }
+  }
+
+  async #copyOverwrite(
+    sourcePath: string,
+    destinationPath: string,
+    options: StorageWorkspaceOverwriteOptions,
+  ): Promise<StorageWorkspaceFile> {
+    try {
+      const source = await this.#state.client.downloadStream(
+        this.#scope(sourcePath),
+        operationOptions(options),
+      );
+      this.#assertResultPath(source.key, sourcePath);
+      const bytes = await collectBoundedBytes(
+        source.body,
+        source.size,
+        this.#limits.maxWriteBytes,
+        sourcePath,
+      );
+      const result = await this.#state.client.upload(
+        this.#scope(destinationPath),
+        bytes,
+        {
           contentType: source.contentType,
           ...(source.metadata !== undefined && { metadata: source.metadata }),
           ...operationOptions(options),

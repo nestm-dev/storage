@@ -45,6 +45,8 @@ export type AiSdkWorkspaceMutationToolName = Extract<
 export type AiSdkWorkspaceApprovalConfig =
   boolean | Partial<Record<AiSdkWorkspaceMutationToolName, boolean>>;
 
+export type AiSdkWorkspaceMutationMode = 'conditional' | 'last-write-wins';
+
 export interface AiSdkWorkspaceCreateConflict {
   /** The logical destination inside the mounted workspace. */
   readonly path: string;
@@ -67,9 +69,15 @@ export interface CreateAiSdkWorkspaceToolsOptions<
   /** Mutation tools require approval by default. */
   requireApproval?: AiSdkWorkspaceApprovalConfig;
   /**
+   * Selects the mutation contract exposed to the model. Conditional mode is
+   * the default; last-write-wins uses the workspace's ordinary Files path.
+   */
+  mutationMode?: AiSdkWorkspaceMutationMode;
+  /**
    * Maps an atomic create collision to an application result. When omitted,
    * the collision remains an AiSdkWorkspaceToolError like every other storage
-   * failure. Replace conflicts are never mapped by this hook.
+   * failure. Replace conflicts are never mapped by this hook. This option is
+   * valid only when mutationMode is conditional.
    */
   mapCreateConflict?: AiSdkWorkspaceCreateConflictMapper<CreateConflictResult>;
 }
@@ -83,7 +91,7 @@ const SAFE_ERROR_MESSAGES: Readonly<
   [StorageErrorCode.UNAUTHORIZED]:
     'This operation is not permitted in the workspace.',
   [StorageErrorCode.CONFLICT]:
-    'The operation conflicts with current workspace state. Refresh metadata and retry with the current ETag or a new destination.',
+    'The operation conflicts with current workspace state. Inspect the affected paths before retrying.',
   [StorageErrorCode.READ_ONLY]:
     'This operation is not permitted in the workspace.',
   [StorageErrorCode.INVALID_ARGUMENT]: 'The workspace tool input was rejected.',
@@ -383,9 +391,20 @@ export function createAiSdkWorkspaceTools<
 >({
   workspace,
   maxReadBytes: requestedMaxReadBytes,
+  mutationMode = 'conditional',
   requireApproval = true,
   mapCreateConflict,
 }: CreateAiSdkWorkspaceToolsOptions<CreateConflictResult>): ToolSet {
+  if (mutationMode !== 'conditional' && mutationMode !== 'last-write-wins') {
+    throw new RangeError(
+      'mutationMode must be "conditional" or "last-write-wins".',
+    );
+  }
+  if (mutationMode === 'last-write-wins' && mapCreateConflict !== undefined) {
+    throw new RangeError(
+      'mapCreateConflict is available only in conditional mutation mode.',
+    );
+  }
   const maxReadBytes = resolveReadLimit(workspace, requestedMaxReadBytes);
   const tools: ToolSet = {};
   const pathSchema = logicalPath('File path', workspace.limits.maxPathBytes);
@@ -441,7 +460,9 @@ export function createAiSdkWorkspaceTools<
   if (workspace.allows('read')) {
     tools.workspace_stat = tool({
       description:
-        'Inspect a file inside the mounted workspace without reading its contents. Returns the ETag required for safe replace, move, and delete operations.',
+        mutationMode === 'conditional'
+          ? 'Inspect a file inside the mounted workspace without reading its contents. Returns the ETag required for safe replace, move, and delete operations.'
+          : 'Inspect a file inside the mounted workspace without reading its contents. Any returned ETag is informational in last-write-wins mode.',
       strict: true,
       inputSchema: z.object({ path: pathSchema }).strict(),
       execute: ({ path }, { abortSignal }) =>
@@ -512,86 +533,139 @@ export function createAiSdkWorkspaceTools<
     });
   }
 
-  const canCreate = workspace.allows('create');
-  const canReplace = workspace.allows('replace');
-  if (canCreate || canReplace) {
-    const commonWriteShape = {
-      path: pathSchema,
-      content: z
-        .string()
-        .refine(
-          (value) =>
-            utf8Encoder.encode(value).byteLength <=
-            workspace.limits.maxWriteBytes,
-          {
-            message: `Content exceeds the ${workspace.limits.maxWriteBytes}-byte workspace write limit.`,
-          },
-        )
-        .describe(
-          `UTF-8 text to write. The workspace enforces its ${workspace.limits.maxWriteBytes}-byte write limit.`,
-        ),
-    };
-    const createSchema = z
-      .object({ ...commonWriteShape, mode: z.literal('create') })
-      .strict();
-    const replaceSchema = z
-      .object({
-        ...commonWriteShape,
-        mode: z.literal('replace'),
-        etag: etagSchema,
-      })
-      .strict();
-    const inputSchema =
-      canCreate && canReplace
-        ? z.discriminatedUnion('mode', [createSchema, replaceSchema])
-        : canCreate
-          ? createSchema
-          : replaceSchema;
-
-    tools.workspace_write_file = tool<
-      z.infer<typeof inputSchema>,
-      unknown,
-      Record<string, unknown>
-    >({
+  const commonWriteShape = {
+    path: pathSchema,
+    content: z
+      .string()
+      .refine(
+        (value) =>
+          utf8Encoder.encode(value).byteLength <=
+          workspace.limits.maxWriteBytes,
+        {
+          message: `Content exceeds the ${workspace.limits.maxWriteBytes}-byte workspace write limit.`,
+        },
+      )
+      .describe(
+        `UTF-8 text to write. The workspace enforces its ${workspace.limits.maxWriteBytes}-byte write limit.`,
+      ),
+  };
+  if (mutationMode === 'last-write-wins' && workspace.allows('write')) {
+    const inputSchema = z.object(commonWriteShape).strict();
+    tools.workspace_write_file = tool({
       description:
-        canCreate && canReplace
-          ? 'Create a new UTF-8 text file or replace an existing file inside the mounted workspace. Create fails if the destination exists; replace requires its current ETag.'
-          : canCreate
-            ? 'Create a new UTF-8 text file inside the mounted workspace. The operation fails if the destination already exists.'
-            : 'Replace an existing UTF-8 text file inside the mounted workspace using its current ETag.',
-      // The combined create/replace schema is a discriminated union. OpenAI
-      // strict function tools reject its root-level oneOf, while the runtime
-      // Zod schema continues to validate every tool call in non-strict mode.
-      strict: !(canCreate && canReplace),
+        'Write a UTF-8 text file inside the mounted workspace. An existing destination is overwritten; the last successful writer wins.',
+      strict: true,
       inputSchema,
       needsApproval: resolveApproval('workspace_write_file', requireApproval),
-      execute: (input, { abortSignal }) =>
-        executeCreateAware(
-          abortSignal,
-          input,
-          async () =>
-            serializeFile(
-              input.mode === 'create'
-                ? await workspace.writeFile(input.path, input.content, {
-                    mode: 'create',
-                    ...operationOptions(abortSignal),
-                  })
-                : await workspace.writeFile(input.path, input.content, {
-                    mode: 'replace',
-                    etag: input.etag,
-                    ...operationOptions(abortSignal),
-                  }),
-            ),
-          mapCreateConflict,
+      execute: ({ path, content }, { abortSignal }) =>
+        executeSafely(abortSignal, async () =>
+          serializeFile(
+            await workspace.writeFile(path, content, {
+              mode: 'overwrite',
+              ...operationOptions(abortSignal),
+            }),
+          ),
         ),
     });
+  } else if (mutationMode === 'conditional') {
+    const canCreate = workspace.allows('create');
+    const canReplace = workspace.allows('replace');
+    if (canCreate || canReplace) {
+      const createSchema = z
+        .object({ ...commonWriteShape, mode: z.literal('create') })
+        .strict();
+      const replaceSchema = z
+        .object({
+          ...commonWriteShape,
+          mode: z.literal('replace'),
+          etag: etagSchema,
+        })
+        .strict();
+      const inputSchema =
+        canCreate && canReplace
+          ? z.discriminatedUnion('mode', [createSchema, replaceSchema])
+          : canCreate
+            ? createSchema
+            : replaceSchema;
+
+      tools.workspace_write_file = tool<
+        z.infer<typeof inputSchema>,
+        unknown,
+        Record<string, unknown>
+      >({
+        description:
+          canCreate && canReplace
+            ? 'Create a new UTF-8 text file or replace an existing file inside the mounted workspace. Create fails if the destination exists; replace requires its current ETag.'
+            : canCreate
+              ? 'Create a new UTF-8 text file inside the mounted workspace. The operation fails if the destination already exists.'
+              : 'Replace an existing UTF-8 text file inside the mounted workspace using its current ETag.',
+        // The combined create/replace schema is a discriminated union. OpenAI
+        // strict function tools reject its root-level oneOf, while the runtime
+        // Zod schema continues to validate every tool call in non-strict mode.
+        strict: !(canCreate && canReplace),
+        inputSchema,
+        needsApproval: resolveApproval('workspace_write_file', requireApproval),
+        execute: (input, { abortSignal }) =>
+          executeCreateAware(
+            abortSignal,
+            input,
+            async () =>
+              serializeFile(
+                input.mode === 'create'
+                  ? await workspace.writeFile(input.path, input.content, {
+                      mode: 'create',
+                      ...operationOptions(abortSignal),
+                    })
+                  : await workspace.writeFile(input.path, input.content, {
+                      mode: 'replace',
+                      etag: input.etag,
+                      ...operationOptions(abortSignal),
+                    }),
+              ),
+            mapCreateConflict,
+          ),
+      });
+    }
   }
 
-  const canCopy =
-    workspace.allows('copy') &&
-    workspace.allows('read') &&
-    workspace.allows('create');
-  if (canCopy) {
+  const canCopy = workspace.allows('copy') && workspace.allows('read');
+  if (
+    mutationMode === 'last-write-wins' &&
+    canCopy &&
+    workspace.allows('write')
+  ) {
+    tools.workspace_copy_file = tool({
+      description:
+        'Copy the latest readable contents of a file inside the mounted workspace. The source remains intact, and an existing destination is overwritten.',
+      strict: true,
+      inputSchema: z
+        .object({
+          source: logicalPath(
+            'Source file path',
+            workspace.limits.maxPathBytes,
+          ),
+          destination: logicalPath(
+            'Destination file path',
+            workspace.limits.maxPathBytes,
+          ),
+        })
+        .strict(),
+      needsApproval: resolveApproval('workspace_copy_file', requireApproval),
+      execute: ({ source, destination }, { abortSignal }) =>
+        executeSafely(abortSignal, async () =>
+          serializeFile(
+            await workspace.copyFile(source, destination, {
+              mode: 'overwrite',
+              ...operationOptions(abortSignal),
+            }),
+          ),
+        ),
+    });
+  } else if (
+    mutationMode === 'conditional' &&
+    canCopy &&
+    workspace.allows('create')
+  ) {
     tools.workspace_copy_file = tool({
       description:
         'Copy an exact observed version of a file inside the mounted workspace. The source remains intact, and the operation fails if the source changed or the destination already exists.',
@@ -624,12 +698,13 @@ export function createAiSdkWorkspaceTools<
     });
   }
 
-  const canMove =
+  if (
+    mutationMode === 'conditional' &&
     workspace.allows('move') &&
     workspace.allows('read') &&
-    workspace.allows('create') &&
-    workspace.allows('delete');
-  if (canMove) {
+    workspace.allows('delete') &&
+    workspace.allows('create')
+  ) {
     tools.workspace_move_file = tool({
       description:
         "Move a file inside the mounted workspace using the source's current ETag. The operation fails if the destination already exists. If source deletion cannot be confirmed, the destination is retained and the tool reports a conflict; inspect both paths before retrying.",
@@ -662,7 +737,27 @@ export function createAiSdkWorkspaceTools<
     });
   }
 
-  if (workspace.allows('delete')) {
+  if (
+    mutationMode === 'last-write-wins' &&
+    workspace.allows('delete') &&
+    workspace.allows('write')
+  ) {
+    tools.workspace_delete_file = tool({
+      description:
+        'Unconditionally delete the current file at a path inside the mounted workspace.',
+      strict: true,
+      inputSchema: z.object({ path: pathSchema }).strict(),
+      needsApproval: resolveApproval('workspace_delete_file', requireApproval),
+      execute: ({ path }, { abortSignal }) =>
+        executeSafely(abortSignal, async () => {
+          await workspace.deleteFile(path, {
+            mode: 'unconditional',
+            ...operationOptions(abortSignal),
+          });
+          return { deleted: true as const, path };
+        }),
+    });
+  } else if (mutationMode === 'conditional' && workspace.allows('delete')) {
     tools.workspace_delete_file = tool({
       description:
         'Delete a file inside the mounted workspace using its current ETag.',
