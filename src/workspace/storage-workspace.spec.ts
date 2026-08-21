@@ -8,6 +8,8 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { handlers } from 'files-sdk';
+
 import { createFsStorageDriver } from '../files-sdk/fs/index.js';
 import { StorageClient } from '../storage.client.js';
 import { StorageError, StorageErrorCode } from '../storage.error.js';
@@ -213,6 +215,39 @@ describe('StorageWorkspace', () => {
     await expect(workspace.stat('src/a.ts')).rejects.toMatchObject({
       code: StorageErrorCode.NOT_FOUND,
     });
+  });
+
+  it('fails workspace writes closed when Files plugins cannot intercept conditional operations', async () => {
+    const transform = vi.fn();
+    const driver = createFsStorageDriver({
+      adapter: { root },
+      plugins: [
+        {
+          name: 'body-transform',
+          wrap: handlers({
+            upload: (operation, next) => {
+              transform(operation.body);
+              return next({ ...operation, body: 'ciphertext' });
+            },
+          }),
+        },
+      ],
+    });
+    const workspace = mountStorageWorkspace(
+      new StorageClient('files-policy', driver),
+      { permissions: ALL_PERMISSIONS, prefix: 'runs/run-1' },
+    );
+
+    await expect(
+      workspace.writeFile('plaintext.txt', 'plaintext', { mode: 'create' }),
+    ).rejects.toMatchObject({
+      code: StorageErrorCode.NOT_SUPPORTED,
+      permanent: true,
+    });
+    expect(transform).not.toHaveBeenCalled();
+    await expect(driver.exists('runs/run-1/plaintext.txt')).resolves.toBe(
+      false,
+    );
   });
 
   it('rejects non-canonical ETags for every conditional mutation', async () => {
