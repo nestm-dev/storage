@@ -7,7 +7,9 @@
   "changesets": [
     "add-agent-workspaces",
     "add-artifact-storage",
+    "add-workspace-last-write-wins",
     "compose-workspace-tool-conflicts",
+    "fail-closed-conditional-files-policy",
     "fix-workspace-cursor-continuity",
     "framework-neutral-core",
     "harden-storage-boundaries",

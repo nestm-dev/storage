@@ -1,5 +1,30 @@
 # @nestm/storage
 
+## 0.1.0-alpha.9
+
+### Minor Changes
+
+- aec25d6: Add explicit last-write-wins workspace write, copy, and unconditional-delete
+  operations that traverse the ordinary Files SDK plugin, hook, and receipt
+  pipeline while retaining the existing native conditional create, replace,
+  copy, move, and delete variants. Unconditional delete requires both `write` and
+  `delete`; move remains conditional-only because a non-atomic
+  download/upload/delete sequence could delete a newer source generation. Add a
+  separate `write` permission and an AI tool factory mutation-mode switch whose
+  default remains conditional.
+
+  Add bounded binary workspace reads through `readBytes`, alongside the existing
+  UTF-8 `readText` API. `readBytes` is a required `StorageWorkspace` member, so
+  custom interface implementations and typed test doubles must add it when
+  upgrading; workspaces returned by `mountStorageWorkspace` need no changes.
+
+### Patch Changes
+
+- 37e0d8d: Fail conditional storage operations closed when caller-configured Files SDK
+  plugins, hooks, or receipts would be bypassed by native adapter extensions.
+  Ordinary operations continue through Files SDK while incompatible conditional
+  capabilities are hidden until Files SDK exposes one shared interception boundary.
+
 ## 0.1.0-alpha.8
 
 ### Minor Changes
