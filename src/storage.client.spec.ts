@@ -119,6 +119,51 @@ describe('StorageClient', () => {
     );
   });
 
+  it('enforces capability-declared copy predicate counterparts', async () => {
+    const driver = createMemoryStorageDriver();
+    const promote = vi.fn(async () => undefined);
+    Object.defineProperty(driver, 'capabilities', {
+      value: {
+        ...driver.capabilities,
+        conditionalCopyDestination: {
+          atomicWithSource: true,
+          create: true,
+          replace: true,
+          requiresSourcePredicate: true,
+        },
+        conditionalCopySource: {
+          etag: true,
+          requiresDestinationPredicate: true,
+          version: false,
+        },
+      },
+    });
+    driver.promote = promote;
+    const client = new StorageClient('media', driver);
+
+    expect(() =>
+      client.promote('staging.bin', 'final.bin', {
+        sourceEtag: 'source-etag',
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.NOT_SUPPORTED }),
+    );
+    expect(() =>
+      client.promote('staging.bin', 'final.bin', {
+        destination: { type: 'create' },
+      }),
+    ).toThrow(
+      expect.objectContaining({ code: StorageErrorCode.NOT_SUPPORTED }),
+    );
+    expect(promote).not.toHaveBeenCalled();
+
+    await client.promote('staging.bin', 'final.bin', {
+      destination: { type: 'create' },
+      sourceEtag: 'source-etag',
+    });
+    expect(promote).toHaveBeenCalledOnce();
+  });
+
   it('rejects unconditional promotion and unsupported drivers', async () => {
     const client = new StorageClient('media', createMemoryStorageDriver());
 
@@ -191,6 +236,111 @@ describe('StorageClient', () => {
     });
     expect(deleteConditional).toHaveBeenCalledWith('note.txt', {
       condition: { etag: 'next-etag' },
+    });
+  });
+
+  it('marks conditional mutations applied when a Storage after-operation plugin fails', async () => {
+    const driver = createMemoryStorageDriver();
+    const uploadConditional = vi.fn(async (key: string) => ({
+      contentType: 'text/plain',
+      etag: 'committed-etag',
+      key,
+      size: 4,
+    }));
+    const deleteConditional = vi.fn(async () => undefined);
+    const promote = vi.fn(async () => undefined);
+    Object.defineProperty(driver, 'capabilities', {
+      value: {
+        ...driver.capabilities,
+        conditionalCopyDestination: {
+          atomicWithSource: true,
+          create: true,
+          replace: false,
+        },
+        conditionalCopySource: { etag: true, version: false },
+        conditionalCreate: { resultEtag: true },
+        conditionalDelete: { etag: true },
+      },
+    });
+    driver.uploadConditional = uploadConditional;
+    driver.deleteConditional = deleteConditional;
+    driver.promote = promote;
+    const observedErrors: unknown[] = [];
+    const client = new StorageClient('media', driver, [
+      {
+        async afterOperation() {
+          throw new Error('private mandatory audit failure');
+        },
+        onError(_context, error) {
+          observedErrors.push(error);
+        },
+      },
+    ]);
+
+    await expect(
+      client.uploadConditional('created.txt', 'body', {
+        condition: { type: 'create' },
+      }),
+    ).rejects.toMatchObject({
+      applied: true,
+      appliedEtag: 'committed-etag',
+      code: StorageErrorCode.PROVIDER,
+    });
+    await expect(
+      client.deleteConditional('deleted.txt', {
+        condition: { etag: 'current-etag' },
+      }),
+    ).rejects.toMatchObject({
+      applied: true,
+      appliedEtag: undefined,
+      code: StorageErrorCode.PROVIDER,
+    });
+    await expect(
+      client.promote('source.txt', 'destination.txt', {
+        destination: { type: 'create' },
+        sourceEtag: 'source-etag',
+      }),
+    ).rejects.toMatchObject({
+      applied: true,
+      appliedEtag: undefined,
+      code: StorageErrorCode.PROVIDER,
+    });
+
+    expect(uploadConditional).toHaveBeenCalledOnce();
+    expect(deleteConditional).toHaveBeenCalledOnce();
+    expect(promote).toHaveBeenCalledOnce();
+    expect(observedErrors).toHaveLength(3);
+    expect(observedErrors).toEqual([
+      expect.objectContaining({ applied: true }),
+      expect.objectContaining({ applied: true }),
+      expect.objectContaining({ applied: true }),
+    ]);
+  });
+
+  it('marks a resolved conditional write applied when its advertised ETag is missing', async () => {
+    const driver = createMemoryStorageDriver();
+    Object.defineProperty(driver, 'capabilities', {
+      value: {
+        ...driver.capabilities,
+        conditionalCreate: { resultEtag: true },
+      },
+    });
+    driver.uploadConditional = vi.fn(async (key: string) => ({
+      contentType: 'text/plain',
+      key,
+      size: 4,
+    }));
+    const client = new StorageClient('media', driver);
+
+    await expect(
+      client.uploadConditional('created.txt', 'body', {
+        condition: { type: 'create' },
+      }),
+    ).rejects.toMatchObject({
+      applied: true,
+      appliedEtag: undefined,
+      code: StorageErrorCode.PROVIDER,
+      permanent: true,
     });
   });
 

@@ -18,11 +18,15 @@ describe('StorageError', () => {
       readonly aborted = false;
       readonly timedOut = false;
       readonly permanent = true;
+      readonly applied = true;
+      readonly appliedEtag = 'committed-etag';
     }
 
     const error = new ForeignStorageError('missing');
     expect(isStorageError(error)).toBe(true);
     expect(normalizeStorageError(error)).toBe(error);
+    expect(error.applied).toBe(true);
+    expect(error.appliedEtag).toBe('committed-etag');
   });
 
   it('recognizes the exact legacy structural shape without a brand', () => {
@@ -38,6 +42,55 @@ describe('StorageError', () => {
     });
 
     expect(isStorageError(error)).toBe(true);
+  });
+
+  it('defaults reconciliation metadata and preserves an applied ETag', () => {
+    const unapplied = new StorageError('not committed', {
+      code: StorageErrorCode.CONFLICT,
+    });
+    const applied = new StorageError('commit acknowledgement failed', {
+      applied: true,
+      appliedEtag: 'committed-etag',
+      code: StorageErrorCode.PROVIDER,
+    });
+
+    expect(unapplied.applied).toBe(false);
+    expect(unapplied.appliedEtag).toBeUndefined();
+    expect(applied.applied).toBe(true);
+    expect(applied.appliedEtag).toBe('committed-etag');
+  });
+
+  it('only retains a canonical applied ETag with positive applied evidence', () => {
+    const unapplied = new StorageError('not committed', {
+      appliedEtag: 'unconfirmed-etag',
+      code: StorageErrorCode.PROVIDER,
+    });
+    const malformed = new StorageError('bad provider metadata', {
+      applied: true,
+      appliedEtag: '"quoted-etag"',
+      code: StorageErrorCode.PROVIDER,
+    });
+
+    expect(unapplied.appliedEtag).toBeUndefined();
+    expect(malformed.appliedEtag).toBeUndefined();
+  });
+
+  it.each([
+    { applied: 'true' },
+    { appliedEtag: 42 },
+    { appliedEtag: '"quoted-etag"' },
+    { applied: false, appliedEtag: 'unconfirmed-etag' },
+  ])('rejects malformed reconciliation metadata: %o', (metadata) => {
+    const error = Object.assign(new Error('foreign'), {
+      aborted: false,
+      code: StorageErrorCode.PROVIDER,
+      name: 'StorageError',
+      permanent: false,
+      timedOut: false,
+      ...metadata,
+    });
+
+    expect(isStorageError(error)).toBe(false);
   });
 
   it('does not classify unrelated errors from a coincidental code or name', () => {

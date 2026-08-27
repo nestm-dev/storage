@@ -110,6 +110,12 @@ Profiles that advertise source and destination predicates but leave
 `atomicWithSource` false run the same complete cross-product as negative cases:
 every combined pair must fail before it can alter the destination.
 
+When a provider exposes only paired conditional copy, set
+`conditionalCopySource.requiresDestinationPredicate` and
+`conditionalCopyDestination.requiresSourcePredicate`. The harness then proves
+that either predicate fails closed when exercised alone, while still running
+the advertised paired combinations through the atomicity matrix.
+
 Run only these suites with:
 
 ```sh

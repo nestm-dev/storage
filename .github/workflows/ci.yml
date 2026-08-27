@@ -58,7 +58,7 @@ jobs:
       - run: pnpm run test
         env: { CI: 'true' }
 
-  # Non-blocking early warning for changes in Nest's prerelease API.
+  # Non-blocking early warning for changes in Nest's next release line.
   canary:
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -73,17 +73,3 @@ jobs:
       - run: pnpm install --no-frozen-lockfile
       - run: pnpm up "@nestjs/*@next"
       - run: pnpm run test
-
-  npm-peer-smoke:
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
-    steps:
-      - uses: actions/setup-node@v7
-        with: { node-version: 24 }
-      - run: |
-          mkdir smoke && cd smoke && npm init -y > /dev/null
-          if npm install @nestjs/common@next @nestjs/core@next @nestjs/platform-express@next reflect-metadata rxjs --no-audit --no-fund; then
-            echo "::warning::Nest 12 alpha sibling peers appear fixed — review pnpm-workspace.yaml and README."
-          else
-            echo "npm ERESOLVE still present (expected while Nest 12 alphas declare stale sibling peers)."
-          fi

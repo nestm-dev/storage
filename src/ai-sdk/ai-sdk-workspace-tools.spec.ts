@@ -892,6 +892,39 @@ describe('createAiSdkWorkspaceTools', () => {
     });
   });
 
+  it('does not map an applied create conflict as an ordinary collision', async () => {
+    const fixture = createWorkspaceDouble(['create']);
+    fixture.writeFile.mockRejectedValue(
+      new StorageWorkspaceError('private post-commit detail', {
+        applied: true,
+        appliedEtag: 'committed-etag',
+        code: StorageErrorCode.CONFLICT,
+        operation: 'writeFile',
+        path: 'existing.txt',
+      }),
+    );
+    const mapCreateConflict = vi.fn(() => ({
+      kind: 'already-exists' as const,
+    }));
+    const tools = createAiSdkWorkspaceTools({
+      workspace: fixture.workspace,
+      mapCreateConflict,
+    });
+
+    await expect(
+      executeTool(tools, 'workspace_write_file', {
+        path: 'existing.txt',
+        content: 'new',
+        mode: 'create',
+      }),
+    ).rejects.toMatchObject({
+      applied: true,
+      appliedEtag: 'committed-etag',
+      code: StorageErrorCode.CONFLICT,
+    });
+    expect(mapCreateConflict).not.toHaveBeenCalled();
+  });
+
   it('sanitizes failures thrown by a create-conflict mapper', async () => {
     const fixture = createWorkspaceDouble(['create']);
     fixture.writeFile.mockRejectedValue(
@@ -944,6 +977,8 @@ describe('createAiSdkWorkspaceTools', () => {
       message: 'The requested workspace path was not found.',
     });
     expect((notFound as Error & { cause?: unknown }).cause).toBeUndefined();
+    expect(notFound).not.toHaveProperty('applied');
+    expect(notFound).not.toHaveProperty('appliedEtag');
     expect(JSON.stringify(notFound)).not.toContain('secret');
 
     fixture.stat.mockRejectedValueOnce(
@@ -957,6 +992,55 @@ describe('createAiSdkWorkspaceTools', () => {
       message: 'The workspace operation failed.',
     });
     expect(String(provider)).not.toContain('provider.invalid');
+  });
+
+  it('retains only bounded post-commit reconciliation metadata', async () => {
+    const fixture = createWorkspaceDouble(['create']);
+    fixture.writeFile.mockRejectedValueOnce(
+      new StorageWorkspaceError('private post-commit provider detail', {
+        applied: true,
+        appliedEtag: 'committed-etag',
+        code: StorageErrorCode.PROVIDER,
+        operation: 'writeFile',
+        path: 'private.txt',
+      }),
+    );
+    const tools = createAiSdkWorkspaceTools({ workspace: fixture.workspace });
+
+    const applied = await executeTool(tools, 'workspace_write_file', {
+      content: 'committed body',
+      mode: 'create',
+      path: 'private.txt',
+    }).catch((error: unknown) => error);
+    expect(applied).toBeInstanceOf(AiSdkWorkspaceToolError);
+    expect(applied).toMatchObject({
+      applied: true,
+      appliedEtag: 'committed-etag',
+      code: StorageErrorCode.PROVIDER,
+      message: 'The workspace operation failed.',
+    });
+    expect(JSON.stringify(applied)).not.toContain('private');
+
+    fixture.writeFile.mockRejectedValueOnce(
+      new StorageWorkspaceError('private malformed ETag detail', {
+        applied: true,
+        appliedEtag: 'unsafe\r\nX-Provider-Secret: leaked',
+        code: StorageErrorCode.PROVIDER,
+        operation: 'writeFile',
+        path: 'private.txt',
+      }),
+    );
+    const malformed = await executeTool(tools, 'workspace_write_file', {
+      content: 'committed body',
+      mode: 'create',
+      path: 'private.txt',
+    }).catch((error: unknown) => error);
+    expect(malformed).toMatchObject({
+      applied: true,
+      code: StorageErrorCode.PROVIDER,
+    });
+    expect(malformed).not.toHaveProperty('appliedEtag');
+    expect(JSON.stringify(malformed)).not.toContain('X-Provider-Secret');
   });
 
   it('reports an aborted call without exposing the underlying failure', async () => {

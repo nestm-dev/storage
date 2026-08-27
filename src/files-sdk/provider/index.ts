@@ -18,7 +18,10 @@ import {
   type FilesSdkStorageDriver,
 } from '../files-sdk.driver.js';
 import type { S3Adapter, S3ProviderProfile } from '../s3/index.js';
-import { recordS3ConstructionMetadata } from '../s3/construction-metadata.js';
+import {
+  recordS3ConditionalRequestPermission,
+  recordS3ConstructionMetadata,
+} from '../s3/construction-metadata.js';
 
 /** Slug of a storage provider this package can build a driver for. */
 export type StorageProviderName = ProviderSlug;
@@ -110,9 +113,14 @@ async function resolveAdapter(
   config: StorageProviderConfig | undefined,
   s3ProviderProfile: S3ProviderProfile | undefined,
 ): Promise<Adapter> {
+  const loaderConfig = withVerifiedS3ConditionalOptIn(
+    provider,
+    config,
+    s3ProviderProfile,
+  );
   let resolved;
   try {
-    resolved = await loadFiles({ ...config, provider });
+    resolved = await loadFiles({ ...loaderConfig, provider });
   } catch (error) {
     throw mapFilesSdkError(error);
   }
@@ -137,6 +145,12 @@ async function resolveAdapter(
       ? configJsonPublicBaseUrl
       : undefined);
   const s3Adapter = adapter as Parameters<typeof withS3Capabilities>[0];
+  if (provider === 's3') {
+    recordS3ConditionalRequestPermission(
+      s3Adapter.raw,
+      config?.configJson?.conditional !== false,
+    );
+  }
   recordS3ConstructionMetadata(s3Adapter.raw, {
     publicBaseUrlConfigured:
       provider !== 's3' ||
@@ -154,6 +168,33 @@ async function resolveAdapter(
       providerProfile: s3ProviderProfile,
     }),
   });
+}
+
+function withVerifiedS3ConditionalOptIn(
+  provider: StorageProviderName,
+  config: StorageProviderConfig | undefined,
+  s3ProviderProfile: S3ProviderProfile | undefined,
+): StorageProviderConfig | undefined {
+  const configJsonEndpoint = config?.configJson?.endpoint;
+  const hasCustomEndpoint =
+    config?.endpoint !== undefined || configJsonEndpoint !== undefined;
+  if (
+    provider !== 's3' ||
+    s3ProviderProfile === undefined ||
+    config === undefined ||
+    !hasCustomEndpoint ||
+    config.configJson?.conditional !== undefined
+  ) {
+    return config;
+  }
+
+  // files-sdk requires this construction-time opt-in before it exposes native
+  // conditional primitives for a custom endpoint. The branded provider profile
+  // still narrows the exposed operations in withS3Capabilities below.
+  return {
+    ...config,
+    configJson: { ...config.configJson, conditional: true },
+  };
 }
 
 function unknownProvider(provider: string): StorageError {

@@ -220,7 +220,7 @@ describe('StorageWorkspace', () => {
     });
   });
 
-  it('fails workspace writes closed when Files plugins cannot intercept conditional operations', async () => {
+  it('runs conditional workspace writes through Files body transforms', async () => {
     const transform = vi.fn();
     const driver = createFsStorageDriver({
       adapter: { root },
@@ -243,17 +243,52 @@ describe('StorageWorkspace', () => {
 
     await expect(
       workspace.writeFile('plaintext.txt', 'plaintext', { mode: 'create' }),
-    ).rejects.toMatchObject({
-      code: StorageErrorCode.NOT_SUPPORTED,
-      permanent: true,
-    });
-    expect(transform).not.toHaveBeenCalled();
-    await expect(driver.exists('runs/run-1/plaintext.txt')).resolves.toBe(
-      false,
+    ).resolves.toMatchObject({ path: 'plaintext.txt' });
+    expect(transform).toHaveBeenCalledOnce();
+    expect(transform).toHaveBeenCalledWith('plaintext');
+    expect(readFileSync(join(root, 'runs/run-1/plaintext.txt'), 'utf8')).toBe(
+      'ciphertext',
     );
   });
 
-  it('routes overwrite reads and writes through the Files encryption plugin', async () => {
+  it('preserves applied metadata when a post-commit Files plugin fails', async () => {
+    const driver = createFsStorageDriver({
+      adapter: { root },
+      plugins: [
+        {
+          name: 'failing-observer',
+          wrap: handlers({
+            upload: async (operation, next) => {
+              await next(operation);
+              throw new Error('private observer detail');
+            },
+          }),
+        },
+      ],
+    });
+    const workspace = mountStorageWorkspace(
+      new StorageClient('applied-workspace', driver),
+      { permissions: ALL_PERMISSIONS, prefix: 'runs/run-1' },
+    );
+
+    const error = await workspace
+      .writeFile('applied.txt', 'committed', { mode: 'create' })
+      .catch((cause: unknown) => cause);
+
+    expect(error).toMatchObject({
+      applied: true,
+      appliedEtag: expect.any(String),
+      code: StorageErrorCode.PROVIDER,
+      message: 'Workspace create failed for "applied.txt".',
+      name: 'StorageWorkspaceError',
+    });
+    expect(String(error)).not.toContain('private observer detail');
+    expect(readFileSync(join(root, 'runs/run-1/applied.txt'), 'utf8')).toBe(
+      'committed',
+    );
+  });
+
+  it('routes conditional and overwrite writes through Files encryption', async () => {
     const driver = createFsStorageDriver({
       adapter: { root },
       plugins: [encryption(new Uint8Array(32).fill(0x5a))],
@@ -261,33 +296,40 @@ describe('StorageWorkspace', () => {
     const workspace = mountStorageWorkspace(
       new StorageClient('encrypted-overwrite', driver),
       {
-        permissions: ['read', 'write', 'copy', 'delete'],
+        permissions: ['read', 'write', 'create', 'replace', 'copy', 'delete'],
         prefix: 'runs/run-1',
       },
     );
 
-    await workspace.writeFile('protected.txt', 'first plaintext', {
-      mode: 'overwrite',
-    });
+    const created = await workspace.writeFile(
+      'protected.txt',
+      'first plaintext',
+      { mode: 'create' },
+    );
     await workspace.writeFile('protected.txt', 'second plaintext', {
+      etag: created.etag as string,
+      mode: 'replace',
+    });
+    await workspace.writeFile('protected.txt', 'latest plaintext', {
       mode: 'overwrite',
     });
 
     await expect(workspace.readText('protected.txt')).resolves.toMatchObject({
-      text: 'second plaintext',
+      text: 'latest plaintext',
     });
     const raw = readFileSync(join(root, 'runs/run-1/protected.txt'));
     expect(raw.includes(Buffer.from('first plaintext'))).toBe(false);
     expect(raw.includes(Buffer.from('second plaintext'))).toBe(false);
+    expect(raw.includes(Buffer.from('latest plaintext'))).toBe(false);
 
     await workspace.copyFile('protected.txt', 'copied.txt', {
       mode: 'overwrite',
     });
     await expect(workspace.readText('copied.txt')).resolves.toMatchObject({
-      text: 'second plaintext',
+      text: 'latest plaintext',
     });
     const copiedRaw = readFileSync(join(root, 'runs/run-1/copied.txt'));
-    expect(copiedRaw.includes(Buffer.from('second plaintext'))).toBe(false);
+    expect(copiedRaw.includes(Buffer.from('latest plaintext'))).toBe(false);
     expect(copiedRaw.equals(raw)).toBe(false);
 
     await workspace.deleteFile('copied.txt', { mode: 'unconditional' });
@@ -1088,7 +1130,11 @@ describe('StorageWorkspace', () => {
       workspace.moveFile('source.txt', 'moved.txt', {
         etag: source.etag ?? '',
       }),
-    ).rejects.toMatchObject({ code: StorageErrorCode.CONFLICT });
+    ).rejects.toMatchObject({
+      applied: true,
+      appliedEtag: expect.any(String),
+      code: StorageErrorCode.CONFLICT,
+    });
     await expect(workspace.stat('source.txt')).resolves.toBeDefined();
     await expect(workspace.stat('moved.txt')).resolves.toBeDefined();
 
@@ -1125,7 +1171,11 @@ describe('StorageWorkspace', () => {
         etag: source.etag ?? '',
         signal: controller.signal,
       }),
-    ).rejects.toMatchObject({ code: StorageErrorCode.CONFLICT });
+    ).rejects.toMatchObject({
+      applied: true,
+      appliedEtag: expect.any(String),
+      code: StorageErrorCode.CONFLICT,
+    });
     expect(controller.signal.aborted).toBe(true);
     await expect(workspace.stat('moved.txt')).resolves.toBeDefined();
   });
@@ -1153,7 +1203,11 @@ describe('StorageWorkspace', () => {
       workspace.moveFile('source.txt', 'moved.txt', {
         etag: source.etag ?? '',
       }),
-    ).rejects.toMatchObject({ code: StorageErrorCode.CONFLICT });
+    ).rejects.toMatchObject({
+      applied: true,
+      appliedEtag: expect.any(String),
+      code: StorageErrorCode.CONFLICT,
+    });
     await expect(workspace.stat('source.txt')).rejects.toMatchObject({
       code: StorageErrorCode.NOT_FOUND,
     });

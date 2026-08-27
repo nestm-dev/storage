@@ -43,6 +43,10 @@ export const DEFAULT_BUFFER_LIMIT = 10 * 1024 * 1024;
 type BulkOperationOptions = StorageBulkOptions & StorageOperationOptions;
 type DownloadManyOptions = StorageBulkOptions & StorageDownloadOptions;
 
+interface AppliedMutationSettlement {
+  readonly appliedEtag?: string;
+}
+
 function assertKey(key: string, label = 'key'): void {
   if (typeof key !== 'string' || key.length === 0) {
     throw new StorageError(`${label} must be a non-empty string.`, {
@@ -354,8 +358,28 @@ export class StorageClient {
       );
     }
 
-    return this.#execute({ key, operation: 'upload', store: this.name }, () =>
-      uploadConditional.call(this.#driver, key, body, options),
+    return this.#execute(
+      { key, operation: 'upload', store: this.name },
+      () => uploadConditional.call(this.#driver, key, body, options),
+      (result) => {
+        if (capability.resultEtag && !isCanonicalStorageEtag(result.etag)) {
+          throw new StorageError(
+            `Store "${this.name}" committed a conditional upload without the advertised result ETag.`,
+            {
+              code: StorageErrorCode.PROVIDER,
+              key,
+              operation: 'upload',
+              permanent: true,
+              store: this.name,
+            },
+          );
+        }
+        return {
+          ...(isCanonicalStorageEtag(result.etag) && {
+            appliedEtag: result.etag,
+          }),
+        };
+      },
     );
   }
 
@@ -509,8 +533,10 @@ export class StorageClient {
       );
     }
 
-    return this.#execute({ key, operation: 'delete', store: this.name }, () =>
-      deleteConditional.call(this.#driver, key, options),
+    return this.#execute(
+      { key, operation: 'delete', store: this.name },
+      () => deleteConditional.call(this.#driver, key, options),
+      () => ({}),
     );
   }
 
@@ -599,16 +625,24 @@ export class StorageClient {
     const destinationCapability =
       this.#driver.capabilities.conditionalCopyDestination;
     const promote = this.#driver.promote;
+    const hasSourcePredicate =
+      sourceEtag !== undefined || sourceVersion !== undefined;
     if (
       promote === undefined ||
       (sourceEtag !== undefined && sourceCapability?.etag !== true) ||
       (sourceVersion !== undefined && sourceCapability?.version !== true) ||
+      (hasSourcePredicate &&
+        destination === undefined &&
+        sourceCapability?.requiresDestinationPredicate === true) ||
       (destination?.type === 'create' &&
         destinationCapability?.create !== true) ||
       (destination?.type === 'replace' &&
         destinationCapability?.replace !== true) ||
       (destination !== undefined &&
-        (sourceEtag !== undefined || sourceVersion !== undefined) &&
+        !hasSourcePredicate &&
+        destinationCapability?.requiresSourcePredicate === true) ||
+      (destination !== undefined &&
+        hasSourcePredicate &&
         destinationCapability?.atomicWithSource !== true)
     ) {
       throw new StorageError(
@@ -631,6 +665,7 @@ export class StorageClient {
         to: destinationKey,
       },
       () => promote.call(this.#driver, sourceKey, destinationKey, options),
+      () => ({}),
     );
   }
 
@@ -856,22 +891,49 @@ export class StorageClient {
   async #execute<Result>(
     context: StorageOperationContext,
     operation: () => Promise<Result>,
+    appliedMutation?: (result: Result) => AppliedMutationSettlement,
   ): Promise<Result> {
+    let appliedSettlement: AppliedMutationSettlement | undefined;
     try {
       for (const plugin of this.#plugins) {
         await plugin.beforeOperation?.(context);
       }
       const result = await operation();
+      if (appliedMutation !== undefined) {
+        // Settle before describing the result so even an unexpected local
+        // result-validation failure cannot turn a committed mutation into a
+        // safe-to-retry error.
+        appliedSettlement = {};
+        appliedSettlement = appliedMutation(result);
+      }
       for (const plugin of this.#plugins) {
         await plugin.afterOperation?.(context, result);
       }
       return result;
     } catch (error) {
-      const normalized = normalizeStorageError(error, {
+      let normalized = normalizeStorageError(error, {
         ...(context.key !== undefined && { key: context.key }),
         operation: context.operation,
         store: this.name,
       });
+      if (appliedSettlement !== undefined) {
+        normalized = new StorageError(normalized.message, {
+          aborted: normalized.aborted,
+          applied: true,
+          ...(isCanonicalStorageEtag(appliedSettlement.appliedEtag) && {
+            appliedEtag: appliedSettlement.appliedEtag,
+          }),
+          cause: normalized.cause,
+          code: normalized.code,
+          ...(normalized.key !== undefined && { key: normalized.key }),
+          ...(normalized.operation !== undefined && {
+            operation: normalized.operation,
+          }),
+          permanent: normalized.permanent,
+          ...(normalized.store !== undefined && { store: normalized.store }),
+          timedOut: normalized.timedOut,
+        });
+      }
       for (const plugin of this.#plugins) {
         try {
           await plugin.onError?.(context, normalized);

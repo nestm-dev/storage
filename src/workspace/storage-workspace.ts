@@ -958,6 +958,8 @@ class StorageWorkspaceImplementation implements StorageWorkspaceContract {
         StorageErrorCode.CONFLICT,
         `Workspace move could not confirm source deletion; destination "${destinationPath}" was retained. Inspect both paths before retrying.`,
         {
+          applied: true,
+          appliedEtag: copied.etag,
           operation: 'move',
           path: destinationPath,
           permanent: true,

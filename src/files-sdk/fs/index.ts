@@ -4,13 +4,19 @@ import * as fsp from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 
-import type {
-  Body,
-  DownloadOptions,
-  ListOptions,
-  ListResult,
-  OperationOptions,
-  StoredFile,
+import {
+  createStoredFile,
+  type AdapterConditionalOperations,
+  type AdapterDownloadOptions,
+  type AdapterUploadOptions,
+  type Body,
+  type ConditionalUploadResult,
+  type CopyCondition,
+  type DownloadOptions,
+  type ListOptions,
+  type ListResult,
+  type OperationOptions,
+  type StoredFile,
 } from 'files-sdk';
 import { fs, type FsAdapter, type FsAdapterOptions } from 'files-sdk/fs';
 
@@ -30,6 +36,7 @@ import type {
 } from '../../storage.types.js';
 import {
   createFilesSdkDriver,
+  mapStorageErrorToFilesSdkError,
   type FilesSdkConditionalCopyAdapter,
   type FilesSdkConditionalDeleteAdapter,
   type FilesSdkConditionalReadAdapter,
@@ -71,6 +78,54 @@ interface OperationRuntime {
   callerSignal: AbortSignal | undefined;
 }
 
+interface OperationRuntimeOptions {
+  readonly signal?: AbortSignal;
+  readonly timeout?: number;
+}
+
+function storedFileOfStorageObject(object: StorageObject): StoredFile {
+  return createStoredFile(
+    {
+      ...(object.etag !== undefined && { etag: object.etag }),
+      key: object.key,
+      ...(object.lastModified !== undefined && {
+        lastModified: object.lastModified.getTime(),
+      }),
+      ...(object.metadata !== undefined && {
+        metadata: { ...object.metadata },
+      }),
+      size: object.size,
+      type: object.contentType,
+    },
+    { factory: () => object.body, kind: 'stream' },
+  );
+}
+
+function conditionalUploadResultOf(
+  result: StorageUploadResult,
+): ConditionalUploadResult {
+  if (!isCanonicalStorageEtag(result.etag)) {
+    throw new StorageError(
+      'A conditional filesystem upload committed without a canonical ETag.',
+      {
+        applied: true,
+        code: StorageErrorCode.PROVIDER,
+        operation: 'upload',
+        permanent: true,
+      },
+    );
+  }
+  return {
+    contentType: result.contentType,
+    etag: result.etag,
+    key: result.key,
+    ...(result.lastModified !== undefined && {
+      lastModified: result.lastModified.getTime(),
+    }),
+    size: result.size,
+  };
+}
+
 function fsErrorCode(error: unknown): string | undefined {
   if (typeof error === 'object' && error !== null && 'code' in error) {
     return typeof error.code === 'string' ? error.code : undefined;
@@ -103,6 +158,25 @@ function storageFsError(
       code === StorageErrorCode.NOT_FOUND ||
       code === StorageErrorCode.CONFLICT ||
       code === StorageErrorCode.UNAUTHORIZED,
+  });
+}
+
+function appliedStorageFsError(
+  error: unknown,
+  key: string,
+  operation: 'copy' | 'delete' | 'upload',
+  appliedEtag?: string,
+): StorageError {
+  const mapped = storageFsError(error, key, operation);
+  return new StorageError(mapped.message, {
+    aborted: mapped.aborted,
+    applied: true,
+    ...(appliedEtag !== undefined && { appliedEtag }),
+    code: mapped.code,
+    key: mapped.key ?? key,
+    operation: mapped.operation ?? operation,
+    permanent: true,
+    timedOut: mapped.timedOut,
   });
 }
 
@@ -175,7 +249,7 @@ function notFound(key: string): never {
   });
 }
 
-function runtimeOf(options: StorageOperationOptions): OperationRuntime {
+function runtimeOf(options: OperationRuntimeOptions): OperationRuntime {
   const timeoutSignal =
     options.timeout === undefined || options.timeout <= 0
       ? undefined
@@ -559,6 +633,7 @@ const CONDITIONAL_FS_TAILS = new Map<string, Promise<void>>();
 async function serializeFsKey<Result>(
   lockKey: string,
   operation: () => Promise<Result>,
+  wait?: { readonly key: string; readonly runtime: OperationRuntime },
 ): Promise<Result> {
   const previous = CONDITIONAL_FS_TAILS.get(lockKey) ?? Promise.resolve();
   let release = (): void => undefined;
@@ -567,13 +642,53 @@ async function serializeFsKey<Result>(
   });
   const tail = previous.then(() => gate);
   CONDITIONAL_FS_TAILS.set(lockKey, tail);
-  await previous;
+  let acquired = false;
   try {
+    if (wait === undefined || wait.runtime.signal === undefined) {
+      await previous;
+    } else {
+      const signal = wait.runtime.signal;
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = (): void => signal.removeEventListener('abort', abort);
+        const abort = (): void => {
+          cleanup();
+          try {
+            assertActive(wait.runtime, wait.key);
+          } catch (error) {
+            reject(error);
+          }
+        };
+        signal.addEventListener('abort', abort, { once: true });
+        if (signal.aborted) {
+          abort();
+          return;
+        }
+        void previous.then(
+          () => {
+            cleanup();
+            resolve();
+          },
+          (error: unknown) => {
+            cleanup();
+            reject(error);
+          },
+        );
+      });
+    }
+    acquired = true;
     return await operation();
   } finally {
     release();
-    if (CONDITIONAL_FS_TAILS.get(lockKey) === tail) {
-      CONDITIONAL_FS_TAILS.delete(lockKey);
+    if (acquired) {
+      if (CONDITIONAL_FS_TAILS.get(lockKey) === tail) {
+        CONDITIONAL_FS_TAILS.delete(lockKey);
+      }
+    } else {
+      void tail.then(() => {
+        if (CONDITIONAL_FS_TAILS.get(lockKey) === tail) {
+          CONDITIONAL_FS_TAILS.delete(lockKey);
+        }
+      });
     }
   }
 }
@@ -582,33 +697,65 @@ async function serializeFsKey<Result>(
  * Adds symlink-defended reads and process-local exact conditional operations
  * to a files-sdk fs adapter.
  *
- * The configured root must be dedicated to this driver: no other process and
- * no unconditional filesystem writer may mutate it concurrently. Each call
- * rejects symlinks in the existing key path and uses exclusive same-directory
- * temporary files plus atomic renames, but Node has no portable `openat2`
- * equivalent that could make those checks safe against a hostile concurrent
- * tree rewrite. This is a CAS implementation for an exclusively-owned local
- * workspace, not a host-filesystem sandbox. Body and metadata sidecars are two
- * files, so a process crash between their renames can still require cleanup.
+ * The configured root must be dedicated to this decorated adapter: no other
+ * process, unwrapped adapter, or direct filesystem writer may mutate it
+ * concurrently. Ordinary adapter mutations and conditional operations share
+ * one process-local lock domain. Each call rejects symlinks in the existing key
+ * path and uses exclusive same-directory temporary files plus atomic renames,
+ * but Node has no portable `openat2` equivalent that could make those checks
+ * safe against a hostile concurrent tree rewrite. This is a CAS implementation
+ * for an exclusively-owned local workspace, not a host-filesystem sandbox.
+ * Body and metadata sidecars are two files, so a process crash between their
+ * renames can still require cleanup.
  */
 export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
   const root = path.resolve(base.root);
+  const copy = base.copy.bind(base);
+  const deleteObject = base.delete.bind(base);
   const download = base.download.bind(base);
   const exists = base.exists.bind(base);
   const head = base.head.bind(base);
   const list = base.list.bind(base);
+  const move = base.move?.bind(base);
+  const resumableUpload = base.resumableUpload?.bind(base);
+  const upload = base.upload.bind(base);
+  const identity = (key: string): string =>
+    path.resolve(root, key).normalize('NFC').toLowerCase();
   const serialize = <Result>(
     key: string,
     operation: () => Promise<Result>,
+    runtime?: OperationRuntime,
   ): Promise<Result> =>
-    serializeFsKey(`${root}\0${key.normalize('NFC').toLowerCase()}`, operation);
+    serializeFsKey(
+      identity(key),
+      operation,
+      runtime === undefined ? undefined : { key, runtime },
+    );
+  const serializeMutationPair = <Result>(
+    first: string,
+    second: string,
+    operation: () => Promise<Result>,
+    runtime?: OperationRuntime,
+  ): Promise<Result> => {
+    const firstIdentity = identity(first);
+    const secondIdentity = identity(second);
+    if (firstIdentity === secondIdentity) {
+      return serialize(first, operation, runtime);
+    }
+    const [headKey, tailKey] =
+      firstIdentity < secondIdentity ? [first, second] : [second, first];
+    return serialize(
+      headKey,
+      () => serialize(tailKey, operation, runtime),
+      runtime,
+    );
+  };
   const serializePair = <Result>(
     first: string,
     second: string,
     operation: () => Promise<Result>,
+    runtime?: OperationRuntime,
   ): Promise<Result> => {
-    const identity = (key: string): string =>
-      key.normalize('NFC').toLowerCase();
     if (identity(first) === identity(second)) {
       throw new StorageError(
         'Conditional filesystem copy requires distinct source and destination keys.',
@@ -620,22 +767,32 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
         },
       );
     }
-    const ordered = [first, second].sort((left, right) =>
-      identity(left).localeCompare(identity(right)),
-    );
-    const [headKey, tailKey] = ordered;
-    if (headKey === undefined || tailKey === undefined) {
-      throw new StorageError(
-        'Conditional filesystem copy requires distinct source and destination keys.',
-        {
-          code: StorageErrorCode.INVALID_ARGUMENT,
-          key: first,
-          operation: 'copy',
-          permanent: true,
-        },
-      );
+    return serializeMutationPair(first, second, operation, runtime);
+  };
+  const serializeFilesMutation = async <Result>(
+    key: string,
+    options: OperationOptions | undefined,
+    operation: () => Promise<Result>,
+  ): Promise<Result> => {
+    const runtime = runtimeOf(options ?? {});
+    try {
+      return await serialize(key, operation, runtime);
+    } catch (error) {
+      throw mapStorageErrorToFilesSdkError(error);
     }
-    return serialize(headKey, () => serialize(tailKey, operation));
+  };
+  const serializeFilesMutationPair = async <Result>(
+    first: string,
+    second: string,
+    options: OperationOptions | undefined,
+    operation: () => Promise<Result>,
+  ): Promise<Result> => {
+    const runtime = runtimeOf(options ?? {});
+    try {
+      return await serializeMutationPair(first, second, operation, runtime);
+    } catch (error) {
+      throw mapStorageErrorToFilesSdkError(error);
+    }
   };
   const assertEtag = (
     value: unknown,
@@ -653,7 +810,7 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
     }
   };
 
-  return Object.assign(base, {
+  const adapter = Object.assign(base, {
     conditionalCreate: Object.freeze({ resultEtag: true }),
     conditionalReplace: Object.freeze({ resultEtag: true }),
     conditionalDelete: Object.freeze({ etag: true }),
@@ -665,6 +822,16 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
       replace: true,
     }),
     physicalKey: Object.freeze({ maxBytes: 4096 }),
+    async copy(from, to, options) {
+      return serializeFilesMutationPair(from, to, options, () =>
+        copy(from, to, options),
+      );
+    },
+    async delete(key, options) {
+      return serializeFilesMutation(key, options, () =>
+        deleteObject(key, options),
+      );
+    },
     async download(
       key: string,
       options?: DownloadOptions,
@@ -676,6 +843,24 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
       key: string,
       options: StorageConditionalReadOptions,
     ): Promise<StorageObject> {
+      if (
+        typeof options !== 'object' ||
+        options === null ||
+        typeof options.condition !== 'object' ||
+        options.condition === null ||
+        (options.condition.etag === undefined &&
+          options.condition.version === undefined)
+      ) {
+        throw new StorageError(
+          'A conditional filesystem read requires an ETag or version.',
+          {
+            code: StorageErrorCode.INVALID_ARGUMENT,
+            key,
+            operation: 'download',
+            permanent: true,
+          },
+        );
+      }
       if (options.condition.etag !== undefined) {
         assertEtag(options.condition.etag, 'condition.etag', key, 'download');
       }
@@ -690,54 +875,75 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
           },
         );
       }
-      return serialize(key, async () => {
-        let handle: fsp.FileHandle | undefined;
-        try {
-          const runtime = runtimeOf(options);
-          const segments = strictSegments(key);
-          const bodyPath = await ensureParents(
-            root,
-            segments,
-            key,
-            false,
-            runtime,
-          );
-          const sidecarPath = bodyPath + SIDECAR_SUFFIX;
-          if (
-            (await regularFileOrMissing(bodyPath, key)) === undefined ||
-            (await regularFileOrMissing(sidecarPath, key)) === undefined
-          ) {
-            notFound(key);
-          }
-          const sidecar = await readSidecar(sidecarPath, key);
-          if (
-            options.condition.etag !== undefined &&
-            sidecar.etag !== options.condition.etag
-          ) {
-            conflict(key);
-          }
-          assertActive(runtime, key);
-          handle = await fsp.open(
-            bodyPath,
-            fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
-          );
-          const stat = await handle.stat();
-          if (!stat.isFile() || stat.nlink !== 1) {
-            invalidFsPath(key, 'an object path is not a regular file');
-          }
-          const start = options.range?.start ?? 0;
-          const requestedEnd = options.range?.end ?? Math.max(0, stat.size - 1);
-          const end = Math.min(requestedEnd, Math.max(0, stat.size - 1));
-          const size = start >= stat.size ? 0 : Math.max(0, end - start + 1);
-          if (size === 0) {
-            await handle.close();
+      const runtime = runtimeOf(options);
+      return serialize(
+        key,
+        async () => {
+          let handle: fsp.FileHandle | undefined;
+          try {
+            const segments = strictSegments(key);
+            const bodyPath = await ensureParents(
+              root,
+              segments,
+              key,
+              false,
+              runtime,
+            );
+            const sidecarPath = bodyPath + SIDECAR_SUFFIX;
+            if (
+              (await regularFileOrMissing(bodyPath, key)) === undefined ||
+              (await regularFileOrMissing(sidecarPath, key)) === undefined
+            ) {
+              notFound(key);
+            }
+            const sidecar = await readSidecar(sidecarPath, key);
+            if (
+              options.condition.etag !== undefined &&
+              sidecar.etag !== options.condition.etag
+            ) {
+              conflict(key);
+            }
+            assertActive(runtime, key);
+            handle = await fsp.open(
+              bodyPath,
+              fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+            );
+            const stat = await handle.stat();
+            if (!stat.isFile() || stat.nlink !== 1) {
+              invalidFsPath(key, 'an object path is not a regular file');
+            }
+            const start = options.range?.start ?? 0;
+            const requestedEnd =
+              options.range?.end ?? Math.max(0, stat.size - 1);
+            const end = Math.min(requestedEnd, Math.max(0, stat.size - 1));
+            const size = start >= stat.size ? 0 : Math.max(0, end - start + 1);
+            if (size === 0) {
+              await handle.close();
+              handle = undefined;
+              return {
+                body: new ReadableStream<Uint8Array>({
+                  start(controller) {
+                    controller.close();
+                  },
+                }),
+                contentType: sidecar.contentType,
+                etag: sidecar.etag,
+                key,
+                lastModified: new Date(sidecar.lastModified),
+                ...(sidecar.metadata !== undefined && {
+                  metadata: { ...sidecar.metadata },
+                }),
+                name: path.basename(key),
+                size: 0,
+              };
+            }
+            const nodeStream = handle.createReadStream({
+              autoClose: true,
+              ...(options.range !== undefined && { end, start }),
+            });
             handle = undefined;
             return {
-              body: new ReadableStream<Uint8Array>({
-                start(controller) {
-                  controller.close();
-                },
-              }),
+              body: Readable.toWeb(nodeStream) as ReadableStream<Uint8Array>,
               contentType: sidecar.contentType,
               etag: sidecar.etag,
               key,
@@ -746,31 +952,15 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
                 metadata: { ...sidecar.metadata },
               }),
               name: path.basename(key),
-              size: 0,
+              size,
             };
+          } catch (error) {
+            await handle?.close().catch(() => undefined);
+            throw storageFsError(error, key, 'download');
           }
-          const nodeStream = handle.createReadStream({
-            autoClose: true,
-            ...(options.range !== undefined && { end, start }),
-          });
-          handle = undefined;
-          return {
-            body: Readable.toWeb(nodeStream) as ReadableStream<Uint8Array>,
-            contentType: sidecar.contentType,
-            etag: sidecar.etag,
-            key,
-            lastModified: new Date(sidecar.lastModified),
-            ...(sidecar.metadata !== undefined && {
-              metadata: { ...sidecar.metadata },
-            }),
-            name: path.basename(key),
-            size,
-          };
-        } catch (error) {
-          await handle?.close().catch(() => undefined);
-          throw storageFsError(error, key, 'download');
-        }
-      });
+        },
+        runtime,
+      );
     },
     async exists(key: string, options?: OperationOptions): Promise<boolean> {
       await assertSymlinkFreeReadPath(root, key);
@@ -787,60 +977,100 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
       }
       return result;
     },
+    async move(from, to, options) {
+      return serializeFilesMutationPair(from, to, options, async () => {
+        if (move !== undefined) {
+          return move(from, to, options);
+        }
+        await copy(from, to, options);
+        await deleteObject(from, options);
+      });
+    },
     async deleteConditional(
       key: string,
       options: StorageConditionalDeleteOptions,
     ): Promise<void> {
-      assertEtag(options.condition.etag, 'condition.etag', key, 'delete');
-      return serialize(key, async () => {
-        const runtime = runtimeOf(options);
-        try {
-          const segments = strictSegments(key);
-          const bodyPath = await ensureParents(
-            root,
-            segments,
+      if (
+        typeof options !== 'object' ||
+        options === null ||
+        typeof options.condition !== 'object' ||
+        options.condition === null
+      ) {
+        throw new StorageError(
+          'A conditional filesystem delete requires an ETag.',
+          {
+            code: StorageErrorCode.INVALID_ARGUMENT,
             key,
-            false,
-            runtime,
-          );
-          const sidecarPath = bodyPath + SIDECAR_SUFFIX;
-          if (
-            (await regularFileOrMissing(bodyPath, key)) === undefined ||
-            (await regularFileOrMissing(sidecarPath, key)) === undefined
-          ) {
-            notFound(key);
-          }
-          const sidecar = await readSidecar(sidecarPath, key);
-          if (sidecar.etag !== options.condition.etag) {
-            conflict(key);
-          }
-
-          assertActive(runtime, key);
-          await ensureParents(root, segments, key, false, runtime);
-          if (
-            (await regularFileOrMissing(bodyPath, key)) === undefined ||
-            (await regularFileOrMissing(sidecarPath, key)) === undefined ||
-            (await readSidecar(sidecarPath, key)).etag !==
-              options.condition.etag
-          ) {
-            conflict(key);
-          }
-          await fsp.unlink(bodyPath);
+            operation: 'delete',
+            permanent: true,
+          },
+        );
+      }
+      assertEtag(options.condition.etag, 'condition.etag', key, 'delete');
+      const runtime = runtimeOf(options);
+      return serialize(
+        key,
+        async () => {
+          let applied = false;
           try {
+            const segments = strictSegments(key);
+            const bodyPath = await ensureParents(
+              root,
+              segments,
+              key,
+              false,
+              runtime,
+            );
+            const sidecarPath = bodyPath + SIDECAR_SUFFIX;
+            if (
+              (await regularFileOrMissing(bodyPath, key)) === undefined ||
+              (await regularFileOrMissing(sidecarPath, key)) === undefined
+            ) {
+              notFound(key);
+            }
+            const sidecar = await readSidecar(sidecarPath, key);
+            if (sidecar.etag !== options.condition.etag) {
+              conflict(key);
+            }
+
+            assertActive(runtime, key);
+            await ensureParents(root, segments, key, false, runtime);
+            if (
+              (await regularFileOrMissing(bodyPath, key)) === undefined ||
+              (await regularFileOrMissing(sidecarPath, key)) === undefined ||
+              (await readSidecar(sidecarPath, key)).etag !==
+                options.condition.etag
+            ) {
+              conflict(key);
+            }
+            await fsp.unlink(bodyPath);
+            applied = true;
             await fsp.unlink(sidecarPath);
           } catch (error) {
-            throw storageFsError(error, key, 'delete');
+            throw applied
+              ? appliedStorageFsError(error, key, 'delete')
+              : storageFsError(error, key, 'delete');
           }
-        } catch (error) {
-          throw storageFsError(error, key, 'delete');
-        }
-      });
+        },
+        runtime,
+      );
     },
     async promote(
       sourceKey: string,
       destinationKey: string,
       options: StoragePromotionOptions,
     ): Promise<void> {
+      if (typeof options !== 'object' || options === null) {
+        throw new StorageError(
+          'A conditional filesystem copy requires a predicate.',
+          {
+            code: StorageErrorCode.INVALID_ARGUMENT,
+            key: sourceKey,
+            operation: 'copy',
+            permanent: true,
+          },
+        );
+      }
       const destination = options.destination;
       if (
         destination !== undefined &&
@@ -853,6 +1083,21 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
           {
             code: StorageErrorCode.INVALID_ARGUMENT,
             key: destinationKey,
+            operation: 'copy',
+            permanent: true,
+          },
+        );
+      }
+      if (
+        options.sourceEtag === undefined &&
+        options.sourceVersion === undefined &&
+        destination === undefined
+      ) {
+        throw new StorageError(
+          'A conditional filesystem copy requires a source or destination predicate.',
+          {
+            code: StorageErrorCode.INVALID_ARGUMENT,
+            key: sourceKey,
             operation: 'copy',
             permanent: true,
           },
@@ -880,224 +1125,411 @@ export function withFsConditionalMutation(base: FsAdapter): FsStorageAdapter {
           },
         );
       }
-      return serializePair(sourceKey, destinationKey, async () => {
-        let bodyTemp: string | undefined;
-        let sidecarTemp: string | undefined;
-        const runtime = runtimeOf(options);
-        try {
-          const sourceSegments = strictSegments(sourceKey);
-          const destinationSegments = strictSegments(destinationKey);
-          const sourcePath = await ensureParents(
-            root,
-            sourceSegments,
-            sourceKey,
-            false,
-            runtime,
-          );
-          const sourceSidecarPath = sourcePath + SIDECAR_SUFFIX;
-          if (
-            (await regularFileOrMissing(sourcePath, sourceKey)) === undefined ||
-            (await regularFileOrMissing(sourceSidecarPath, sourceKey)) ===
-              undefined
-          ) {
-            notFound(sourceKey);
-          }
-          const sourceSidecar = await readSidecar(sourceSidecarPath, sourceKey);
-          if (
-            options.sourceEtag !== undefined &&
-            sourceSidecar.etag !== options.sourceEtag
-          ) {
-            conflict(sourceKey);
-          }
-
-          const destinationPath = await ensureParents(
-            root,
-            destinationSegments,
-            destinationKey,
-            true,
-            runtime,
-          );
-          const destinationSidecarPath = destinationPath + SIDECAR_SUFFIX;
-          const assertDestination = async (): Promise<void> => {
-            const body = await regularFileOrMissing(
-              destinationPath,
-              destinationKey,
+      const runtime = runtimeOf(options);
+      return serializePair(
+        sourceKey,
+        destinationKey,
+        async () => {
+          let applied = false;
+          let bodyTemp: string | undefined;
+          let sidecarTemp: string | undefined;
+          try {
+            const sourceSegments = strictSegments(sourceKey);
+            const destinationSegments = strictSegments(destinationKey);
+            const sourcePath = await ensureParents(
+              root,
+              sourceSegments,
+              sourceKey,
+              false,
+              runtime,
             );
-            const sidecar = await regularFileOrMissing(
-              destinationSidecarPath,
-              destinationKey,
+            const sourceSidecarPath = sourcePath + SIDECAR_SUFFIX;
+            if (
+              (await regularFileOrMissing(sourcePath, sourceKey)) ===
+                undefined ||
+              (await regularFileOrMissing(sourceSidecarPath, sourceKey)) ===
+                undefined
+            ) {
+              notFound(sourceKey);
+            }
+            const sourceSidecar = await readSidecar(
+              sourceSidecarPath,
+              sourceKey,
             );
-            if (options.destination?.type === 'create') {
-              if (body !== undefined || sidecar !== undefined) {
-                conflict(destinationKey);
-              }
-              return;
+            if (
+              options.sourceEtag !== undefined &&
+              sourceSidecar.etag !== options.sourceEtag
+            ) {
+              conflict(sourceKey);
             }
-            if (options.destination?.type === 'replace') {
-              if (body === undefined || sidecar === undefined) {
-                notFound(destinationKey);
+
+            const destinationPath = await ensureParents(
+              root,
+              destinationSegments,
+              destinationKey,
+              true,
+              runtime,
+            );
+            const destinationSidecarPath = destinationPath + SIDECAR_SUFFIX;
+            const assertDestination = async (): Promise<void> => {
+              const body = await regularFileOrMissing(
+                destinationPath,
+                destinationKey,
+              );
+              const sidecar = await regularFileOrMissing(
+                destinationSidecarPath,
+                destinationKey,
+              );
+              if (options.destination?.type === 'create') {
+                if (body !== undefined || sidecar !== undefined) {
+                  conflict(destinationKey);
+                }
+                return;
               }
-              if (
-                (await readSidecar(destinationSidecarPath, destinationKey))
-                  .etag !== options.destination.etag
-              ) {
-                conflict(destinationKey);
+              if (options.destination?.type === 'replace') {
+                if (body === undefined || sidecar === undefined) {
+                  notFound(destinationKey);
+                }
+                if (
+                  (await readSidecar(destinationSidecarPath, destinationKey))
+                    .etag !== options.destination.etag
+                ) {
+                  conflict(destinationKey);
+                }
               }
+            };
+            await assertDestination();
+
+            const staged = await openTemp(path.dirname(destinationPath));
+            await staged.handle.close();
+            bodyTemp = staged.path;
+            await fsp.copyFile(sourcePath, bodyTemp);
+            const lastModified = Date.now();
+            sidecarTemp = await stageSidecar(path.dirname(destinationPath), {
+              ...sourceSidecar,
+              lastModified,
+            });
+
+            assertActive(runtime, sourceKey);
+            if (
+              (await regularFileOrMissing(sourcePath, sourceKey)) ===
+                undefined ||
+              (await regularFileOrMissing(sourceSidecarPath, sourceKey)) ===
+                undefined ||
+              (options.sourceEtag !== undefined &&
+                (await readSidecar(sourceSidecarPath, sourceKey)).etag !==
+                  options.sourceEtag)
+            ) {
+              conflict(sourceKey);
             }
-          };
-          await assertDestination();
-
-          const staged = await openTemp(path.dirname(destinationPath));
-          await staged.handle.close();
-          bodyTemp = staged.path;
-          await fsp.copyFile(sourcePath, bodyTemp);
-          const lastModified = Date.now();
-          sidecarTemp = await stageSidecar(path.dirname(destinationPath), {
-            ...sourceSidecar,
-            lastModified,
-          });
-
-          assertActive(runtime, sourceKey);
-          if (
-            (await regularFileOrMissing(sourcePath, sourceKey)) === undefined ||
-            (await regularFileOrMissing(sourceSidecarPath, sourceKey)) ===
-              undefined ||
-            (options.sourceEtag !== undefined &&
-              (await readSidecar(sourceSidecarPath, sourceKey)).etag !==
-                options.sourceEtag)
-          ) {
-            conflict(sourceKey);
+            await assertDestination();
+            await fsp.rename(bodyTemp, destinationPath);
+            applied = true;
+            bodyTemp = undefined;
+            await fsp.rename(sidecarTemp, destinationSidecarPath);
+            sidecarTemp = undefined;
+          } catch (error) {
+            throw applied
+              ? appliedStorageFsError(error, destinationKey, 'copy')
+              : storageFsError(error, sourceKey, 'copy');
+          } finally {
+            await removeTemp(bodyTemp).catch(() => undefined);
+            await removeTemp(sidecarTemp).catch(() => undefined);
           }
-          await assertDestination();
-          await fsp.rename(bodyTemp, destinationPath);
-          bodyTemp = undefined;
-          await fsp.rename(sidecarTemp, destinationSidecarPath);
-          sidecarTemp = undefined;
-        } catch (error) {
-          throw storageFsError(error, sourceKey, 'copy');
-        } finally {
-          await removeTemp(bodyTemp).catch(() => undefined);
-          await removeTemp(sidecarTemp).catch(() => undefined);
-        }
-      });
+        },
+        runtime,
+      );
     },
     async uploadConditional(
       key: string,
       body: Body,
       options: StorageConditionalUploadOptions,
     ): Promise<StorageUploadResult> {
+      if (
+        typeof options !== 'object' ||
+        options === null ||
+        typeof options.condition !== 'object' ||
+        options.condition === null ||
+        (options.condition.type !== 'create' &&
+          options.condition.type !== 'replace')
+      ) {
+        throw new StorageError(
+          'A conditional filesystem upload requires a create or replace predicate.',
+          {
+            code: StorageErrorCode.INVALID_ARGUMENT,
+            key,
+            operation: 'upload',
+            permanent: true,
+          },
+        );
+      }
       if (options.condition.type === 'replace') {
         assertEtag(options.condition.etag, 'condition.etag', key, 'upload');
       }
-      return serialize(key, async () => {
-        let bodyTemp: string | undefined;
-        let sidecarTemp: string | undefined;
-        const runtime = runtimeOf(options);
-        try {
-          if (options.multipart !== undefined && options.multipart !== false) {
-            unsupportedUpload(
-              key,
-              'Conditional filesystem uploads do not support multipart mode.',
-            );
-          }
-          if (options.control !== undefined) {
-            unsupportedUpload(
-              key,
-              'Conditional filesystem uploads do not support resumable control.',
-            );
-          }
-
-          const segments = strictSegments(key);
-          const bodyPath = await ensureParents(
-            root,
-            segments,
-            key,
-            true,
-            runtime,
-          );
-          const sidecarPath = bodyPath + SIDECAR_SUFFIX;
-          const existingBody = await regularFileOrMissing(bodyPath, key);
-          const existingSidecar = await regularFileOrMissing(sidecarPath, key);
-          if (options.condition.type === 'create') {
-            if (existingBody !== undefined || existingSidecar !== undefined) {
-              conflict(key);
-            }
-          } else {
-            if (existingBody === undefined || existingSidecar === undefined) {
-              notFound(key);
-            }
+      const runtime = runtimeOf(options);
+      return serialize(
+        key,
+        async () => {
+          let applied = false;
+          let appliedEtag: string | undefined;
+          let bodyTemp: string | undefined;
+          let sidecarTemp: string | undefined;
+          try {
             if (
+              options.multipart !== undefined &&
+              options.multipart !== false
+            ) {
+              unsupportedUpload(
+                key,
+                'Conditional filesystem uploads do not support multipart mode.',
+              );
+            }
+            if (options.control !== undefined) {
+              unsupportedUpload(
+                key,
+                'Conditional filesystem uploads do not support resumable control.',
+              );
+            }
+
+            const segments = strictSegments(key);
+            const bodyPath = await ensureParents(
+              root,
+              segments,
+              key,
+              true,
+              runtime,
+            );
+            const sidecarPath = bodyPath + SIDECAR_SUFFIX;
+            const existingBody = await regularFileOrMissing(bodyPath, key);
+            const existingSidecar = await regularFileOrMissing(
+              sidecarPath,
+              key,
+            );
+            if (options.condition.type === 'create') {
+              if (existingBody !== undefined || existingSidecar !== undefined) {
+                conflict(key);
+              }
+            } else {
+              if (existingBody === undefined || existingSidecar === undefined) {
+                notFound(key);
+              }
+              if (
+                (await readSidecar(sidecarPath, key)).etag !==
+                options.condition.etag
+              ) {
+                conflict(key);
+              }
+            }
+
+            const staged = await stageBody(
+              path.dirname(bodyPath),
+              key,
+              body,
+              options,
+              runtime,
+            );
+            bodyTemp = staged.path;
+            const lastModified = Date.now();
+            const contentType = defaultContentType(body, options.contentType);
+            sidecarTemp = await stageSidecar(path.dirname(bodyPath), {
+              contentType,
+              etag: staged.etag,
+              lastModified,
+              ...(options.cacheControl !== undefined && {
+                cacheControl: options.cacheControl,
+              }),
+              ...(options.metadata !== undefined && {
+                metadata: options.metadata,
+              }),
+            });
+
+            assertActive(runtime, key);
+            await ensureParents(root, segments, key, false, runtime);
+            const currentBody = await regularFileOrMissing(bodyPath, key);
+            const currentSidecar = await regularFileOrMissing(sidecarPath, key);
+            if (options.condition.type === 'create') {
+              if (currentBody !== undefined || currentSidecar !== undefined) {
+                conflict(key);
+              }
+            } else if (
+              currentBody === undefined ||
+              currentSidecar === undefined ||
               (await readSidecar(sidecarPath, key)).etag !==
-              options.condition.etag
+                options.condition.etag
             ) {
               conflict(key);
             }
+
+            await fsp.rename(bodyTemp, bodyPath);
+            applied = true;
+            appliedEtag = staged.etag;
+            bodyTemp = undefined;
+            await fsp.rename(sidecarTemp, sidecarPath);
+            sidecarTemp = undefined;
+            return {
+              contentType,
+              etag: staged.etag,
+              key,
+              lastModified: new Date(lastModified),
+              size: staged.size,
+            };
+          } catch (error) {
+            throw applied
+              ? appliedStorageFsError(error, key, 'upload', appliedEtag)
+              : storageFsError(error, key, 'upload');
+          } finally {
+            await removeTemp(bodyTemp).catch(() => undefined);
+            await removeTemp(sidecarTemp).catch(() => undefined);
           }
-
-          const staged = await stageBody(
-            path.dirname(bodyPath),
-            key,
-            body,
-            options,
-            runtime,
-          );
-          bodyTemp = staged.path;
-          const lastModified = Date.now();
-          const contentType = defaultContentType(body, options.contentType);
-          sidecarTemp = await stageSidecar(path.dirname(bodyPath), {
-            contentType,
-            etag: staged.etag,
-            lastModified,
-            ...(options.cacheControl !== undefined && {
-              cacheControl: options.cacheControl,
-            }),
-            ...(options.metadata !== undefined && {
-              metadata: options.metadata,
-            }),
-          });
-
-          assertActive(runtime, key);
-          await ensureParents(root, segments, key, false, runtime);
-          const currentBody = await regularFileOrMissing(bodyPath, key);
-          const currentSidecar = await regularFileOrMissing(sidecarPath, key);
-          if (options.condition.type === 'create') {
-            if (currentBody !== undefined || currentSidecar !== undefined) {
-              conflict(key);
-            }
-          } else if (
-            currentBody === undefined ||
-            currentSidecar === undefined ||
-            (await readSidecar(sidecarPath, key)).etag !==
-              options.condition.etag
-          ) {
-            conflict(key);
-          }
-
-          await fsp.rename(bodyTemp, bodyPath);
-          bodyTemp = undefined;
-          await fsp.rename(sidecarTemp, sidecarPath);
-          sidecarTemp = undefined;
-          return {
-            contentType,
-            etag: staged.etag,
-            key,
-            lastModified: new Date(lastModified),
-            size: staged.size,
-          };
-        } catch (error) {
-          throw storageFsError(error, key, 'upload');
-        } finally {
-          await removeTemp(bodyTemp).catch(() => undefined);
-          await removeTemp(sidecarTemp).catch(() => undefined);
-        }
-      });
+        },
+        runtime,
+      );
+    },
+    async upload(key, body, options) {
+      return serializeFilesMutation(key, options, () =>
+        upload(key, body, options),
+      );
     },
   } satisfies FilesSdkConditionalCopyAdapter &
     FilesSdkConditionalDeleteAdapter &
     FilesSdkConditionalReadAdapter &
     FilesSdkConditionalUploadAdapter &
     FilesSdkPhysicalKeyAdapter &
-    Pick<FsAdapter, 'download' | 'exists' | 'head' | 'list'>);
+    Pick<
+      FsAdapter,
+      | 'copy'
+      | 'delete'
+      | 'download'
+      | 'exists'
+      | 'head'
+      | 'list'
+      | 'move'
+      | 'upload'
+    >);
+
+  if (resumableUpload !== undefined) {
+    adapter.resumableUpload = (key, options) => {
+      const resumable = resumableUpload(key, options);
+      const complete = resumable.complete.bind(resumable);
+      resumable.complete = (parts) =>
+        serialize(key, () => complete(parts)) as ReturnType<typeof complete>;
+      return resumable;
+    };
+  }
+
+  const operationOptions = (
+    options: OperationOptions | undefined,
+  ): StorageOperationOptions => ({
+    ...(options?.signal !== undefined && { signal: options.signal }),
+    ...(options?.timeout !== undefined && { timeout: options.timeout }),
+  });
+  const uploadOptions = (
+    options: AdapterUploadOptions | undefined,
+  ): Omit<StorageConditionalUploadOptions, 'condition'> => ({
+    ...operationOptions(options),
+    ...(options?.cacheControl !== undefined && {
+      cacheControl: options.cacheControl,
+    }),
+    ...(options?.contentType !== undefined && {
+      contentType: options.contentType,
+    }),
+    ...(options?.metadata !== undefined && {
+      metadata: { ...options.metadata },
+    }),
+    ...(options?.onProgress !== undefined && {
+      onProgress: options.onProgress,
+    }),
+  });
+  const downloadOptions = (
+    options: AdapterDownloadOptions | undefined,
+  ): Omit<StorageConditionalReadOptions, 'condition'> => ({
+    ...operationOptions(options),
+    ...(options?.range !== undefined && { range: { ...options.range } }),
+  });
+  const runConditional = async <Result>(
+    operation: () => Promise<Result>,
+  ): Promise<Result> => {
+    try {
+      return await operation();
+    } catch (error) {
+      throw mapStorageErrorToFilesSdkError(error);
+    }
+  };
+
+  const conditional = Object.freeze({
+    copy: Object.freeze({
+      atomicSourceDestination: true,
+      destinationCreate: true,
+      destinationReplace: true,
+      run: (
+        sourceKey: string,
+        destinationKey: string,
+        condition: CopyCondition,
+        options?: OperationOptions,
+      ): Promise<void> =>
+        runConditional(() =>
+          adapter.promote(sourceKey, destinationKey, {
+            ...operationOptions(options),
+            destination: condition.destination,
+            sourceEtag: condition.source.etag,
+          }),
+        ),
+      sourceEtag: true,
+    }),
+    create: (
+      key: string,
+      body: Body,
+      options?: AdapterUploadOptions,
+    ): Promise<ConditionalUploadResult> =>
+      runConditional(async () =>
+        conditionalUploadResultOf(
+          await adapter.uploadConditional(key, body, {
+            ...uploadOptions(options),
+            condition: { type: 'create' },
+          }),
+        ),
+      ),
+    delete: (
+      key: string,
+      etag: string,
+      options?: OperationOptions,
+    ): Promise<void> =>
+      runConditional(() =>
+        adapter.deleteConditional(key, {
+          ...operationOptions(options),
+          condition: { etag },
+        }),
+      ),
+    exactRead: (
+      key: string,
+      etag: string,
+      options?: AdapterDownloadOptions,
+    ): Promise<StoredFile> =>
+      runConditional(async () =>
+        storedFileOfStorageObject(
+          await adapter.downloadConditional(key, {
+            ...downloadOptions(options),
+            condition: { etag },
+          }),
+        ),
+      ),
+    replace: (
+      key: string,
+      body: Body,
+      etag: string,
+      options?: AdapterUploadOptions,
+    ): Promise<ConditionalUploadResult> =>
+      runConditional(async () =>
+        conditionalUploadResultOf(
+          await adapter.uploadConditional(key, body, {
+            ...uploadOptions(options),
+            condition: { etag, type: 'replace' },
+          }),
+        ),
+      ),
+  } satisfies AdapterConditionalOperations);
+
+  return Object.assign(adapter, { conditional });
 }
 
 /**

@@ -15,6 +15,14 @@ import {
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { Readable } from 'node:stream';
 import {
+  createStoredFile,
+  type AdapterConditionalOperations,
+  type ConditionalUploadResult,
+  type CopyCondition,
+  type OperationOptions as FilesOperationOptions,
+  type StoredFile,
+} from 'files-sdk';
+import {
   mapS3Error,
   s3 as createFilesSdkS3Adapter,
   type S3Adapter,
@@ -56,10 +64,13 @@ import {
   type FilesSdkSignedDownloadPolicyAdapter,
   type FilesSdkStorageDriver,
   mapFilesSdkError,
+  mapStorageErrorToFilesSdkError,
 } from '../files-sdk.driver.js';
 import {
   getS3ConstructionMetadata,
+  getS3ConditionalRequestPermission,
   recordS3ConstructionMetadata,
+  recordS3ConditionalRequestPermission,
 } from './construction-metadata.js';
 
 export interface S3StorageDriverOptions extends Omit<
@@ -186,6 +197,11 @@ export function defineS3ProviderProfile(
       profile.conditionalCopySource?.version,
     ],
     [
+      profile.conditionalCopySource?.requiresDestinationPredicate !== undefined,
+      'conditionalCopySource.requiresDestinationPredicate',
+      profile.conditionalCopySource?.requiresDestinationPredicate,
+    ],
+    [
       profile.conditionalCopyDestination !== undefined,
       'conditionalCopyDestination.create',
       profile.conditionalCopyDestination?.create,
@@ -199,6 +215,11 @@ export function defineS3ProviderProfile(
       profile.conditionalCopyDestination !== undefined,
       'conditionalCopyDestination.atomicWithSource',
       profile.conditionalCopyDestination?.atomicWithSource,
+    ],
+    [
+      profile.conditionalCopyDestination?.requiresSourcePredicate !== undefined,
+      'conditionalCopyDestination.requiresSourcePredicate',
+      profile.conditionalCopyDestination?.requiresSourcePredicate,
     ],
     [
       profile.conditionalMultipartCompletion !== undefined,
@@ -434,6 +455,29 @@ function assertS3ProviderProfileContainedBy(
       );
     }
   }
+
+  if (
+    profile.conditionalCopySource !== undefined &&
+    (profile.conditionalCopySource.etag ||
+      profile.conditionalCopySource.version) &&
+    ceiling.conditionalCopySource?.requiresDestinationPredicate === true &&
+    profile.conditionalCopySource.requiresDestinationPredicate !== true
+  ) {
+    throw new TypeError(
+      `S3 provider profile "${profile.name}" cannot remove ${ceiling.name} conditionalCopySource.requiresDestinationPredicate.`,
+    );
+  }
+  if (
+    profile.conditionalCopyDestination !== undefined &&
+    (profile.conditionalCopyDestination.create ||
+      profile.conditionalCopyDestination.replace) &&
+    ceiling.conditionalCopyDestination?.requiresSourcePredicate === true &&
+    profile.conditionalCopyDestination.requiresSourcePredicate !== true
+  ) {
+    throw new TypeError(
+      `S3 provider profile "${profile.name}" cannot remove ${ceiling.name} conditionalCopyDestination.requiresSourcePredicate.`,
+    );
+  }
 }
 
 export const AWS_S3_PROVIDER_PROFILE = defineS3ProviderProfile({
@@ -482,6 +526,47 @@ export type S3StorageAdapter = S3StorageAdapterBase &
       FilesSdkConditionalUploadAdapter
   >;
 
+function filesAttemptOptions<Options extends FilesOperationOptions>(
+  options: Options | undefined,
+): Omit<Options, 'retries'> | undefined {
+  if (options === undefined) return undefined;
+  // Files owns retry settlement. Its adapter primitives receive a single
+  // merged attempt signal and must not start a second retry loop.
+  const { retries: _retries, ...attempt } = options;
+  return attempt;
+}
+
+async function throughFilesConditionalBoundary<Result>(
+  operationName: 'copy' | 'delete' | 'download' | 'upload',
+  operation: () => Promise<Result>,
+): Promise<Result> {
+  try {
+    return await operation();
+  } catch (error: unknown) {
+    throw mapStorageErrorToFilesSdkError(
+      mapS3ConditionalError(error, operationName),
+    );
+  }
+}
+
+function storedFileOfStorageObject(object: StorageObject): StoredFile {
+  return createStoredFile(
+    {
+      ...(object.etag !== undefined && { etag: object.etag }),
+      key: object.key,
+      ...(object.lastModified !== undefined && {
+        lastModified: object.lastModified.getTime(),
+      }),
+      ...(object.metadata !== undefined && {
+        metadata: { ...object.metadata },
+      }),
+      size: object.size,
+      type: object.contentType,
+    },
+    { factory: () => object.body, kind: 'stream' },
+  );
+}
+
 function copySource(
   bucket: string,
   key: string,
@@ -516,8 +601,31 @@ function maxRetries(options: StorageOperationOptions): number {
   return Math.max(0, Math.floor(configured ?? 0));
 }
 
+function invalidS3Argument(
+  message: string,
+  operation: 'copy' | 'delete' | 'download' | 'upload',
+  key?: unknown,
+): never {
+  throw new StorageError(message, {
+    code: StorageErrorCode.INVALID_ARGUMENT,
+    ...(typeof key === 'string' && { key }),
+    operation,
+    permanent: true,
+  });
+}
+
+function assertS3Key(
+  key: unknown,
+  label: string,
+  operation: 'copy' | 'delete' | 'download' | 'upload',
+): asserts key is string {
+  if (typeof key !== 'string' || key.length === 0) {
+    invalidS3Argument(`${label} must be a non-empty string.`, operation, key);
+  }
+}
+
 function etagHeader(
-  etag: string,
+  etag: unknown,
   key: string,
   operation: 'copy' | 'delete' | 'download' | 'upload',
   label: string,
@@ -532,6 +640,183 @@ function etagHeader(
     });
   }
   return header;
+}
+
+function assertConditionalReadInput(
+  key: string,
+  options: StorageConditionalReadOptions,
+): void {
+  const candidate = options as unknown;
+  if (typeof candidate !== 'object' || candidate === null) {
+    invalidS3Argument(
+      'Conditional read options must be an object.',
+      'download',
+      key,
+    );
+  }
+  const condition = (candidate as { readonly condition?: unknown }).condition;
+  if (typeof condition !== 'object' || condition === null) {
+    invalidS3Argument(
+      'Conditional read requires an ETag or version predicate.',
+      'download',
+      key,
+    );
+  }
+  const { etag, version } = condition as {
+    readonly etag?: unknown;
+    readonly version?: unknown;
+  };
+  if (etag === undefined && version === undefined) {
+    invalidS3Argument(
+      'Conditional read requires an ETag or version predicate.',
+      'download',
+      key,
+    );
+  }
+  if (etag !== undefined) {
+    etagHeader(etag, key, 'download', 'condition.etag');
+  }
+  if (
+    version !== undefined &&
+    (typeof version !== 'string' || version.length === 0)
+  ) {
+    invalidS3Argument(
+      'condition.version must be a non-empty string.',
+      'download',
+      key,
+    );
+  }
+
+  const range = (candidate as { readonly range?: unknown }).range;
+  if (range === undefined) return;
+  if (typeof range !== 'object' || range === null) {
+    invalidS3Argument('range must be an object.', 'download', key);
+  }
+  const { end, start } = range as {
+    readonly end?: unknown;
+    readonly start?: unknown;
+  };
+  if (!Number.isSafeInteger(start) || (start as number) < 0) {
+    invalidS3Argument(
+      'range.start must be a non-negative safe integer.',
+      'download',
+      key,
+    );
+  }
+  if (
+    end !== undefined &&
+    (!Number.isSafeInteger(end) || (end as number) < (start as number))
+  ) {
+    invalidS3Argument(
+      'range.end must be a safe integer greater than or equal to range.start.',
+      'download',
+      key,
+    );
+  }
+}
+
+function assertPromotionInput(
+  sourceKey: string,
+  destinationKey: string,
+  promotion: StoragePromotionOptions,
+): void {
+  const candidate = promotion as unknown;
+  if (typeof candidate !== 'object' || candidate === null) {
+    invalidS3Argument(
+      'Promotion options must be an object.',
+      'copy',
+      sourceKey,
+    );
+  }
+  const { destination, sourceEtag, sourceVersion } = candidate as {
+    readonly destination?: unknown;
+    readonly sourceEtag?: unknown;
+    readonly sourceVersion?: unknown;
+  };
+  if (sourceEtag !== undefined) {
+    etagHeader(sourceEtag, sourceKey, 'copy', 'sourceEtag');
+  }
+  if (
+    sourceVersion !== undefined &&
+    (typeof sourceVersion !== 'string' || sourceVersion.length === 0)
+  ) {
+    invalidS3Argument(
+      'sourceVersion must be a non-empty string.',
+      'copy',
+      sourceKey,
+    );
+  }
+  if (
+    destination !== undefined &&
+    (typeof destination !== 'object' ||
+      destination === null ||
+      ((destination as { readonly type?: unknown }).type !== 'create' &&
+        (destination as { readonly type?: unknown }).type !== 'replace'))
+  ) {
+    invalidS3Argument(
+      'destination.type must be "create" or "replace".',
+      'copy',
+      destinationKey,
+    );
+  }
+  if (
+    typeof destination === 'object' &&
+    destination !== null &&
+    (destination as { readonly type?: unknown }).type === 'replace'
+  ) {
+    etagHeader(
+      (destination as { readonly etag?: unknown }).etag,
+      destinationKey,
+      'copy',
+      'destination.etag',
+    );
+  }
+  if (
+    sourceEtag === undefined &&
+    sourceVersion === undefined &&
+    destination === undefined
+  ) {
+    invalidS3Argument(
+      'promote requires a source or destination precondition.',
+      'copy',
+      sourceKey,
+    );
+  }
+}
+
+function assertConditionalUploadInput(
+  key: string,
+  conditional: StorageConditionalUploadOptions,
+): void {
+  const candidate = conditional as unknown;
+  if (typeof candidate !== 'object' || candidate === null) {
+    invalidS3Argument(
+      'Conditional upload options must be an object.',
+      'upload',
+      key,
+    );
+  }
+  const condition = (candidate as { readonly condition?: unknown }).condition;
+  if (
+    typeof condition !== 'object' ||
+    condition === null ||
+    ((condition as { readonly type?: unknown }).type !== 'create' &&
+      (condition as { readonly type?: unknown }).type !== 'replace')
+  ) {
+    invalidS3Argument(
+      'condition.type must be "create" or "replace".',
+      'upload',
+      key,
+    );
+  }
+  if ((condition as { readonly type: unknown }).type === 'replace') {
+    etagHeader(
+      (condition as { readonly etag?: unknown }).etag,
+      key,
+      'upload',
+      'condition.etag',
+    );
+  }
 }
 
 function providerEtag(
@@ -568,6 +853,23 @@ function contentTypeOf(
     return body.type;
   }
   return 'application/octet-stream';
+}
+
+function assertBufferedFilesConditionalS3Body(
+  body: StorageBody,
+  key: string,
+): void {
+  if (body instanceof ReadableStream || body instanceof Readable) {
+    throw new StorageError(
+      'Conditional S3 uploads through Files require a buffered body.',
+      {
+        code: StorageErrorCode.PROVIDER,
+        key,
+        operation: 'upload',
+        permanent: true,
+      },
+    );
+  }
 }
 
 async function normalizeConditionalBody(
@@ -634,21 +936,34 @@ function s3ErrorIdentity(error: unknown): {
   code: string | undefined;
   status: number | undefined;
 } {
-  if (typeof error !== 'object' || error === null) {
-    return { code: undefined, status: undefined };
+  let current = error;
+  const seen = new Set<object>();
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (typeof current !== 'object' || current === null || seen.has(current)) {
+      break;
+    }
+    seen.add(current);
+    const candidate = current as {
+      readonly name?: unknown;
+      readonly Code?: unknown;
+      readonly code?: unknown;
+      readonly cause?: unknown;
+      readonly $metadata?: { readonly httpStatusCode?: unknown };
+    };
+    const serviceCode = candidate.name ?? candidate.Code ?? candidate.code;
+    const status = candidate.$metadata?.httpStatusCode;
+    if (
+      typeof status === 'number' ||
+      (typeof serviceCode === 'string' && serviceCode !== 'FilesError')
+    ) {
+      return {
+        code: typeof serviceCode === 'string' ? serviceCode : undefined,
+        status: typeof status === 'number' ? status : undefined,
+      };
+    }
+    current = candidate.cause;
   }
-  const candidate = error as {
-    readonly name?: unknown;
-    readonly Code?: unknown;
-    readonly code?: unknown;
-    readonly $metadata?: { readonly httpStatusCode?: unknown };
-  };
-  const serviceCode = candidate.name ?? candidate.Code ?? candidate.code;
-  const status = candidate.$metadata?.httpStatusCode;
-  return {
-    code: typeof serviceCode === 'string' ? serviceCode : undefined,
-    status: typeof status === 'number' ? status : undefined,
-  };
+  return { code: undefined, status: undefined };
 }
 
 function mapS3ConditionalError(
@@ -664,29 +979,55 @@ function mapS3ConditionalError(
     identity.status === 412 || identity.code === 'PreconditionFailed';
   const conditionalConflict =
     identity.status === 409 || identity.code === 'ConditionalRequestConflict';
+  const mappedPrecondition =
+    provider.code === StorageErrorCode.CONFLICT && !conditionalConflict;
   const notFound =
     identity.status === 404 ||
     identity.code === 'NoSuchKey' ||
     identity.code === 'NoSuchUpload' ||
     provider.code === StorageErrorCode.NOT_FOUND;
   const code =
-    precondition || conditionalConflict
+    precondition || mappedPrecondition || conditionalConflict
       ? StorageErrorCode.CONFLICT
       : notFound
         ? StorageErrorCode.NOT_FOUND
         : provider.code;
   return new StorageError(`Conditional S3 ${operation} failed.`, {
     aborted: provider.aborted,
+    applied: provider.applied,
+    ...(provider.appliedEtag !== undefined && {
+      appliedEtag: provider.appliedEtag,
+    }),
     code,
     operation,
     permanent:
-      precondition || notFound
+      precondition || mappedPrecondition || notFound
         ? true
         : conditionalConflict
           ? false
           : provider.permanent,
     timedOut: provider.timedOut,
   });
+}
+
+function s3InterruptionError(
+  options: StorageOperationOptions,
+  signal: AbortSignal | undefined,
+  operation: 'copy' | 'delete' | 'download' | 'upload',
+): StorageError | undefined {
+  if (signal?.aborted !== true) return undefined;
+  const timedOut = options.signal?.aborted !== true;
+  return new StorageError(
+    timedOut
+      ? `Conditional S3 ${operation} timed out.`
+      : `Conditional S3 ${operation} was aborted.`,
+    {
+      aborted: !timedOut,
+      code: timedOut ? StorageErrorCode.TIMEOUT : StorageErrorCode.ABORTED,
+      operation,
+      timedOut,
+    },
+  );
 }
 
 async function withS3Retry<Result>(
@@ -700,10 +1041,15 @@ async function withS3Retry<Result>(
     try {
       return await operation(signal);
     } catch (error) {
+      const interrupted = s3InterruptionError(options, signal, operationName);
+      if (interrupted !== undefined) throw interrupted;
       const mapped = mapS3ConditionalError(error, operationName);
+      const retryableCode =
+        mapped.code === StorageErrorCode.PROVIDER ||
+        mapped.code === StorageErrorCode.CONFLICT;
       if (
         attempt >= retries ||
-        mapped.code !== StorageErrorCode.PROVIDER ||
+        !retryableCode ||
         mapped.aborted ||
         mapped.permanent ||
         signal?.aborted === true
@@ -718,7 +1064,14 @@ async function withS3Retry<Result>(
               error: mapped,
             })
           : Math.min(1000, 100 * 2 ** attempt);
-      await waitForRetry(delay, options.signal);
+      try {
+        await waitForRetry(delay, signal);
+      } catch (waitError) {
+        throw (
+          s3InterruptionError(options, signal, operationName) ??
+          mapS3ConditionalError(waitError, operationName)
+        );
+      }
     }
   }
 }
@@ -745,11 +1098,70 @@ async function waitForRetry(
       reject(signal?.reason);
     };
     signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted === true) abort();
   });
 }
 
 const S3_MIN_MULTIPART_PART_BYTES = 5 * 1024 * 1024;
 const S3_MAX_MULTIPART_PARTS = 10_000;
+const S3_MULTIPART_CLEANUP_TIMEOUT_MS = 5_000;
+
+async function waitForS3Cleanup<Result>(
+  request: Promise<Result>,
+  signal: AbortSignal,
+): Promise<Result> {
+  return new Promise<Result>((resolve, reject) => {
+    const cleanup = (): void => signal.removeEventListener('abort', abort);
+    const abort = (): void => {
+      cleanup();
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    void request.then(
+      (result) => {
+        cleanup();
+        resolve(result);
+      },
+      (error: unknown) => {
+        cleanup();
+        reject(error);
+      },
+    );
+    if (signal.aborted) abort();
+  });
+}
+
+async function abortMultipartUpload(
+  base: S3RequestAdapter,
+  key: string,
+  uploadId: string,
+  callerSignal: AbortSignal | undefined,
+): Promise<void> {
+  const cleanupController = new AbortController();
+  const cleanupTimeout = setTimeout(
+    () => cleanupController.abort(),
+    S3_MULTIPART_CLEANUP_TIMEOUT_MS,
+  );
+  const cleanupSignal =
+    callerSignal === undefined
+      ? cleanupController.signal
+      : AbortSignal.any([callerSignal, cleanupController.signal]);
+  try {
+    await waitForS3Cleanup(
+      base.raw.send(
+        new AbortMultipartUploadCommand({
+          Bucket: base.bucket,
+          Key: key,
+          UploadId: uploadId,
+        }),
+        { abortSignal: cleanupSignal },
+      ),
+      cleanupSignal,
+    );
+  } finally {
+    clearTimeout(cleanupTimeout);
+  }
+}
 
 function conditionalHeaders(
   condition: StorageConditionalUploadOptions['condition'],
@@ -859,12 +1271,47 @@ function missingResultEtag(key: string): StorageError {
   return new StorageError(
     'S3 committed a conditional upload without returning the ETag required to identify its result; reconcile the destination before retrying.',
     {
+      applied: true,
       code: StorageErrorCode.PROVIDER,
       key,
       operation: 'upload',
       permanent: true,
     },
   );
+}
+
+function conditionalResultEtag(etag: unknown, key: string): string {
+  try {
+    const normalized = providerEtag(etag, key, 'upload');
+    if (normalized === undefined) throw missingResultEtag(key);
+    return normalized;
+  } catch (error) {
+    if (!isStorageError(error) || error.applied) throw error;
+    throw new StorageError(error.message, {
+      aborted: error.aborted,
+      applied: true,
+      code: error.code,
+      key,
+      operation: 'upload',
+      permanent: true,
+      timedOut: error.timedOut,
+    });
+  }
+}
+
+function filesConditionalUploadResultOf(
+  result: StorageUploadResult,
+): ConditionalUploadResult {
+  const etag = conditionalResultEtag(result.etag, result.key);
+  return {
+    contentType: result.contentType,
+    etag,
+    key: result.key,
+    ...(result.lastModified !== undefined && {
+      lastModified: result.lastModified.getTime(),
+    }),
+    size: result.size,
+  };
 }
 
 type S3RequestAdapter = Pick<S3Adapter, 'bucket' | 'raw'>;
@@ -912,8 +1359,7 @@ async function uploadConditionalSingle(
       total: normalized.contentLength,
     }),
   });
-  const etag = providerEtag(result.ETag, key, 'upload');
-  if (etag === undefined) throw missingResultEtag(key);
+  const etag = conditionalResultEtag(result.ETag, key);
   return { contentType, etag, key, size };
 }
 
@@ -945,6 +1391,7 @@ async function uploadConditionalMultipart(
     S3_MIN_MULTIPART_PART_BYTES,
     configuredPartSize ?? S3_MIN_MULTIPART_PART_BYTES,
   );
+  const cleanupSignal = operationSignal(conditional);
   const normalized = await normalizeConditionalBody(body, undefined);
   if (normalized.contentLength === 0) {
     return uploadConditionalSingle(base, key, new Uint8Array(), {
@@ -1032,14 +1479,9 @@ async function uploadConditionalMultipart(
       });
     }
     if (completedParts.length === 0) {
-      await base.raw.send(
-        new AbortMultipartUploadCommand({
-          Bucket: base.bucket,
-          Key: key,
-          UploadId: uploadId,
-        }),
-      );
+      const emptyUploadId = uploadId;
       uploadId = undefined;
+      await abortMultipartUpload(base, key, emptyUploadId, cleanupSignal);
       return uploadConditionalSingle(base, key, new Uint8Array(), {
         ...conditional,
         multipart: false,
@@ -1058,31 +1500,219 @@ async function uploadConditionalMultipart(
         signal === undefined ? undefined : { abortSignal: signal },
       ),
     );
-    const etag = providerEtag(completed.ETag, key, 'upload');
-    if (etag === undefined) throw missingResultEtag(key);
+    const etag = conditionalResultEtag(completed.ETag, key);
     uploadId = undefined;
     return { contentType, etag, key, size };
   } catch (error) {
     if (uploadId !== undefined) {
-      await base.raw
-        .send(
-          new AbortMultipartUploadCommand({
-            Bucket: base.bucket,
-            Key: key,
-            UploadId: uploadId,
-          }),
-        )
-        .catch(() => undefined);
+      await abortMultipartUpload(base, key, uploadId, cleanupSignal).catch(
+        () => undefined,
+      );
     }
     throw error;
   }
 }
 
+function profileUsesConditionalHeaders(profile: S3ProviderProfile): boolean {
+  return (
+    profile.conditionalCreate !== undefined ||
+    profile.conditionalReplace !== undefined ||
+    profile.conditionalDelete?.etag === true ||
+    profile.conditionalRead?.etag === true ||
+    profile.conditionalCopySource?.etag === true ||
+    profile.conditionalCopyDestination?.create === true ||
+    profile.conditionalCopyDestination?.replace === true ||
+    profile.conditionalMultipartCompletion?.create === true ||
+    profile.conditionalMultipartCompletion?.replace === true
+  );
+}
+
+function conditionalOperationsForProfile(
+  profile: S3ProviderProfile,
+  adapter: S3StorageAdapter,
+  upstream: AdapterConditionalOperations | undefined,
+): AdapterConditionalOperations | undefined {
+  const conditional: AdapterConditionalOperations = {};
+  const legacyUpload = adapter.uploadConditional;
+  const legacyRead = adapter.downloadConditional;
+  const legacyDelete = adapter.deleteConditional;
+  const legacyCopy = adapter.promote;
+
+  if (profile.conditionalCreate?.resultEtag === true) {
+    if (legacyUpload !== undefined) {
+      conditional.create = (key, body, options) =>
+        throughFilesConditionalBoundary('upload', async () => {
+          assertBufferedFilesConditionalS3Body(body, key);
+          return filesConditionalUploadResultOf(
+            await legacyUpload(key, body, {
+              ...filesAttemptOptions(options),
+              condition: { type: 'create' },
+            }),
+          );
+        });
+    }
+  }
+
+  if (profile.conditionalReplace?.resultEtag === true) {
+    if (legacyUpload !== undefined) {
+      conditional.replace = (key, body, etag, options) =>
+        throughFilesConditionalBoundary('upload', async () => {
+          assertBufferedFilesConditionalS3Body(body, key);
+          return filesConditionalUploadResultOf(
+            await legacyUpload(key, body, {
+              ...filesAttemptOptions(options),
+              condition: { etag, type: 'replace' },
+            }),
+          );
+        });
+    }
+  }
+
+  if (profile.conditionalRead?.etag === true) {
+    const nativeExactRead = upstream?.exactRead;
+    if (nativeExactRead !== undefined) {
+      conditional.exactRead = (key, etag, options) =>
+        throughFilesConditionalBoundary('download', () =>
+          nativeExactRead.call(upstream, key, etag, options),
+        );
+    } else if (legacyRead !== undefined) {
+      conditional.exactRead = (key, etag, options) =>
+        throughFilesConditionalBoundary('download', async () =>
+          storedFileOfStorageObject(
+            await legacyRead(key, {
+              ...filesAttemptOptions(options),
+              condition: { etag },
+            }),
+          ),
+        );
+    }
+  }
+
+  if (profile.conditionalDelete?.etag === true) {
+    const nativeDelete = upstream?.delete;
+    if (nativeDelete !== undefined) {
+      conditional.delete = (key, etag, options) =>
+        throughFilesConditionalBoundary('delete', () =>
+          nativeDelete.call(upstream, key, etag, options),
+        );
+    } else if (legacyDelete !== undefined) {
+      conditional.delete = (key, etag, options) =>
+        throughFilesConditionalBoundary('delete', () =>
+          legacyDelete(key, {
+            ...filesAttemptOptions(options),
+            condition: { etag },
+          }),
+        );
+    }
+  }
+
+  const destinationCreate =
+    profile.conditionalCopyDestination?.atomicWithSource === true &&
+    profile.conditionalCopyDestination.create === true;
+  const destinationReplace =
+    profile.conditionalCopyDestination?.atomicWithSource === true &&
+    profile.conditionalCopyDestination.replace === true;
+  if (
+    profile.conditionalCopySource?.etag === true &&
+    (destinationCreate || destinationReplace) &&
+    legacyCopy !== undefined
+  ) {
+    const nativeCopy = upstream?.copy;
+    conditional.copy = Object.freeze({
+      atomicSourceDestination: true,
+      destinationCreate,
+      destinationReplace,
+      async run(
+        sourceKey: string,
+        destinationKey: string,
+        condition: CopyCondition,
+        options?: FilesOperationOptions,
+      ): Promise<void> {
+        const destinationSupported =
+          condition.destination.type === 'create'
+            ? destinationCreate
+            : destinationReplace;
+        if (!destinationSupported) {
+          throw mapStorageErrorToFilesSdkError(
+            new StorageError(
+              `S3 provider profile "${profile.name}" does not support the requested conditional copy.`,
+              {
+                code: StorageErrorCode.NOT_SUPPORTED,
+                key: destinationKey,
+                operation: 'copy',
+                permanent: true,
+              },
+            ),
+          );
+        }
+        const nativeDestinationSupported =
+          condition.destination.type === 'create'
+            ? nativeCopy?.destinationCreate === true
+            : nativeCopy?.destinationReplace === true;
+        if (
+          nativeCopy?.sourceEtag === true &&
+          nativeCopy.atomicSourceDestination === true &&
+          nativeDestinationSupported
+        ) {
+          return throughFilesConditionalBoundary('copy', () =>
+            nativeCopy.run.call(
+              nativeCopy,
+              sourceKey,
+              destinationKey,
+              condition,
+              options,
+            ),
+          );
+        }
+        return throughFilesConditionalBoundary('copy', () =>
+          legacyCopy(sourceKey, destinationKey, {
+            ...filesAttemptOptions(options),
+            destination: condition.destination,
+            sourceEtag: condition.source.etag,
+          }),
+        );
+      },
+      sourceEtag: true,
+    });
+  }
+
+  return Object.keys(conditional).length === 0
+    ? undefined
+    : Object.freeze(conditional);
+}
+
 const configuredS3Clients = new WeakSet<S3Adapter['raw']>();
+const withheldCustomConditionalOperations = new WeakMap<
+  S3Adapter['raw'],
+  AdapterConditionalOperations
+>();
 
 /** Constructs the upstream S3 adapter while retaining security-relevant metadata. */
 export function s3(options: S3AdapterOptions): S3Adapter {
-  const adapter = createFilesSdkS3Adapter(options);
+  // A verified provider profile is applied only by withS3Capabilities, after
+  // construction. Opt the raw custom-endpoint client into upstream's wire
+  // header guard here, but hide its broad conditional surface until that
+  // profile has narrowed the exact operations below.
+  const implicitCustomConditional =
+    options.endpoint !== undefined && options.conditional === undefined;
+  const adapter = createFilesSdkS3Adapter(
+    implicitCustomConditional ? { ...options, conditional: true } : options,
+  );
+  if (options.endpoint !== undefined && adapter.conditional !== undefined) {
+    if (options.conditional === true) {
+      withheldCustomConditionalOperations.set(adapter.raw, adapter.conditional);
+    }
+    if (!Reflect.deleteProperty(adapter, 'conditional')) {
+      adapter.raw.destroy();
+      throw new TypeError(
+        'The custom-endpoint S3 conditional surface could not be withheld before provider verification.',
+      );
+    }
+  }
+  recordS3ConditionalRequestPermission(
+    adapter.raw,
+    options.conditional !== false,
+  );
   markFilesSdkS3AdapterUndecorated(adapter);
   recordS3ConstructionMetadata(adapter.raw, {
     publicBaseUrlConfigured: options.publicBaseUrl !== undefined,
@@ -1128,6 +1758,17 @@ export function withS3Capabilities(
       ? AWS_S3_PROVIDER_PROFILE
       : UNVERIFIED_S3_PROVIDER_PROFILE);
   assertVerifiedS3ProviderProfile(profile);
+  const upstreamConditional =
+    base.conditional ?? withheldCustomConditionalOperations.get(raw);
+  if (
+    profileUsesConditionalHeaders(profile) &&
+    upstreamConditional === undefined &&
+    getS3ConditionalRequestPermission(raw) !== true
+  ) {
+    throw new TypeError(
+      `S3 provider profile "${profile.name}" requires conditional request headers, but the adapter was not constructed with conditional requests enabled.`,
+    );
+  }
   if (!sdkHasCustomEndpoint) {
     assertS3ProviderProfileContainedBy(profile, AWS_S3_PROVIDER_PROFILE);
   }
@@ -1282,32 +1923,28 @@ export function withS3Capabilities(
         destinationKey: string,
         promotion: StoragePromotionOptions,
       ): Promise<void> {
-        const destination = promotion.destination;
-        if (
-          destination !== undefined &&
-          (typeof destination !== 'object' ||
-            destination === null ||
-            (destination.type !== 'create' && destination.type !== 'replace'))
-        ) {
-          throw new StorageError(
-            'destination.type must be "create" or "replace".',
-            {
-              code: StorageErrorCode.INVALID_ARGUMENT,
-              key: destinationKey,
-              operation: 'promote',
-              permanent: true,
-            },
-          );
-        }
+        assertS3Key(sourceKey, 'source key', 'copy');
+        assertS3Key(destinationKey, 'destination key', 'copy');
+        assertPromotionInput(sourceKey, destinationKey, promotion);
         if (
           (promotion.sourceEtag !== undefined &&
             profile.conditionalCopySource?.etag !== true) ||
           (promotion.sourceVersion !== undefined &&
             profile.conditionalCopySource?.version !== true) ||
+          ((promotion.sourceEtag !== undefined ||
+            promotion.sourceVersion !== undefined) &&
+            promotion.destination === undefined &&
+            profile.conditionalCopySource?.requiresDestinationPredicate ===
+              true) ||
           (promotion.destination?.type === 'create' &&
             profile.conditionalCopyDestination?.create !== true) ||
           (promotion.destination?.type === 'replace' &&
             profile.conditionalCopyDestination?.replace !== true) ||
+          (promotion.destination !== undefined &&
+            promotion.sourceEtag === undefined &&
+            promotion.sourceVersion === undefined &&
+            profile.conditionalCopyDestination?.requiresSourcePredicate ===
+              true) ||
           (promotion.destination !== undefined &&
             (promotion.sourceEtag !== undefined ||
               promotion.sourceVersion !== undefined) &&
@@ -1368,6 +2005,8 @@ export function withS3Capabilities(
         key: string,
         options: StorageConditionalReadOptions,
       ): Promise<StorageObject> {
+        assertS3Key(key, 'key', 'download');
+        assertConditionalReadInput(key, options);
         if (
           (options.condition.etag !== undefined &&
             profile.conditionalRead?.etag !== true) ||
@@ -1424,13 +2063,15 @@ export function withS3Capabilities(
     } satisfies FilesSdkConditionalReadAdapter);
   }
 
-  if (profile.conditionalDelete !== undefined) {
+  if (profile.conditionalDelete?.etag === true) {
     Object.assign(adapter, {
       conditionalDelete: profile.conditionalDelete,
       async deleteConditional(
         key: string,
         options: StorageConditionalDeleteOptions,
       ): Promise<void> {
+        assertS3Key(key, 'key', 'delete');
+        etagHeader(options?.condition?.etag, key, 'delete', 'condition.etag');
         await withS3Retry(options, 'delete', async (signal) => {
           await raw.send(
             new DeleteObjectCommand({
@@ -1469,14 +2110,8 @@ export function withS3Capabilities(
         body: StorageBody,
         conditional: StorageConditionalUploadOptions,
       ): Promise<StorageUploadResult> {
-        if (conditional.condition.type === 'replace') {
-          etagHeader(
-            conditional.condition.etag,
-            key,
-            'upload',
-            'condition.etag',
-          );
-        }
+        assertS3Key(key, 'key', 'upload');
+        assertConditionalUploadInput(key, conditional);
         const supported =
           conditional.condition.type === 'create'
             ? profile.conditionalCreate !== undefined
@@ -1517,6 +2152,14 @@ export function withS3Capabilities(
       },
     } satisfies FilesSdkConditionalUploadAdapter);
   }
+
+  Object.assign(adapter, {
+    conditional: conditionalOperationsForProfile(
+      profile,
+      adapter,
+      upstreamConditional,
+    ),
+  });
 
   Object.freeze(adapter);
   markFilesSdkS3RawClientProvenance(raw, adapter, provenance);

@@ -7,6 +7,26 @@ const constructionMetadata = new WeakMap<
   object,
   Readonly<S3ConstructionMetadata>
 >();
+const conditionalRequestPermission = new WeakMap<object, boolean>();
+
+export function recordS3ConditionalRequestPermission(
+  raw: object,
+  enabled: boolean,
+): void {
+  const existing = conditionalRequestPermission.get(raw);
+  if (existing !== undefined && existing !== enabled) {
+    throw new TypeError(
+      'S3 conditional-request construction permission cannot be changed.',
+    );
+  }
+  conditionalRequestPermission.set(raw, enabled);
+}
+
+export function getS3ConditionalRequestPermission(
+  raw: object,
+): boolean | undefined {
+  return conditionalRequestPermission.get(raw);
+}
 
 export function recordS3ConstructionMetadata(
   raw: object,

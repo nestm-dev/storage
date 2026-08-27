@@ -8,8 +8,8 @@ The package uses [`files-sdk`](https://github.com/haydenbleasel/files-sdk) as
 its provider engine, but owns the API injected into Nest applications. Provider
 SDK types, errors, and `files.raw` do not leak through the root package.
 
-> This package targets the NestJS 12 prerelease line and is itself published on
-> the `alpha` dist-tag.
+> This package targets stable NestJS 12 and is itself published on the `alpha`
+> dist-tag.
 
 ## Requirements
 
@@ -17,10 +17,9 @@ SDK types, errors, and `files.raw` do not leak through the root package.
 - ESM
 
 The framework-neutral `@nestm/storage/core` entry point does not require
-NestJS. The root entry point and HTTP gateway additionally require NestJS
-`12.0.0-alpha.5` or newer in the Nest 12 prerelease line, `reflect-metadata`,
-and RxJS. Those framework peers are optional at installation time so core-only
-consumers do not download NestJS.
+NestJS. The root entry point and HTTP gateway additionally require NestJS 12,
+`reflect-metadata`, and RxJS. Those framework peers are optional at installation
+time so core-only consumers do not download NestJS.
 
 ## Install
 
@@ -33,7 +32,7 @@ pinned engine explicitly only when the application imports another adapter
 such as `files-sdk/gcs`:
 
 ```sh
-pnpm add files-sdk@2.2.3
+pnpm add files-sdk@2.3.0
 ```
 
 Pass AWS-SDK-backed S3 adapters through the package-owned `s3()` and
@@ -58,20 +57,15 @@ pnpm add @google-cloud/storage google-auth-library
 pnpm add @azure/storage-blob @azure/core-auth @azure/identity
 ```
 
-`@aws-sdk/client-s3` 3.919.0 or newer is required. Earlier releases omit
-destination `If-Match` and `If-None-Match` from the serialized `CopyObject`
-request even when those fields appear in a newer compile-time command shape;
-the package peer range and packed minimum-peer smoke test enforce this floor.
+`@aws-sdk/client-s3` 3.1079.0 or newer is required, matching the Files SDK 2.3
+peer floor. The supported range includes destination `If-Match` and
+`If-None-Match` serialization for `CopyObject`; the package peer range and
+packed minimum-peer smoke test enforce this floor.
 
 `files-sdk` currently declares its optional Nest peer for Nest 10 and 11. This
 library does not import `files-sdk/nestjs`; the Nest 12 integration is entirely
 owned here. A package manager may nevertheless report that temporary optional
-peer mismatch while Nest 12 remains prerelease.
-
-NestJS 12 alpha also has prerelease peer declarations that npm may reject under
-its strict resolver. If npm reports an `ERESOLVE` error for Nest's own peers,
-install with `npm install --legacy-peer-deps`; pnpm works with the repository's
-checked-in peer-version policy.
+peer mismatch until Files SDK widens its declaration to include Nest 12.
 
 ## Framework-neutral core
 
@@ -268,7 +262,7 @@ Install AI SDK 7 and Zod only in applications that use the optional adapter:
 pnpm add ai@^7 zod@^4
 ```
 
-`files-sdk` 2.2.x still declares an optional `ai@^6` peer for its own adapter,
+`files-sdk` 2.3.x still declares an optional `ai@^6` peer for its own adapter,
 so some package managers may print a peer warning when AI SDK 7 is installed.
 This package does not import that adapter; `@nestm/storage/ai-sdk` targets AI
 SDK 7 directly.
@@ -609,36 +603,37 @@ provide: NestJS 12 named stores, exact native conditional/CAS capabilities,
 `StorageWorkspace` permissions and limits, bounded storage errors, and
 capability-scoped AI tools.
 
-On the alpha.8 base, ordinary `FilesSdkStorageDriver` operations already
-delegate to the Files SDK pipeline. The exception is the native conditional
-adapter extensions: the current Files SDK operation union does not include
-them, so they cannot run through caller-configured Files plugins, hooks, or
-receipts. Until Files SDK provides one interception boundary for ordinary and
-conditional operations, the driver applies this interim fail-closed
-compatibility rule:
+Files SDK 2.3 provides native conditional operations through the same
+interception boundary as ordinary CRUD. NestM adapters expose their exact
+create, replace, ETag read, delete, and paired conditional-copy primitives to
+that boundary. These operations now pass through caller-configured Files
+plugins, hooks, retries, and receipts; a body transform, veto, retry observer,
+or audit policy therefore sees the conditional operation instead of being
+bypassed.
 
-| Caller Files configuration                        | Ordinary operations                  | Conditional operations                                   |
-| ------------------------------------------------- | ------------------------------------ | -------------------------------------------------------- |
-| No plugins, active hooks, or receipts             | Files pipeline                       | Advertised when the adapter supports the exact primitive |
-| One or more plugins                               | Files pipeline, including transforms | Hidden; direct invocation returns `NOT_SUPPORTED`        |
-| Any active hook                                   | Files pipeline and hook callbacks    | Hidden; direct invocation returns `NOT_SUPPORTED`        |
-| Receipts enabled with `true` or an options object | Files pipeline and receipts          | Hidden; direct invocation returns `NOT_SUPPORTED`        |
+NestM retains a narrow direct fallback only for conditional shapes Files SDK
+2.3 cannot represent: immutable version predicates, conditional
+multipart/resumable completion, and a copy with only its source or only its
+destination conditioned. Because those fallbacks cannot traverse the Files
+operation pipeline, they remain fail-closed when caller Files policy is active:
 
-An empty plugin list, an empty hooks object, and `receipts: false` do not trigger
-the gate. NestM's internal physical-key guard does not trigger it either. When
-available, direct conditional paths independently apply prefixing, the
-physical-key budget, mutation read-only restrictions, default
-retry/signal/timeout options, and bounded error mapping. `StoragePlugin` remains
-a separate veto/observation boundary; it is not a substitute for Files body or
-result transforms. This compatibility gate is intended to be removed once
-native CAS can traverse the upstream operation and plugin pipeline rather than
-becoming a second generic CRUD facade here.
+| Operation shape                                             | Execution path        | With Files plugins, active hooks, or receipts |
+| ----------------------------------------------------------- | --------------------- | --------------------------------------------- |
+| Ordinary operations                                         | Files pipeline        | Available                                     |
+| Create/replace/ETag read/delete/paired conditional copy     | Files 2.3 pipeline    | Available                                     |
+| Version, conditional multipart/resumable, or one-sided copy | NestM direct fallback | Hidden; invocation returns `NOT_SUPPORTED`    |
 
-`StorageWorkspace` therefore exposes both contracts without weakening either:
-its existing create/replace, exact-read copy/move, and conditional-delete paths
-retain native CAS and this fail-closed gate, while explicit overwrite and
-unconditional-delete variants use the ordinary Files pipeline. Lower-level
-conditional client and driver APIs remain available to callers that need them.
+An empty plugin list, an empty hooks object, and `receipts: false` do not count
+as caller policy. When available, a direct fallback still applies prefixing,
+the physical-key budget, read-only restrictions, default retry/signal/timeout
+options, and bounded error mapping. `StoragePlugin` remains a separate
+veto/observation boundary; it is not a substitute for Files body or result
+transforms.
+
+`StorageWorkspace` uses the Files pipeline whenever its conditional operation
+has an upstream representation. Lower-level conditional client and driver APIs
+remain available for applications that intentionally use the policy-free
+NestM-only fallback shapes.
 
 ## Storage API
 
@@ -701,6 +696,15 @@ copy, destination copy, atomic source-and-destination promotion, and multipart
 completion. They also declare the complete physical-key byte budget. Callers
 must check the exact primitive they need; a missing field is unsupported and is
 never widened from another operation.
+
+Some adapters expose conditional copy only as a paired source-and-destination
+operation. In that case,
+`capabilities.conditionalCopySource.requiresDestinationPredicate` and
+`capabilities.conditionalCopyDestination.requiresSourcePredicate` are `true`.
+`StorageClient.promote` rejects a request missing the required counterpart
+before provider I/O. A paired request must also satisfy the advertised
+create/replace bit and
+`capabilities.conditionalCopyDestination.atomicWithSource`.
 
 The physical-key budget applies to the exact key sent to the adapter. It
 therefore counts leading slashes for unprefixed drivers, the separator added to
@@ -1021,6 +1025,18 @@ when a provider adapter and this driver resolve separate copies of `files-sdk`.
 `isStorageError()` likewise recognizes branded and exact legacy structural
 errors produced by a duplicated `@nestm/storage` package copy.
 
+For a conditional mutation, `error.applied === true` means the provider commit
+succeeded but acknowledgement failed afterward, for example in an awaited
+post-operation plugin. Conditional uploads also expose `error.appliedEtag` when
+the committed generation is known. Do not blindly retry the original
+predicate: reconcile the logical destination first, using an exact ETag read
+when `appliedEtag` is present. This is a one-way signal: `applied === false`
+does not prove that a remote mutation did not commit. A timeout, connection
+loss, or exhausted retry can lose the provider's success response, so reconcile
+ambiguous transport/provider failures before repeating a conditional mutation.
+The sanitized workspace, AI-tool, and gateway error boundaries retain only
+this bounded reconciliation metadata.
+
 Capability flags cover range reads, native byte-level upload progress,
 delimiter listing, metadata, cache control, resumable uploads, server-side
 copy, conditional promotion, and signed transfers.
@@ -1058,7 +1074,11 @@ StorageModule.forRoot({
 Bodies are written verbatim at `<root>/<key>`. A `<key>.meta.json` sidecar beside
 each one carries the content type, ETag, and custom metadata a filesystem has
 nowhere else to put; sidecars never surface as keys, and uploading a key ending
-in `.meta.json` fails closed rather than colliding with one.
+in `.meta.json` fails closed rather than colliding with one. Ordinary and
+conditional mutations made through the decorated adapter share one
+process-local lock domain. Conditional guarantees therefore require a
+dedicated root: do not mutate it through another process, an unwrapped adapter,
+or direct filesystem calls.
 
 ## License
 

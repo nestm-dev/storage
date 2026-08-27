@@ -6,6 +6,7 @@ import {
   handlers,
   type Adapter,
   type Body,
+  type ConditionalUploadOptions,
   type DownloadOptions,
   type FilesOptions,
   type FilesPlugin,
@@ -65,8 +66,9 @@ export type FilesSdkDriverOptions<AdapterType extends Adapter> =
   FilesOptions<AdapterType>;
 
 /**
- * Interim compatibility gate until Files SDK exposes native conditional/CAS
- * verbs through the same operation pipeline as its generic data plane.
+ * Detects caller policy that must not be bypassed by NestM-only conditional
+ * fallbacks that Files SDK cannot represent (versions, multipart completion,
+ * or a copy with only one side conditioned).
  */
 function hasCallerFilesOperationPolicy<AdapterType extends Adapter>(
   options: FilesSdkDriverOptions<AdapterType>,
@@ -103,6 +105,7 @@ const FILES_SDK_S3_RESERVED_EXTENSION_KEYS = [
 const FILES_SDK_S3_AUTHORITY_KEYS = [
   ...FILES_SDK_S3_RESERVED_EXTENSION_KEYS,
   'bucket',
+  'conditional',
   'copy',
   'delete',
   'deleteMany',
@@ -446,16 +449,168 @@ function conditionalCopyAdapterOf(
     (source === undefined && destination === undefined) ||
     (source !== undefined &&
       (typeof source.etag !== 'boolean' ||
-        typeof source.version !== 'boolean')) ||
+        typeof source.version !== 'boolean' ||
+        (source.requiresDestinationPredicate !== undefined &&
+          typeof source.requiresDestinationPredicate !== 'boolean'))) ||
     (destination !== undefined &&
       (typeof destination.create !== 'boolean' ||
         typeof destination.replace !== 'boolean' ||
+        (destination.requiresSourcePredicate !== undefined &&
+          typeof destination.requiresSourcePredicate !== 'boolean') ||
         typeof destination.atomicWithSource !== 'boolean')) ||
     typeof candidate.promote !== 'function'
   ) {
     return undefined;
   }
   return candidate as Adapter & FilesSdkConditionalCopyAdapter;
+}
+
+interface FilesConditionalCopyCapability {
+  readonly atomicSourceDestination: boolean;
+  readonly destinationCreate: boolean;
+  readonly destinationReplace: boolean;
+  readonly sourceEtag: boolean;
+}
+
+interface ConditionalCopyCapabilities {
+  readonly source?: StorageConditionalCopySourceCapability;
+  readonly destination?: StorageConditionalCopyDestinationCapability;
+}
+
+function conditionalCopyCapabilities(
+  direct: FilesSdkConditionalCopyAdapter | undefined,
+  pipeline: FilesConditionalCopyCapability,
+): ConditionalCopyCapabilities {
+  const directSource =
+    direct?.conditionalCopySource !== undefined &&
+    (direct.conditionalCopySource.etag || direct.conditionalCopySource.version)
+      ? direct.conditionalCopySource
+      : undefined;
+  const directDestination =
+    direct?.conditionalCopyDestination !== undefined &&
+    (direct.conditionalCopyDestination.create ||
+      direct.conditionalCopyDestination.replace)
+      ? direct.conditionalCopyDestination
+      : undefined;
+  const pipelineSupported =
+    pipeline.sourceEtag &&
+    pipeline.atomicSourceDestination &&
+    (pipeline.destinationCreate || pipeline.destinationReplace);
+  const pipelineCapabilities: ConditionalCopyCapabilities = pipelineSupported
+    ? {
+        source: {
+          etag: true,
+          requiresDestinationPredicate: true,
+          version: false,
+        },
+        destination: {
+          atomicWithSource: true,
+          create: pipeline.destinationCreate,
+          replace: pipeline.destinationReplace,
+          requiresSourcePredicate: true,
+        },
+      }
+    : {};
+
+  if (directSource === undefined && directDestination === undefined) {
+    return pipelineCapabilities;
+  }
+  if (!pipelineSupported) {
+    return {
+      ...(directSource !== undefined && { source: { ...directSource } }),
+      ...(directDestination !== undefined && {
+        destination: { ...directDestination },
+      }),
+    };
+  }
+  // Never splice unrelated one-sided direct declarations onto the paired
+  // Files surface. Without both direct halves there is no coherent route for
+  // the cross-product the public capability model would otherwise imply.
+  if (directSource === undefined || directDestination === undefined) {
+    return {
+      ...(directSource !== undefined && { source: { ...directSource } }),
+      ...(directDestination !== undefined && {
+        destination: { ...directDestination },
+      }),
+    };
+  }
+
+  const sourcePredicates = [
+    ...(directSource.etag || pipeline.sourceEtag ? (['etag'] as const) : []),
+    ...(directSource.version ? (['version'] as const) : []),
+  ];
+  const destinationPredicates = [
+    ...(directDestination.create || pipeline.destinationCreate
+      ? (['create'] as const)
+      : []),
+    ...(directDestination.replace || pipeline.destinationReplace
+      ? (['replace'] as const)
+      : []),
+  ];
+  const supportsDirectSourceAlone = (
+    predicate: (typeof sourcePredicates)[number],
+  ): boolean =>
+    directSource[predicate] &&
+    directSource.requiresDestinationPredicate !== true;
+  const supportsDirectDestinationAlone = (
+    predicate: (typeof destinationPredicates)[number],
+  ): boolean =>
+    directDestination[predicate] &&
+    directDestination.requiresSourcePredicate !== true;
+  const sourceAlone = sourcePredicates.map(supportsDirectSourceAlone);
+  const destinationAlone = destinationPredicates.map(
+    supportsDirectDestinationAlone,
+  );
+  // One shared dependency flag cannot express a union where only some source
+  // or destination predicate kinds require their counterpart.
+  if (
+    (sourceAlone.some(Boolean) && !sourceAlone.every(Boolean)) ||
+    (destinationAlone.some(Boolean) && !destinationAlone.every(Boolean))
+  ) {
+    return {
+      source: { ...directSource },
+      destination: { ...directDestination },
+    };
+  }
+
+  const everyPairIsAtomic = sourcePredicates.every((source) =>
+    destinationPredicates.every((destination) => {
+      const throughPipeline =
+        source === 'etag' &&
+        (destination === 'create'
+          ? pipeline.destinationCreate
+          : pipeline.destinationReplace);
+      const throughDirect =
+        directSource[source] &&
+        directDestination[destination] &&
+        directDestination.atomicWithSource;
+      return throughPipeline || throughDirect;
+    }),
+  );
+  if (!everyPairIsAtomic) {
+    return {
+      source: { ...directSource },
+      destination: { ...directDestination },
+    };
+  }
+
+  return {
+    source: {
+      etag: sourcePredicates.includes('etag'),
+      ...(sourceAlone.every((supported) => !supported) && {
+        requiresDestinationPredicate: true,
+      }),
+      version: sourcePredicates.includes('version'),
+    },
+    destination: {
+      atomicWithSource: true,
+      create: destinationPredicates.includes('create'),
+      replace: destinationPredicates.includes('replace'),
+      ...(destinationAlone.every((supported) => !supported) && {
+        requiresSourcePredicate: true,
+      }),
+    },
+  };
 }
 
 function conditionalUploadAdapterOf(
@@ -601,6 +756,8 @@ interface FilesErrorLike {
   readonly aborted: boolean;
   readonly timedOut: boolean;
   readonly permanent: boolean;
+  readonly applied?: boolean;
+  readonly appliedEtag?: string;
   readonly cause?: unknown;
 }
 
@@ -633,7 +790,9 @@ function isFilesErrorLike(error: unknown): error is FilesErrorLike {
       'timedOut' in error &&
       typeof error.timedOut === 'boolean' &&
       'permanent' in error &&
-      typeof error.permanent === 'boolean'
+      typeof error.permanent === 'boolean' &&
+      (!('applied' in error) || typeof error.applied === 'boolean') &&
+      (!('appliedEtag' in error) || typeof error.appliedEtag === 'string')
     );
   } catch {
     return false;
@@ -649,6 +808,7 @@ function unwrapFilesError(error: FilesErrorLike): FilesErrorLike {
     !current.aborted &&
     !current.timedOut &&
     !current.permanent &&
+    current.applied !== true &&
     isFilesErrorLike(current.cause) &&
     current.message === current.cause.message &&
     !seen.has(current.cause)
@@ -683,10 +843,51 @@ const PUBLIC_PROVIDER_ERROR_MESSAGES: Readonly<
 function sanitizedStorageError(error: StorageError): StorageError {
   return new StorageError(PUBLIC_PROVIDER_ERROR_MESSAGES[error.code], {
     aborted: error.aborted,
+    applied: error.applied,
+    ...(isCanonicalStorageEtag(error.appliedEtag) && {
+      appliedEtag: error.appliedEtag,
+    }),
     code: error.code,
     permanent: error.permanent,
     timedOut: error.timedOut,
   });
+}
+
+function filesErrorCodeOfStorage(error: StorageError): FilesError['code'] {
+  switch (error.code) {
+    case StorageErrorCode.NOT_FOUND:
+      return 'NotFound';
+    case StorageErrorCode.UNAUTHORIZED:
+      return 'Unauthorized';
+    case StorageErrorCode.CONFLICT:
+      return error.permanent ? 'Conflict' : 'Provider';
+    case StorageErrorCode.READ_ONLY:
+      return 'ReadOnly';
+    default:
+      return 'Provider';
+  }
+}
+
+/** Converts NestM adapter failures before they enter the Files retry pipeline. */
+export function mapStorageErrorToFilesSdkError(error: unknown): FilesError {
+  if (error instanceof FilesError) return error;
+  if (!isStorageError(error)) return FilesError.wrap(error);
+
+  const sanitized = sanitizedStorageError(error);
+  return new FilesError(
+    filesErrorCodeOfStorage(sanitized),
+    sanitized.message,
+    sanitized,
+    {
+      aborted: sanitized.aborted,
+      applied: sanitized.applied,
+      ...(isCanonicalStorageEtag(sanitized.appliedEtag) && {
+        appliedEtag: sanitized.appliedEtag,
+      }),
+      permanent: sanitized.permanent,
+      timedOut: sanitized.timedOut,
+    },
+  );
 }
 
 export function mapFilesSdkError(error: unknown): StorageError {
@@ -703,11 +904,22 @@ export function mapFilesSdkError(error: unknown): StorageError {
     filesError.code === 'Provider' &&
     !filesError.aborted &&
     !filesError.timedOut &&
-    !filesError.permanent &&
     isStorageError(filesError.cause) &&
     filesError.message === filesError.cause.message
   ) {
-    return sanitizedStorageError(filesError.cause);
+    const storageCause = filesError.cause;
+    return new StorageError(PUBLIC_PROVIDER_ERROR_MESSAGES[storageCause.code], {
+      aborted: filesError.aborted || storageCause.aborted,
+      applied: filesError.applied === true || storageCause.applied,
+      ...(isCanonicalStorageEtag(filesError.appliedEtag)
+        ? { appliedEtag: filesError.appliedEtag }
+        : isCanonicalStorageEtag(storageCause.appliedEtag)
+          ? { appliedEtag: storageCause.appliedEtag }
+          : {}),
+      code: storageCause.code,
+      permanent: filesError.permanent || storageCause.permanent,
+      timedOut: filesError.timedOut || storageCause.timedOut,
+    });
   }
 
   let code: StorageErrorCode;
@@ -741,6 +953,10 @@ export function mapFilesSdkError(error: unknown): StorageError {
 
   return new StorageError(PUBLIC_PROVIDER_ERROR_MESSAGES[code], {
     aborted: filesError.aborted,
+    applied: filesError.applied === true,
+    ...(isCanonicalStorageEtag(filesError.appliedEtag) && {
+      appliedEtag: filesError.appliedEtag,
+    }),
     code,
     permanent: filesError.permanent,
     timedOut: filesError.timedOut,
@@ -792,6 +1008,10 @@ function storageRetryOptions(
             error,
             {
               aborted: error.aborted,
+              applied: error.applied,
+              ...(isCanonicalStorageEtag(error.appliedEtag) && {
+                appliedEtag: error.appliedEtag,
+              }),
               permanent: error.permanent,
               timedOut: error.timedOut,
             },
@@ -921,6 +1141,25 @@ function uploadOptions(
   };
 }
 
+function conditionalUploadOptions(
+  options: StorageConditionalUploadOptions,
+): ConditionalUploadOptions {
+  return {
+    ...operationOptions(options),
+    ...(options.cacheControl !== undefined && {
+      cacheControl: options.cacheControl,
+    }),
+    condition: options.condition,
+    ...(options.contentType !== undefined && {
+      contentType: options.contentType,
+    }),
+    ...(options.metadata !== undefined && { metadata: options.metadata }),
+    ...(options.onProgress !== undefined && {
+      onProgress: options.onProgress,
+    }),
+  };
+}
+
 function downloadOptions(options?: StorageDownloadOptions): DownloadOptions {
   return {
     ...operationOptions(options),
@@ -1026,6 +1265,19 @@ function invalidConditionalEtag(
   });
 }
 
+function invalidConditionalArgument(
+  message: string,
+  key: string,
+  operation: 'delete' | 'download' | 'promote' | 'upload',
+): StorageError {
+  return new StorageError(message, {
+    code: StorageErrorCode.INVALID_ARGUMENT,
+    key,
+    operation,
+    permanent: true,
+  });
+}
+
 function metadataOf(
   file: StoredFile,
   operation: 'download' | 'head' | 'list' | 'search',
@@ -1056,6 +1308,64 @@ function uploadResultOf(result: UploadResult): StorageUploadResult {
       lastModified: new Date(result.lastModified),
     }),
     size: result.size,
+  };
+}
+
+function conditionalUploadResultOf(result: UploadResult): StorageUploadResult {
+  try {
+    return uploadResultOf(result);
+  } catch (error) {
+    if (!isStorageError(error)) throw error;
+    throw new StorageError(error.message, {
+      applied: true,
+      code: error.code,
+      permanent: error.permanent,
+    });
+  }
+}
+
+function directConditionalUploadResultOf(
+  result: StorageUploadResult,
+  logicalKey: string,
+  physicalKey: string,
+): StorageUploadResult {
+  let etag: string | undefined;
+  try {
+    etag = providerEtag(result.etag, logicalKey, 'upload');
+  } catch (error) {
+    if (!isStorageError(error)) throw error;
+    throw new StorageError(error.message, {
+      applied: true,
+      code: error.code,
+      key: logicalKey,
+      operation: 'upload',
+      permanent: true,
+    });
+  }
+  if (result.key !== physicalKey) {
+    throw new StorageError(
+      'Storage adapter returned an unexpected conditional upload key.',
+      {
+        applied: true,
+        ...(etag !== undefined && { appliedEtag: etag }),
+        code: StorageErrorCode.PROVIDER,
+        key: logicalKey,
+        operation: 'upload',
+        permanent: true,
+      },
+    );
+  }
+  return {
+    ...result,
+    ...(etag === undefined ? {} : { etag }),
+    key: logicalKey,
+  };
+}
+
+function storageObjectOf(file: StoredFile): StorageObject {
+  return {
+    ...metadataOf(file, 'download'),
+    body: normalizeDownloadStream(file.stream()),
   };
 }
 
@@ -1270,7 +1580,7 @@ export class FilesSdkStorageDriver<
   readonly #conditionalDelete: FilesSdkConditionalDeleteAdapter | undefined;
   readonly #conditionalRead: FilesSdkConditionalReadAdapter | undefined;
   readonly #conditionalUpload: FilesSdkConditionalUploadAdapter | undefined;
-  readonly #conditionalOperationsBlockedByFilesPolicy: boolean;
+  readonly #directConditionalFallbackBlocked: boolean;
   readonly #physicalKey: FilesSdkPhysicalKeyAdapter | undefined;
   readonly #prefix: string;
   readonly #readOnly: boolean;
@@ -1345,7 +1655,7 @@ export class FilesSdkStorageDriver<
     const readOnly =
       options.readonly === true || s3Provenance?.provenance === 'unverified';
     // Evaluate caller policy before appending NestM's internal key guard below.
-    this.#conditionalOperationsBlockedByFilesPolicy =
+    this.#directConditionalFallbackBlocked =
       hasCallerFilesOperationPolicy(options);
     // Files retains the hooks object by reference. Snapshot it so an initially
     // inactive object cannot be mutated after this compatibility decision and
@@ -1397,6 +1707,30 @@ export class FilesSdkStorageDriver<
 
   get capabilities() {
     const capabilities = this.#files.capabilities;
+    const conditional = capabilities.conditional;
+    const directFallbackAllowed = !this.#directConditionalFallbackBlocked;
+    const directCopy = directFallbackAllowed
+      ? this.#conditionalCopy
+      : undefined;
+    const pipelineCopy = conditional.copy;
+    const copyCapabilities = conditionalCopyCapabilities(
+      directCopy,
+      pipelineCopy,
+    );
+    const conditionalCopySource = copyCapabilities.source;
+    const conditionalCopyDestination = copyCapabilities.destination;
+    const directDelete = directFallbackAllowed
+      ? this.#conditionalDelete
+      : undefined;
+    const directRead = directFallbackAllowed
+      ? this.#conditionalRead
+      : undefined;
+    const directUpload = directFallbackAllowed
+      ? this.#conditionalUpload
+      : undefined;
+    const conditionalReadEtag =
+      conditional.exactRead || directRead?.conditionalRead.etag === true;
+    const conditionalReadVersion = directRead?.conditionalRead.version === true;
     return {
       cacheControl: capabilities.cacheControl,
       delimiter: capabilities.delimiter,
@@ -1404,51 +1738,48 @@ export class FilesSdkStorageDriver<
       rangeRead: capabilities.rangeRead,
       resumableUpload: !this.#readOnly && capabilities.multipart,
       serverSideCopy: !this.#readOnly && capabilities.serverSideCopy,
-      ...(!this.#conditionalOperationsBlockedByFilesPolicy &&
-        this.#conditionalCopy !== undefined &&
-        !this.#readOnly && {
-          ...(this.#conditionalCopy.conditionalCopySource !== undefined && {
-            conditionalCopySource: {
-              ...this.#conditionalCopy.conditionalCopySource,
-            },
-          }),
-          ...(this.#conditionalCopy.conditionalCopyDestination !==
-            undefined && {
-            conditionalCopyDestination: {
-              ...this.#conditionalCopy.conditionalCopyDestination,
-            },
-          }),
+      ...(!this.#readOnly &&
+        conditionalCopySource !== undefined && {
+          conditionalCopySource,
         }),
-      ...(!this.#conditionalOperationsBlockedByFilesPolicy &&
-        this.#conditionalDelete !== undefined &&
-        !this.#readOnly && {
-          conditionalDelete: {
-            ...this.#conditionalDelete.conditionalDelete,
+      ...(!this.#readOnly &&
+        conditionalCopyDestination !== undefined && {
+          conditionalCopyDestination,
+        }),
+      ...(!this.#readOnly &&
+        (conditional.delete ||
+          directDelete?.conditionalDelete.etag === true) && {
+          conditionalDelete: { etag: true },
+        }),
+      ...((conditionalReadEtag || conditionalReadVersion) && {
+        conditionalRead: {
+          etag: conditionalReadEtag,
+          version: conditionalReadVersion,
+        },
+      }),
+      ...(!this.#readOnly &&
+        (conditional.create ||
+          directUpload?.conditionalCreate !== undefined) && {
+          conditionalCreate: {
+            resultEtag:
+              conditional.create ||
+              directUpload?.conditionalCreate?.resultEtag === true,
           },
         }),
-      ...(!this.#conditionalOperationsBlockedByFilesPolicy &&
-        this.#conditionalRead !== undefined && {
-          conditionalRead: { ...this.#conditionalRead.conditionalRead },
+      ...(!this.#readOnly &&
+        (conditional.replace ||
+          directUpload?.conditionalReplace !== undefined) && {
+          conditionalReplace: {
+            resultEtag:
+              conditional.replace ||
+              directUpload?.conditionalReplace?.resultEtag === true,
+          },
         }),
-      ...(!this.#conditionalOperationsBlockedByFilesPolicy &&
-        this.#conditionalUpload !== undefined &&
-        !this.#readOnly && {
-          ...(this.#conditionalUpload.conditionalCreate !== undefined && {
-            conditionalCreate: {
-              ...this.#conditionalUpload.conditionalCreate,
-            },
-          }),
-          ...(this.#conditionalUpload.conditionalReplace !== undefined && {
-            conditionalReplace: {
-              ...this.#conditionalUpload.conditionalReplace,
-            },
-          }),
-          ...(this.#conditionalUpload.conditionalMultipartCompletion !==
-            undefined && {
-            conditionalMultipartCompletion: {
-              ...this.#conditionalUpload.conditionalMultipartCompletion,
-            },
-          }),
+      ...(!this.#readOnly &&
+        directUpload?.conditionalMultipartCompletion !== undefined && {
+          conditionalMultipartCompletion: {
+            ...directUpload.conditionalMultipartCompletion,
+          },
         }),
       ...(this.#physicalKey !== undefined && {
         physicalKey: { ...this.#physicalKey.physicalKey },
@@ -1488,17 +1819,31 @@ export class FilesSdkStorageDriver<
     body: StorageBody,
     options: StorageConditionalUploadOptions,
   ): Promise<StorageUploadResult> {
+    const condition = (options as { readonly condition?: unknown } | undefined)
+      ?.condition;
     if (
-      options.condition.type === 'replace' &&
-      !isCanonicalStorageEtag(options.condition.etag)
+      typeof condition !== 'object' ||
+      condition === null ||
+      !('type' in condition) ||
+      (condition.type !== 'create' && condition.type !== 'replace')
+    ) {
+      return Promise.reject(
+        invalidConditionalArgument(
+          'condition.type must be "create" or "replace".',
+          key,
+          'upload',
+        ),
+      );
+    }
+    if (
+      condition.type === 'replace' &&
+      !isCanonicalStorageEtag('etag' in condition ? condition.etag : undefined)
     ) {
       return Promise.reject(
         invalidConditionalEtag('condition.etag', key, 'upload'),
       );
     }
-    if (this.#conditionalOperationsBlockedByFilesPolicy) {
-      return Promise.reject(this.#conditionalFilesPolicyError(key, 'upload'));
-    }
+    this.#assertLogicalKey(key);
     if (this.#readOnly) {
       return Promise.reject(
         new StorageError(
@@ -1514,21 +1859,42 @@ export class FilesSdkStorageDriver<
     }
     const adapter = this.#conditionalUpload;
     const capability =
-      options.condition.type === 'create'
+      condition.type === 'create'
         ? adapter?.conditionalCreate
         : adapter?.conditionalReplace;
     const multipartRequested =
       options.multipart !== undefined && options.multipart !== false;
+    const controlRequested = options.control !== undefined;
+    const pipelineSupported =
+      !multipartRequested &&
+      !controlRequested &&
+      (condition.type === 'create'
+        ? this.#files.capabilities.conditional.create
+        : this.#files.capabilities.conditional.replace);
+    if (pipelineSupported) {
+      return this.#call(async () =>
+        conditionalUploadResultOf(
+          await this.#files.upload(
+            key,
+            mapBody(body),
+            conditionalUploadOptions(options),
+          ),
+        ),
+      );
+    }
     const multipartSupported =
       !multipartRequested ||
-      (options.condition.type === 'create'
+      (condition.type === 'create'
         ? adapter?.conditionalMultipartCompletion?.create === true
         : adapter?.conditionalMultipartCompletion?.replace === true);
-    if (
-      adapter === undefined ||
-      capability === undefined ||
-      !multipartSupported
-    ) {
+    const directFallbackSupported =
+      adapter !== undefined && capability !== undefined && multipartSupported;
+    if (directFallbackSupported && this.#directConditionalFallbackBlocked) {
+      return Promise.reject(
+        this.#conditionalFallbackPolicyError(key, 'upload'),
+      );
+    }
+    if (!directFallbackSupported) {
       return Promise.reject(
         new StorageError(
           `Storage adapter "${this.#name}" does not support conditional upload.`,
@@ -1549,23 +1915,7 @@ export class FilesSdkStorageDriver<
         mapBody(body),
         mergedOptions,
       );
-      if (result.key !== physicalKey) {
-        throw new StorageError(
-          'Storage adapter returned an unexpected conditional upload key.',
-          {
-            code: StorageErrorCode.PROVIDER,
-            key,
-            operation: 'upload',
-            permanent: true,
-          },
-        );
-      }
-      const etag = providerEtag(result.etag, key, 'upload');
-      return {
-        ...result,
-        ...(etag === undefined ? {} : { etag }),
-        key,
-      };
+      return directConditionalUploadResultOf(result, key, physicalKey);
     });
   }
 
@@ -1587,24 +1937,71 @@ export class FilesSdkStorageDriver<
     key: string,
     options: StorageConditionalReadOptions,
   ): Promise<StorageObject> {
-    if (
-      options.condition.etag !== undefined &&
-      !isCanonicalStorageEtag(options.condition.etag)
-    ) {
+    const condition = (options as { readonly condition?: unknown } | undefined)
+      ?.condition;
+    if (typeof condition !== 'object' || condition === null) {
+      return Promise.reject(
+        invalidConditionalArgument(
+          'conditional read requires a condition object.',
+          key,
+          'download',
+        ),
+      );
+    }
+    const etag = 'etag' in condition ? condition.etag : undefined;
+    const version = 'version' in condition ? condition.version : undefined;
+    if (etag !== undefined && !isCanonicalStorageEtag(etag)) {
       return Promise.reject(
         invalidConditionalEtag('condition.etag', key, 'download'),
       );
     }
-    if (this.#conditionalOperationsBlockedByFilesPolicy) {
-      return Promise.reject(this.#conditionalFilesPolicyError(key, 'download'));
+    if (
+      version !== undefined &&
+      (typeof version !== 'string' || version.length === 0)
+    ) {
+      return Promise.reject(
+        invalidConditionalArgument(
+          'condition.version must be a non-empty string.',
+          key,
+          'download',
+        ),
+      );
+    }
+    if (etag === undefined && version === undefined) {
+      return Promise.reject(
+        invalidConditionalArgument(
+          'conditional read requires an etag, version, or both.',
+          key,
+          'download',
+        ),
+      );
+    }
+    this.#assertLogicalKey(key);
+    const pipelineSupported =
+      etag !== undefined &&
+      version === undefined &&
+      this.#files.capabilities.conditional.exactRead;
+    if (pipelineSupported) {
+      return this.#call(async () =>
+        storageObjectOf(
+          await this.#files.download(key, {
+            ...downloadOptions(options),
+            condition: { etag },
+          }),
+        ),
+      );
     }
     const adapter = this.#conditionalRead;
-    if (
-      adapter === undefined ||
-      (options.condition.etag !== undefined && !adapter.conditionalRead.etag) ||
-      (options.condition.version !== undefined &&
-        !adapter.conditionalRead.version)
-    ) {
+    const directFallbackSupported =
+      adapter !== undefined &&
+      (etag === undefined || adapter.conditionalRead.etag) &&
+      (version === undefined || adapter.conditionalRead.version);
+    if (directFallbackSupported && this.#directConditionalFallbackBlocked) {
+      return Promise.reject(
+        this.#conditionalFallbackPolicyError(key, 'download'),
+      );
+    }
+    if (!directFallbackSupported) {
       return Promise.reject(
         new StorageError(
           `Storage adapter "${this.#name}" does not support conditional read.`,
@@ -1681,14 +2078,24 @@ export class FilesSdkStorageDriver<
     key: string,
     options: StorageConditionalDeleteOptions,
   ): Promise<void> {
-    if (!isCanonicalStorageEtag(options.condition.etag)) {
+    const condition = (options as { readonly condition?: unknown } | undefined)
+      ?.condition;
+    if (typeof condition !== 'object' || condition === null) {
+      return Promise.reject(
+        invalidConditionalArgument(
+          'conditional delete requires a condition object.',
+          key,
+          'delete',
+        ),
+      );
+    }
+    const etag = 'etag' in condition ? condition.etag : undefined;
+    if (!isCanonicalStorageEtag(etag)) {
       return Promise.reject(
         invalidConditionalEtag('condition.etag', key, 'delete'),
       );
     }
-    if (this.#conditionalOperationsBlockedByFilesPolicy) {
-      return Promise.reject(this.#conditionalFilesPolicyError(key, 'delete'));
-    }
+    this.#assertLogicalKey(key);
     if (this.#readOnly) {
       return Promise.reject(
         new StorageError(
@@ -1702,8 +2109,23 @@ export class FilesSdkStorageDriver<
         ),
       );
     }
+    if (this.#files.capabilities.conditional.delete) {
+      return this.#call(() =>
+        this.#files.delete(key, {
+          ...operationOptions(options),
+          condition: options.condition,
+        }),
+      );
+    }
     const adapter = this.#conditionalDelete;
-    if (adapter === undefined || !adapter.conditionalDelete.etag) {
+    const directFallbackSupported =
+      adapter !== undefined && adapter.conditionalDelete.etag;
+    if (directFallbackSupported && this.#directConditionalFallbackBlocked) {
+      return Promise.reject(
+        this.#conditionalFallbackPolicyError(key, 'delete'),
+      );
+    }
+    if (!directFallbackSupported) {
       return Promise.reject(
         new StorageError(
           `Storage adapter "${this.#name}" does not support conditional delete.`,
@@ -1751,6 +2173,15 @@ export class FilesSdkStorageDriver<
     destinationKey: string,
     options: StoragePromotionOptions,
   ): Promise<void> {
+    if (typeof options !== 'object' || options === null) {
+      return Promise.reject(
+        invalidConditionalArgument(
+          'promote requires an options object with a precondition.',
+          sourceKey,
+          'promote',
+        ),
+      );
+    }
     const destination = options.destination;
     if (
       destination !== undefined &&
@@ -1765,6 +2196,32 @@ export class FilesSdkStorageDriver<
           operation: 'promote',
           permanent: true,
         }),
+      );
+    }
+    if (
+      options.sourceVersion !== undefined &&
+      (typeof options.sourceVersion !== 'string' ||
+        options.sourceVersion.length === 0)
+    ) {
+      return Promise.reject(
+        invalidConditionalArgument(
+          'sourceVersion must be a non-empty string.',
+          sourceKey,
+          'promote',
+        ),
+      );
+    }
+    if (
+      options.sourceEtag === undefined &&
+      options.sourceVersion === undefined &&
+      destination === undefined
+    ) {
+      return Promise.reject(
+        invalidConditionalArgument(
+          'promote requires a source or destination precondition.',
+          sourceKey,
+          'promote',
+        ),
       );
     }
     if (
@@ -1783,11 +2240,8 @@ export class FilesSdkStorageDriver<
         invalidConditionalEtag('destination.etag', destinationKey, 'promote'),
       );
     }
-    if (this.#conditionalOperationsBlockedByFilesPolicy) {
-      return Promise.reject(
-        this.#conditionalFilesPolicyError(sourceKey, 'promote'),
-      );
-    }
+    this.#assertLogicalKey(sourceKey);
+    this.#assertLogicalKey(destinationKey);
     if (this.#readOnly) {
       return Promise.reject(
         new StorageError(
@@ -1801,22 +2255,61 @@ export class FilesSdkStorageDriver<
         ),
       );
     }
+    const pipelineCopy = this.#files.capabilities.conditional.copy;
+    const pipelineDestinationSupported =
+      destination?.type === 'create'
+        ? pipelineCopy.destinationCreate
+        : destination?.type === 'replace'
+          ? pipelineCopy.destinationReplace
+          : false;
+    const pipelineSupported =
+      options.sourceEtag !== undefined &&
+      options.sourceVersion === undefined &&
+      destination !== undefined &&
+      pipelineCopy.sourceEtag &&
+      pipelineCopy.atomicSourceDestination &&
+      pipelineDestinationSupported;
+    if (pipelineSupported) {
+      return this.#call(() =>
+        this.#files.copy(sourceKey, destinationKey, {
+          ...operationOptions(options),
+          condition: {
+            destination,
+            source: { etag: options.sourceEtag as string },
+          },
+        }),
+      );
+    }
     const adapter = this.#conditionalCopy;
-    if (
-      adapter === undefined ||
-      (options.sourceEtag !== undefined &&
-        adapter.conditionalCopySource?.etag !== true) ||
-      (options.sourceVersion !== undefined &&
-        adapter.conditionalCopySource?.version !== true) ||
-      (options.destination?.type === 'create' &&
-        adapter.conditionalCopyDestination?.create !== true) ||
-      (options.destination?.type === 'replace' &&
-        adapter.conditionalCopyDestination?.replace !== true) ||
-      (options.destination !== undefined &&
-        (options.sourceEtag !== undefined ||
-          options.sourceVersion !== undefined) &&
-        adapter.conditionalCopyDestination?.atomicWithSource !== true)
-    ) {
+    const directFallbackSupported =
+      adapter !== undefined &&
+      (options.sourceEtag === undefined ||
+        adapter.conditionalCopySource?.etag === true) &&
+      (options.sourceVersion === undefined ||
+        adapter.conditionalCopySource?.version === true) &&
+      (options.sourceEtag === undefined && options.sourceVersion === undefined
+        ? true
+        : options.destination !== undefined ||
+          adapter.conditionalCopySource?.requiresDestinationPredicate !==
+            true) &&
+      (options.destination?.type !== 'create' ||
+        adapter.conditionalCopyDestination?.create === true) &&
+      (options.destination?.type !== 'replace' ||
+        adapter.conditionalCopyDestination?.replace === true) &&
+      (options.destination === undefined ||
+        options.sourceEtag !== undefined ||
+        options.sourceVersion !== undefined ||
+        adapter.conditionalCopyDestination?.requiresSourcePredicate !== true) &&
+      (options.destination === undefined ||
+        (options.sourceEtag === undefined &&
+          options.sourceVersion === undefined) ||
+        adapter.conditionalCopyDestination?.atomicWithSource === true);
+    if (directFallbackSupported && this.#directConditionalFallbackBlocked) {
+      return Promise.reject(
+        this.#conditionalFallbackPolicyError(sourceKey, 'promote'),
+      );
+    }
+    if (!directFallbackSupported) {
       return Promise.reject(
         new StorageError(
           `Storage adapter "${this.#name}" does not support conditional promotion.`,
@@ -1971,12 +2464,12 @@ export class FilesSdkStorageDriver<
     );
   }
 
-  #conditionalFilesPolicyError(
+  #conditionalFallbackPolicyError(
     key: string,
     operation: 'delete' | 'download' | 'promote' | 'upload',
   ): StorageError {
     return new StorageError(
-      'Conditional storage operations are unavailable while Files SDK plugins, hooks, or receipts are configured.',
+      'This conditional form requires a NestM adapter fallback and is unavailable while Files SDK plugins, hooks, or receipts are configured.',
       {
         code: StorageErrorCode.NOT_SUPPORTED,
         key,
