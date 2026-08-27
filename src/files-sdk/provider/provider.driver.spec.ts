@@ -243,11 +243,14 @@ describe('createProviderStorageDriver', () => {
   });
 
   it('forwards an explicit verified profile to a custom S3 endpoint', async () => {
+    const configJson = Object.freeze({
+      endpoint: 'https://objects.example.test',
+    });
     const driver = await createProviderStorageDriver({
       config: {
         accessKeyId: 'test',
         bucket: 'artifacts',
-        configJson: { endpoint: 'https://objects.example.test' },
+        configJson,
         region: 'us-east-1',
         secretAccessKey: 'test',
       },
@@ -269,6 +272,32 @@ describe('createProviderStorageDriver', () => {
       contentType: false,
       sizeRange: false,
     });
+    expect(configJson).toEqual({ endpoint: 'https://objects.example.test' });
+  });
+
+  it('preserves an explicit custom-endpoint conditional opt-out', async () => {
+    await expect(
+      createProviderStorageDriver({
+        config: {
+          accessKeyId: 'test',
+          bucket: 'artifacts',
+          configJson: {
+            conditional: false,
+            endpoint: 'https://objects.example.test',
+          },
+          region: 'us-east-1',
+          secretAccessKey: 'test',
+        },
+        provider: 's3',
+        s3ProviderProfile: defineS3ProviderProfile({
+          name: 'verified-but-conditionals-disabled',
+          physicalKey: { maxBytes: 512 },
+          conditionalCreate: { resultEtag: true },
+        }),
+      }),
+    ).rejects.toThrow(
+      /requires conditional request headers, but the adapter was not constructed with conditional requests enabled/u,
+    );
   });
 
   it('rejects an S3 profile for a different provider', async () => {

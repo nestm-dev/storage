@@ -89,6 +89,46 @@ describe('createStorageProviderConformanceCases', () => {
     ]);
   });
 
+  it('treats paired-only copy predicates as unsupported when exercised alone', () => {
+    const contracts = createStorageProviderConformanceCases({
+      provider: 'paired-only-copy',
+      expected: {
+        conditionalCopyDestination: {
+          atomicWithSource: true,
+          create: true,
+          replace: true,
+          requiresSourcePredicate: true,
+        },
+        conditionalCopySource: {
+          etag: true,
+          requiresDestinationPredicate: true,
+          version: false,
+        },
+        physicalKey: { maxBytes: 1024 },
+      },
+      createFixture() {
+        throw new Error('case generation must not create a fixture');
+      },
+    });
+    const names = contracts.map(({ name }) => name);
+
+    expect(names).toContain(
+      'fails closed when source-ETag copy requires a destination predicate',
+    );
+    expect(names).toContain(
+      'fails closed when create-only destination copy requires a source predicate',
+    );
+    expect(names).toContain(
+      'fails closed when destination replacement copy requires a source predicate',
+    );
+    expect(names).toContain(
+      'combines etag source and create destination copy predicates atomically',
+    );
+    expect(names).toContain(
+      'combines etag source and replace destination copy predicates atomically',
+    );
+  });
+
   it('executes every positive and fail-closed versioned copy combination', async () => {
     const positive = createStorageProviderConformanceCases({
       provider: 'fake-versioned-atomic',

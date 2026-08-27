@@ -1,4 +1,5 @@
 import {
+  AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
   CopyObjectCommand,
   CreateMultipartUploadCommand,
@@ -20,8 +21,8 @@ import { s3 as upstreamS3 } from 'files-sdk/s3';
 import { StorageClient } from '../../storage.client.js';
 import {
   isStorageError,
+  StorageError,
   StorageErrorCode,
-  type StorageError,
 } from '../../storage.error.js';
 import { createFilesSdkDriver } from '../files-sdk.driver.js';
 import {
@@ -196,6 +197,285 @@ describe('createS3StorageDriver', () => {
     }
   });
 
+  it('publishes a frozen Files conditional surface narrowed to the provider profile', () => {
+    const base = s3(adapter);
+    const narrow = defineS3ProviderProfile({
+      name: 'files-exact-read-only',
+      physicalKey: { maxBytes: 1024 },
+      conditionalRead: { etag: true, version: false },
+    });
+    try {
+      const decorated = withS3Capabilities(base, {
+        providerProfile: narrow,
+      });
+
+      expect(Object.keys(decorated.conditional ?? {})).toEqual(['exactRead']);
+      expect(Object.isFrozen(decorated.conditional)).toBe(true);
+      expect(decorated.conditional?.create).toBeUndefined();
+      expect(decorated.conditional?.copy).toBeUndefined();
+      expect(decorated.conditional?.delete).toBeUndefined();
+      expect(decorated.conditional?.replace).toBeUndefined();
+    } finally {
+      base.raw.destroy();
+    }
+  });
+
+  it('does not expose a Files conditional upload without guaranteed result ETags', () => {
+    const base = s3(adapter);
+    try {
+      const decorated = withS3Capabilities(base, {
+        providerProfile: defineS3ProviderProfile({
+          name: 'conditional-create-without-result-etag',
+          physicalKey: { maxBytes: 1024 },
+          conditionalCreate: { resultEtag: false },
+        }),
+      });
+
+      expect(decorated.conditionalCreate).toEqual({ resultEtag: false });
+      expect(decorated.conditional).toBeUndefined();
+    } finally {
+      base.raw.destroy();
+    }
+  });
+
+  it('does not expose direct conditional delete when the profile disables ETag deletion', () => {
+    const send = vi.spyOn(S3Client.prototype, 'send');
+    const base = s3(adapter);
+    try {
+      const decorated = withS3Capabilities(base, {
+        providerProfile: defineS3ProviderProfile({
+          name: 'conditional-delete-disabled',
+          physicalKey: { maxBytes: 1024 },
+          conditionalDelete: { etag: false },
+        }),
+      });
+
+      expect(decorated.conditionalDelete).toBeUndefined();
+      expect(decorated.deleteConditional).toBeUndefined();
+      expect(decorated.conditional?.delete).toBeUndefined();
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      base.raw.destroy();
+      send.mockRestore();
+    }
+  });
+
+  it('bridges verified custom-endpoint conditionals through the Files error boundary', async () => {
+    const base = s3({
+      ...adapter,
+      endpoint: 'https://verified.objects.example.test',
+    });
+    const requests: Array<{
+      headers: Record<string, string | undefined>;
+      input: { IfMatch?: string; IfNoneMatch?: string; Key?: string };
+    }> = [];
+    base.raw.middlewareStack.add(
+      () => async (arguments_) => {
+        const request = arguments_.request as {
+          readonly headers?: Record<string, string | undefined>;
+        };
+        const input = arguments_.input as {
+          IfMatch?: string;
+          IfNoneMatch?: string;
+          Key?: string;
+        };
+        requests.push({ headers: request.headers ?? {}, input });
+        if (input.IfMatch !== undefined) {
+          throw Object.assign(new Error('private precondition detail'), {
+            $metadata: { httpStatusCode: 412 },
+            name: 'PreconditionFailed',
+          });
+        }
+        return {
+          output: {
+            $metadata: {},
+            ...(input.Key !== 'ambiguous.txt' && { ETag: '"created"' }),
+          },
+          response: { headers: {}, statusCode: 200 },
+        } as never;
+      },
+      {
+        name: 'captureVerifiedConditionalRequest',
+        priority: 'high',
+        step: 'finalizeRequest',
+      },
+    );
+    try {
+      expect(base.conditional).toBeUndefined();
+      const decorated = withS3Capabilities(base, {
+        providerProfile: CLOUDFLARE_R2_PROVIDER_PROFILE,
+      });
+
+      expect(Object.keys(decorated.conditional ?? {}).sort()).toEqual([
+        'create',
+        'exactRead',
+        'replace',
+      ]);
+      expect(decorated.conditional?.copy).toBeUndefined();
+      expect(decorated.conditional?.delete).toBeUndefined();
+      await expect(
+        decorated.conditional?.create?.(
+          'stream.txt',
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array([1]));
+              controller.close();
+            },
+          }),
+        ),
+      ).rejects.toMatchObject({
+        code: 'Provider',
+        name: 'FilesError',
+        permanent: true,
+      });
+      expect(requests).toHaveLength(0);
+      await expect(
+        decorated.conditional?.create?.('created.txt', 'body'),
+      ).resolves.toMatchObject({ etag: 'created', key: 'created.txt' });
+      await expect(
+        decorated.conditional?.replace?.('created.txt', 'changed', 'previous'),
+      ).rejects.toMatchObject({
+        code: 'Conflict',
+        message: 'Storage provider operation conflicted with current state.',
+        name: 'FilesError',
+        permanent: true,
+      });
+      await expect(
+        decorated.conditional?.create?.('ambiguous.txt', 'body'),
+      ).rejects.toMatchObject({
+        applied: true,
+        code: 'Provider',
+        name: 'FilesError',
+        permanent: true,
+      });
+
+      expect(requests[0]?.input).toMatchObject({
+        IfNoneMatch: '*',
+        Key: 'created.txt',
+      });
+      expect(requests[0]?.headers).toHaveProperty('if-none-match', '*');
+      expect(requests[1]?.input).toMatchObject({
+        IfMatch: '"previous"',
+        Key: 'created.txt',
+      });
+      expect(requests[1]?.headers).toHaveProperty('if-match', '"previous"');
+    } finally {
+      base.raw.destroy();
+    }
+  });
+
+  it('cannot widen an adapter that explicitly disables conditional requests', () => {
+    const base = s3({
+      ...adapter,
+      conditional: false,
+      endpoint: 'https://disabled.objects.example.test',
+    });
+    try {
+      expect(base.conditional).toBeUndefined();
+      expect(() =>
+        withS3Capabilities(base, {
+          providerProfile: CLOUDFLARE_R2_PROVIDER_PROFILE,
+        }),
+      ).toThrow(/not constructed with conditional requests enabled/u);
+      expect(base.conditional).toBeUndefined();
+    } finally {
+      base.raw.destroy();
+    }
+  });
+
+  it('cannot widen an upstream native adapter that disabled conditional requests', () => {
+    const base = upstreamS3({ ...adapter, conditional: false });
+    try {
+      expect(base.conditional).toBeUndefined();
+      expect(() => withS3Capabilities(base)).toThrow(
+        /not constructed with conditional requests enabled/u,
+      );
+      expect(base.conditional).toBeUndefined();
+    } finally {
+      base.raw.destroy();
+    }
+  });
+
+  it('withholds an explicit custom-endpoint opt-in until a verified profile narrows it', () => {
+    const base = s3({
+      ...adapter,
+      conditional: true,
+      endpoint: 'https://opted-in.objects.example.test',
+    });
+    const narrow = defineS3ProviderProfile({
+      name: 'opted-in-exact-read-only',
+      physicalKey: { maxBytes: 1024 },
+      conditionalRead: { etag: true, version: false },
+    });
+    try {
+      expect(base.conditional).toBeUndefined();
+      const decorated = withS3Capabilities(base, {
+        providerProfile: narrow,
+      });
+      expect(Object.keys(decorated.conditional ?? {})).toEqual(['exactRead']);
+    } finally {
+      base.raw.destroy();
+    }
+  });
+
+  it('exposes Files conditional copy only for paired predicates allowed by the profile', async () => {
+    const send = vi.spyOn(S3Client.prototype, 'send');
+    const base = s3(adapter);
+    const createOnlyCopy = defineS3ProviderProfile({
+      name: 'files-create-only-copy',
+      physicalKey: { maxBytes: 1024 },
+      conditionalCopyDestination: {
+        atomicWithSource: true,
+        create: true,
+        replace: false,
+        requiresSourcePredicate: true,
+      },
+      conditionalCopySource: {
+        etag: true,
+        requiresDestinationPredicate: true,
+        version: false,
+      },
+    });
+    try {
+      const decorated = withS3Capabilities(base, {
+        providerProfile: createOnlyCopy,
+      });
+
+      expect(decorated.conditional?.copy).toMatchObject({
+        atomicSourceDestination: true,
+        destinationCreate: true,
+        destinationReplace: false,
+        sourceEtag: true,
+      });
+      await expect(
+        decorated.conditional?.copy?.run('source.txt', 'destination.txt', {
+          destination: { etag: 'destination-etag', type: 'replace' },
+          source: { etag: 'source-etag' },
+        }),
+      ).rejects.toMatchObject({ code: 'Provider', permanent: true });
+      await expect(
+        decorated.promote?.('source.txt', 'destination.txt', {
+          sourceEtag: 'source-etag',
+        }),
+      ).rejects.toMatchObject({
+        code: StorageErrorCode.NOT_SUPPORTED,
+        permanent: true,
+      });
+      await expect(
+        decorated.promote?.('source.txt', 'destination.txt', {
+          destination: { type: 'create' },
+        }),
+      ).rejects.toMatchObject({
+        code: StorageErrorCode.NOT_SUPPORTED,
+        permanent: true,
+      });
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      base.raw.destroy();
+      send.mockRestore();
+    }
+  });
+
   it('does not apply the native AWS key ceiling to an explicitly verified custom endpoint', () => {
     const custom = s3({
       ...adapter,
@@ -295,6 +575,7 @@ describe('createS3StorageDriver', () => {
       const unverified = withS3Capabilities(unverifiedCustom);
       expect(unverified.conditionalCreate).toBeUndefined();
       expect(unverified.conditionalRead).toBeUndefined();
+      expect(unverified.conditional).toBeUndefined();
     } finally {
       unverifiedCustom.raw.destroy();
     }
@@ -726,6 +1007,67 @@ describe('createS3StorageDriver', () => {
     });
   });
 
+  it('bounds hanging multipart cleanup without caller limits and preserves the original error', async () => {
+    vi.useFakeTimers();
+    const original = new StorageError('original multipart failure', {
+      code: StorageErrorCode.PROVIDER,
+      operation: 'upload',
+      permanent: true,
+    });
+    let cleanupSignal: AbortSignal | undefined;
+    let signalCleanupStarted: (() => void) | undefined;
+    const cleanupStarted = new Promise<void>((resolve) => {
+      signalCleanupStarted = resolve;
+    });
+    const send = vi
+      .spyOn(S3Client.prototype, 'send')
+      .mockImplementation((async (
+        command: unknown,
+        options?: { readonly abortSignal?: AbortSignal },
+      ) => {
+        if (command instanceof CreateMultipartUploadCommand) {
+          return { UploadId: 'upload-to-abort' };
+        }
+        if (command instanceof UploadPartCommand) {
+          throw original;
+        }
+        if (command instanceof AbortMultipartUploadCommand) {
+          cleanupSignal = options?.abortSignal;
+          signalCleanupStarted?.();
+          await new Promise<never>(() => undefined);
+        }
+        throw new Error('Unexpected S3 command.');
+      }) as never);
+    const base = s3(adapter);
+    try {
+      const decorated = withS3Capabilities(base);
+      const failure = rejectedStorageError(() =>
+        decorated.uploadConditional!('cleanup.bin', new Uint8Array([1, 2, 3]), {
+          condition: { type: 'create' },
+          multipart: true,
+        }),
+      );
+
+      await cleanupStarted;
+      const cleanup = send.mock.calls[2];
+      expect(cleanup?.[0]).toBeInstanceOf(AbortMultipartUploadCommand);
+      expect(cleanupSignal).toBe(
+        (cleanup?.[1] as { readonly abortSignal?: AbortSignal } | undefined)
+          ?.abortSignal,
+      );
+      expect(cleanupSignal?.aborted).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      const error = await failure;
+      expect(cleanupSignal?.aborted).toBe(true);
+      expect(error).toBe(original);
+    } finally {
+      vi.useRealTimers();
+      base.raw.destroy();
+      send.mockRestore();
+    }
+  });
+
   it('fails closed when S3 omits or returns a malformed result ETag', async () => {
     const send = vi.spyOn(S3Client.prototype, 'send');
     const client = new StorageClient(
@@ -750,6 +1092,7 @@ describe('createS3StorageDriver', () => {
           condition: { type: 'create' },
         }),
       ).rejects.toMatchObject({
+        applied: true,
         code: StorageErrorCode.PROVIDER,
         permanent: true,
       });
@@ -1118,6 +1461,49 @@ describe('createS3StorageDriver', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it('validates direct conditional method discriminants and non-empty predicates before dispatch', async () => {
+    const send = vi.spyOn(S3Client.prototype, 'send');
+    const base = s3(adapter);
+    try {
+      const decorated = withS3Capabilities(base);
+      const invalidOperations: Array<() => Promise<unknown>> = [
+        () =>
+          decorated.downloadConditional!('read.txt', {
+            condition: {},
+          } as never),
+        () =>
+          decorated.downloadConditional!('read.txt', {
+            condition: { version: '' },
+          }),
+        () => decorated.promote!('source.txt', 'destination.txt', {}),
+        () =>
+          decorated.promote!('source.txt', 'destination.txt', {
+            sourceVersion: '',
+          }),
+        () => decorated.uploadConditional!('upload.txt', 'body', {} as never),
+        () =>
+          decorated.uploadConditional!('upload.txt', 'body', {
+            condition: { type: 'invalid' },
+          } as never),
+        () =>
+          decorated.uploadConditional!('upload.txt', 'body', {
+            condition: { type: 'replace' },
+          } as never),
+      ];
+
+      for (const operation of invalidOperations) {
+        await expect(operation()).rejects.toMatchObject({
+          code: StorageErrorCode.INVALID_ARGUMENT,
+          permanent: true,
+        });
+      }
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      base.raw.destroy();
+      send.mockRestore();
+    }
+  });
+
   it('normalizes 412, 409, and 404 without retaining provider errors', async () => {
     const providerMessages = [
       'secret 412 provider body',
@@ -1189,6 +1575,135 @@ describe('createS3StorageDriver', () => {
     }
   });
 
+  it('keeps ConditionalRequestConflict retryable through the Files pipeline', async () => {
+    const send = vi
+      .spyOn(S3Client.prototype, 'send')
+      .mockRejectedValueOnce(
+        Object.assign(new Error('transient conditional race'), {
+          $metadata: { httpStatusCode: 409 },
+          name: 'ConditionalRequestConflict',
+        }),
+      )
+      .mockResolvedValueOnce({ ETag: '"after-retry"' } as never);
+    const client = new StorageClient(
+      'objects',
+      createS3StorageDriver({ adapter }),
+    );
+
+    await expect(
+      client.uploadConditional('retry.txt', 'changed', {
+        condition: { etag: 'before', type: 'replace' },
+        retries: { backoff: () => 0, max: 1 },
+      }),
+    ).resolves.toMatchObject({ etag: 'after-retry', key: 'retry.txt' });
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries ConditionalRequestConflict during a direct multipart completion', async () => {
+    const backoff = vi.fn(() => 0);
+    const send = vi
+      .spyOn(S3Client.prototype, 'send')
+      .mockResolvedValueOnce({ UploadId: 'retry-upload' } as never)
+      .mockResolvedValueOnce({ ETag: '"part-1"' } as never)
+      .mockRejectedValueOnce(
+        Object.assign(new Error('transient multipart race'), {
+          $metadata: { httpStatusCode: 409 },
+          name: 'ConditionalRequestConflict',
+        }),
+      )
+      .mockResolvedValueOnce({ ETag: '"after-retry"' } as never);
+    const base = s3(adapter);
+    try {
+      const decorated = withS3Capabilities(base);
+      await expect(
+        decorated.uploadConditional!(
+          'retry-multipart.bin',
+          new Uint8Array([1, 2, 3]),
+          {
+            condition: { type: 'create' },
+            multipart: true,
+            retries: { backoff, max: 1 },
+          },
+        ),
+      ).resolves.toMatchObject({
+        etag: 'after-retry',
+        key: 'retry-multipart.bin',
+      });
+
+      expect(send.mock.calls.map(([command]) => command.constructor)).toEqual([
+        CreateMultipartUploadCommand,
+        UploadPartCommand,
+        CompleteMultipartUploadCommand,
+        CompleteMultipartUploadCommand,
+      ]);
+      expect(backoff).toHaveBeenCalledOnce();
+    } finally {
+      base.raw.destroy();
+      send.mockRestore();
+    }
+  });
+
+  it('maps cancellation during direct S3 retry backoff to ABORTED', async () => {
+    const send = vi
+      .spyOn(S3Client.prototype, 'send')
+      .mockRejectedValue(new Error('transient provider failure') as never);
+    const controller = new AbortController();
+    const base = s3(adapter);
+    try {
+      const decorated = withS3Capabilities(base);
+      const error = await rejectedStorageError(() =>
+        decorated.uploadConditional!('retry-abort.txt', 'body', {
+          condition: { type: 'create' },
+          retries: {
+            backoff: () => {
+              setTimeout(() => controller.abort('cancel retry'), 0);
+              return 10_000;
+            },
+            max: 1,
+          },
+          signal: controller.signal,
+        }),
+      );
+
+      expect(error).toMatchObject({
+        aborted: true,
+        code: StorageErrorCode.ABORTED,
+        timedOut: false,
+      });
+      expect(send).toHaveBeenCalledTimes(1);
+    } finally {
+      base.raw.destroy();
+      send.mockRestore();
+    }
+  });
+
+  it('maps timeout during direct S3 retry backoff to TIMEOUT', async () => {
+    const send = vi
+      .spyOn(S3Client.prototype, 'send')
+      .mockRejectedValue(new Error('transient provider failure') as never);
+    const base = s3(adapter);
+    try {
+      const decorated = withS3Capabilities(base);
+      const error = await rejectedStorageError(() =>
+        decorated.uploadConditional!('retry-timeout.txt', 'body', {
+          condition: { type: 'create' },
+          retries: { backoff: () => 10_000, max: 1 },
+          timeout: 20,
+        }),
+      );
+
+      expect(error).toMatchObject({
+        aborted: false,
+        code: StorageErrorCode.TIMEOUT,
+        timedOut: true,
+      });
+      expect(send).toHaveBeenCalledTimes(1);
+    } finally {
+      base.raw.destroy();
+      send.mockRestore();
+    }
+  });
+
   it('validates dependent profile capabilities', () => {
     expect(Object.isFrozen(AWS_S3_PROVIDER_PROFILE)).toBe(true);
     const conservativeUpload = defineS3ProviderProfile({
@@ -1242,6 +1757,54 @@ describe('createS3StorageDriver', () => {
         },
       }),
     ).toThrow(/enable at least one source-copy condition/u);
+    expect(() =>
+      defineS3ProviderProfile({
+        name: 'invalid-copy-dependency-flag',
+        physicalKey: { maxBytes: 1024 },
+        conditionalCopySource: {
+          etag: true,
+          requiresDestinationPredicate: 'yes',
+          version: false,
+        } as never,
+      }),
+    ).toThrow(
+      /conditionalCopySource\.requiresDestinationPredicate must be a boolean/u,
+    );
+    expect(() =>
+      defineS3ProviderProfile({
+        name: 'invalid-destination-dependency-flag',
+        physicalKey: { maxBytes: 1024 },
+        conditionalCopyDestination: {
+          atomicWithSource: false,
+          create: true,
+          replace: false,
+          requiresSourcePredicate: 'yes',
+        } as never,
+      }),
+    ).toThrow(
+      /conditionalCopyDestination\.requiresSourcePredicate must be a boolean/u,
+    );
+    const dependencyNarrowed = defineS3ProviderProfile({
+      name: 'dependency-narrowed-native-profile',
+      physicalKey: { maxBytes: 1024 },
+      conditionalCopyDestination: {
+        atomicWithSource: true,
+        create: true,
+        replace: false,
+        requiresSourcePredicate: true,
+      },
+      conditionalCopySource: {
+        etag: true,
+        requiresDestinationPredicate: true,
+        version: false,
+      },
+    });
+    expect(dependencyNarrowed.conditionalCopySource).toMatchObject({
+      requiresDestinationPredicate: true,
+    });
+    expect(dependencyNarrowed.conditionalCopyDestination).toMatchObject({
+      requiresSourcePredicate: true,
+    });
   });
 
   it('rejects reflected profile-brand forgeries for native and custom endpoints', () => {

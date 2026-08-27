@@ -14,6 +14,7 @@ export {
   type AiSdkWorkspacePageResult,
   type AiSdkWorkspaceTextFileResult,
   type AiSdkWorkspaceToolErrorCode,
+  type AiSdkWorkspaceToolErrorOptions,
   type AiSdkWorkspaceToolName,
   type CreateAiSdkWorkspaceToolsOptions,
 } from './ai-sdk-workspace-tools.js';

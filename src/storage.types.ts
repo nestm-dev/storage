@@ -226,6 +226,8 @@ export interface StorageConditionalCopySourceCapability {
   etag: boolean;
   /** Copy can select an immutable source version. */
   version: boolean;
+  /** A source predicate can only be used together with a destination predicate. */
+  requiresDestinationPredicate?: boolean;
 }
 
 export interface StorageConditionalCopyDestinationCapability {
@@ -233,6 +235,8 @@ export interface StorageConditionalCopyDestinationCapability {
   create: boolean;
   /** Copy can require that the destination matches an opaque provider ETag. */
   replace: boolean;
+  /** A destination predicate can only be used together with a source predicate. */
+  requiresSourcePredicate?: boolean;
   /** Source and destination predicates share one provider linearization point. */
   atomicWithSource: boolean;
 }

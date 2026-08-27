@@ -84,6 +84,13 @@ export interface CreateAiSdkWorkspaceToolsOptions<
 
 export type AiSdkWorkspaceToolErrorCode = StorageErrorCodeValue;
 
+export interface AiSdkWorkspaceToolErrorOptions {
+  /** True when the failed operation may already have committed. */
+  readonly applied?: boolean;
+  /** Canonical ETag of the committed object, when the provider returned one. */
+  readonly appliedEtag?: string;
+}
+
 const SAFE_ERROR_MESSAGES: Readonly<
   Record<AiSdkWorkspaceToolErrorCode, string>
 > = {
@@ -106,15 +113,31 @@ const SAFE_ERROR_MESSAGES: Readonly<
 
 /**
  * Safe error exposed at the AI tool boundary. It deliberately carries no
- * provider error, storage key, mount prefix, store name, or cause.
+ * provider error, storage key, mount prefix, store name, or cause. Applied
+ * reconciliation metadata is retained so callers do not blindly retry a
+ * mutation that may already have committed.
  */
 export class AiSdkWorkspaceToolError extends Error {
   readonly code: AiSdkWorkspaceToolErrorCode;
+  declare readonly applied?: true;
+  declare readonly appliedEtag?: string;
 
-  constructor(code: AiSdkWorkspaceToolErrorCode) {
+  constructor(
+    code: AiSdkWorkspaceToolErrorCode,
+    options: AiSdkWorkspaceToolErrorOptions = {},
+  ) {
     super(SAFE_ERROR_MESSAGES[code]);
     this.name = 'AiSdkWorkspaceToolError';
     this.code = code;
+    if (options.applied === true) {
+      this.applied = true;
+      if (
+        options.appliedEtag !== undefined &&
+        isCanonicalStorageEtag(options.appliedEtag)
+      ) {
+        this.appliedEtag = options.appliedEtag;
+      }
+    }
   }
 }
 
@@ -286,14 +309,26 @@ function sanitizeToolError(
   if (error instanceof AiSdkWorkspaceToolError) {
     return error;
   }
+  const reconciliation =
+    isStorageWorkspaceError(error) || isStorageError(error)
+      ? {
+          applied: error.applied,
+          ...(error.appliedEtag !== undefined && {
+            appliedEtag: error.appliedEtag,
+          }),
+        }
+      : {};
   if (signal?.aborted === true) {
-    return new AiSdkWorkspaceToolError(StorageErrorCode.ABORTED);
+    return new AiSdkWorkspaceToolError(
+      StorageErrorCode.ABORTED,
+      reconciliation,
+    );
   }
   if (isStorageWorkspaceError(error)) {
-    return new AiSdkWorkspaceToolError(error.code);
+    return new AiSdkWorkspaceToolError(error.code, reconciliation);
   }
   if (isStorageError(error)) {
-    return new AiSdkWorkspaceToolError(error.code);
+    return new AiSdkWorkspaceToolError(error.code, reconciliation);
   }
   return new AiSdkWorkspaceToolError(StorageErrorCode.PROVIDER);
 }
@@ -326,6 +361,7 @@ async function executeCreateAware<
     if (
       input.mode === 'create' &&
       safeError.code === StorageErrorCode.CONFLICT &&
+      safeError.applied !== true &&
       mapCreateConflict !== undefined
     ) {
       try {

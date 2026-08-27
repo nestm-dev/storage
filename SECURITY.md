@@ -93,11 +93,17 @@ additional workflow controls, not the authorization boundary.
 
 Conditional mutations can still have an ambiguous outcome when a remote
 provider commits and then loses or violates its response, or when a configured
-post-operation plugin fails after the driver has committed. The API fails
-closed in that case: inspect the logical destination and reconcile it before
-retrying. Create-only and ETag preconditions prevent a blind retry from
-silently overwriting a different object, but they cannot make a multi-object
-move transactionally atomic.
+post-operation plugin fails after the driver has committed. Known post-commit
+failures report `StorageError.applied === true`; a conditional upload also
+carries `appliedEtag` when its committed generation is known. This is positive
+evidence, not a complete remote-commit oracle: a timeout, connection loss, or
+exhausted retry can lose a provider success response and still leave
+`applied === false`. Do not reissue an ambiguous predicate blindly. Reconcile
+the logical destination first, using an exact ETag read when `appliedEtag` is
+available and inspecting the relevant source/destination state for copy or
+delete. Create-only and ETag preconditions prevent a blind retry from silently
+overwriting a different object, but they cannot make a multi-object move
+transactionally atomic.
 
 This guarantee covers calls made through `StorageWorkspace`. It does not
 confine arbitrary `node:fs`, shell, subprocess, or native-code access in the
@@ -106,12 +112,15 @@ inside an OS sandbox (container, VM, or equivalent) that exposes only a
 materialized workspace. Setting `cwd` to a workspace directory is not
 isolation.
 
-For local filesystem storage, use a dedicated service-owned root and do not let
-another untrusted process mutate its directory tree concurrently. High-level
-Node filesystem checks reject symlinks and hard-linked object files in existing
-workspace read and mutation paths, including metadata sidecars, but cannot
-provide a race-proof boundary against an actor that can replace path components
-between validation and use. For that threat model, mount only the workspace
-into a separate UID/container/VM and synchronize approved results back through
-storage. The local adapter also commits the body and metadata sidecar as two
-files; a process crash between their atomic renames can require reconciliation.
+For local filesystem storage, use a dedicated service-owned root and route all
+in-process mutations through the package-decorated adapter; its ordinary and
+conditional mutation paths share one lock domain. A separate process,
+unwrapped adapter, or direct filesystem writer can bypass that coordination and
+must not mutate the tree concurrently. High-level Node filesystem checks reject
+symlinks and hard-linked object files in existing workspace read and mutation
+paths, including metadata sidecars, but cannot provide a race-proof boundary
+against an actor that can replace path components between validation and use.
+For that threat model, mount only the workspace into a separate
+UID/container/VM and synchronize approved results back through storage. The
+local adapter also commits the body and metadata sidecar as two files; a process
+crash between their atomic renames can require reconciliation.

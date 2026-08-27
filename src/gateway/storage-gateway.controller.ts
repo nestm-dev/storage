@@ -26,7 +26,7 @@ import {
   StorageErrorCode,
   isStorageError,
 } from '../storage.error.js';
-import { storageEtagHeader } from '../storage-etag.js';
+import { isCanonicalStorageEtag, storageEtagHeader } from '../storage-etag.js';
 import { StorageService } from '../storage.service.js';
 import type {
   StorageByteRange,
@@ -405,6 +405,12 @@ function toHttpException(error: unknown): HttpException {
         error: {
           code: error.code,
           message: publicStorageMessages[error.code],
+          ...(error.applied === true && { applied: true }),
+          ...(error.applied === true &&
+            error.appliedEtag !== undefined &&
+            isCanonicalStorageEtag(error.appliedEtag) && {
+              appliedEtag: error.appliedEtag,
+            }),
         },
       },
       storageHttpStatus(error),

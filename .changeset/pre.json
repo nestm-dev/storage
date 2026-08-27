@@ -1,22 +1,4 @@
 {
   "mode": "pre",
-  "tag": "alpha",
-  "initialVersions": {
-    "@nestm/storage": "0.1.0-alpha.0"
-  },
-  "changesets": [
-    "add-agent-workspaces",
-    "add-artifact-storage",
-    "add-workspace-last-write-wins",
-    "compose-workspace-tool-conflicts",
-    "fail-closed-conditional-files-policy",
-    "fix-workspace-cursor-continuity",
-    "framework-neutral-core",
-    "harden-storage-boundaries",
-    "initial-storage-release",
-    "map-foreign-files-not-found",
-    "restore-generic-storage-boundary",
-    "runtime-provider-selection",
-    "split-s3-conditional-capabilities"
-  ]
+  "tag": "alpha"
 }

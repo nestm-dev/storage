@@ -24,6 +24,7 @@ import {
 } from '../src/gateway/index.js';
 import { StorageModule } from '../src/storage.module.js';
 import type { StorageDriver } from '../src/storage.driver.js';
+import { StorageError, StorageErrorCode } from '../src/storage.error.js';
 import {
   CLOUDFLARE_R2_PROVIDER_PROFILE,
   createS3StorageDriver,
@@ -308,6 +309,37 @@ describe.each<AdapterName>(['express', 'fastify'])(
         code: 'NOT_FOUND',
         message: 'Storage object was not found.',
       });
+    });
+
+    it('returns bounded reconciliation metadata for applied failures', async () => {
+      const driver = createMemoryStorageDriver();
+      driver.upload = async () => {
+        throw new StorageError('private post-commit provider detail', {
+          applied: true,
+          appliedEtag: 'committed-etag',
+          code: StorageErrorCode.PROVIDER,
+        });
+      };
+      const appliedApp = await createApp(adapterName, 1024, { driver });
+
+      try {
+        const response = await request(appliedApp.getHttpServer())
+          .put('/storage/object')
+          .query({ key: 'applied.txt' })
+          .set('content-type', 'application/octet-stream')
+          .send(Buffer.from('committed body'))
+          .expect(502);
+
+        expect(response.body.error).toEqual({
+          applied: true,
+          appliedEtag: 'committed-etag',
+          code: StorageErrorCode.PROVIDER,
+          message: 'Storage provider operation failed.',
+        });
+        expect(response.text).not.toContain('private post-commit');
+      } finally {
+        await appliedApp.close();
+      }
     });
 
     it('quotes canonical provider ETags once and rejects malformed output', async () => {

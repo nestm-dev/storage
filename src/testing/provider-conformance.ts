@@ -689,18 +689,23 @@ function conditionalReadVersionCase(
 function conditionalCopySourceEtagCase(
   options: StorageProviderConformanceOptions,
 ): StorageProviderConformanceCase {
-  const supported = options.expected.conditionalCopySource?.etag === true;
+  const source = options.expected.conditionalCopySource;
+  const supported = source?.etag === true;
+  const supportedAlone =
+    supported && source.requiresDestinationPredicate !== true;
   return providerCase(
     options,
-    supported
+    supportedAlone
       ? 'copies only the requested source ETag'
-      : 'fails closed when source-ETag copy is unsupported',
+      : supported
+        ? 'fails closed when source-ETag copy requires a destination predicate'
+        : 'fails closed when source-ETag copy is unsupported',
     async (context) => {
       const source = context.key('copy-source-etag.txt');
       const destination = context.key('copy-source-etag-result.txt');
       const original = await seed(context, source, 'source-one');
       const etag = await resultEtag(context.client, source, original);
-      if (!supported) {
+      if (!supportedAlone) {
         await expectStorageError(
           () =>
             context.client.promote(source, destination, { sourceEtag: etag }),
@@ -731,17 +736,22 @@ function conditionalCopySourceEtagCase(
 function conditionalCopySourceVersionCase(
   options: StorageProviderConformanceOptions,
 ): StorageProviderConformanceCase {
-  const supported = options.expected.conditionalCopySource?.version === true;
+  const source = options.expected.conditionalCopySource;
+  const supported = source?.version === true;
+  const supportedAlone =
+    supported && source.requiresDestinationPredicate !== true;
   return providerCase(
     options,
-    supported
+    supportedAlone
       ? 'copies an immutable source version'
-      : 'fails closed when source-version copy is unsupported',
+      : supported
+        ? 'fails closed when source-version copy requires a destination predicate'
+        : 'fails closed when source-version copy is unsupported',
     async (context) => {
       const source = context.key('copy-source-version.txt');
       const destination = context.key('copy-source-version-result.txt');
       await seed(context, source, 'source-version-one');
-      if (!supported) {
+      if (!supportedAlone) {
         await expectStorageError(
           () =>
             context.client.promote(source, destination, {
@@ -770,18 +780,22 @@ function conditionalCopySourceVersionCase(
 function conditionalCopyDestinationCreateCase(
   options: StorageProviderConformanceOptions,
 ): StorageProviderConformanceCase {
-  const supported =
-    options.expected.conditionalCopyDestination?.create === true;
+  const destinationCapability = options.expected.conditionalCopyDestination;
+  const supported = destinationCapability?.create === true;
+  const supportedAlone =
+    supported && destinationCapability.requiresSourcePredicate !== true;
   return providerCase(
     options,
-    supported
+    supportedAlone
       ? 'enforces create-only copy at the destination'
-      : 'fails closed when create-only destination copy is unsupported',
+      : supported
+        ? 'fails closed when create-only destination copy requires a source predicate'
+        : 'fails closed when create-only destination copy is unsupported',
     async (context) => {
       const source = context.key('copy-destination-create-source.txt');
       const destination = context.key('copy-destination-create-result.txt');
       await seed(context, source, 'copy-created');
-      if (!supported) {
+      if (!supportedAlone) {
         await expectStorageError(
           () =>
             context.client.promote(source, destination, {
@@ -813,20 +827,24 @@ function conditionalCopyDestinationCreateCase(
 function conditionalCopyDestinationReplaceCase(
   options: StorageProviderConformanceOptions,
 ): StorageProviderConformanceCase {
-  const supported =
-    options.expected.conditionalCopyDestination?.replace === true;
+  const destinationCapability = options.expected.conditionalCopyDestination;
+  const supported = destinationCapability?.replace === true;
+  const supportedAlone =
+    supported && destinationCapability.requiresSourcePredicate !== true;
   return providerCase(
     options,
-    supported
+    supportedAlone
       ? 'enforces ETag replacement at the copy destination'
-      : 'fails closed when destination replacement copy is unsupported',
+      : supported
+        ? 'fails closed when destination replacement copy requires a source predicate'
+        : 'fails closed when destination replacement copy is unsupported',
     async (context) => {
       const source = context.key('copy-destination-replace-source.txt');
       const destination = context.key('copy-destination-replace-result.txt');
       await seed(context, source, 'replacement');
       const original = await seed(context, destination, 'destination-old');
       const etag = await resultEtag(context.client, destination, original);
-      if (!supported) {
+      if (!supportedAlone) {
         await expectStorageError(
           () =>
             context.client.promote(source, destination, {

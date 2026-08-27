@@ -1,3 +1,5 @@
+import { isCanonicalStorageEtag } from './storage-etag.js';
+
 export const StorageErrorCode = {
   NOT_FOUND: 'NOT_FOUND',
   UNAUTHORIZED: 'UNAUTHORIZED',
@@ -28,6 +30,8 @@ export interface StorageErrorOptions {
   aborted?: boolean;
   timedOut?: boolean;
   permanent?: boolean;
+  applied?: boolean;
+  appliedEtag?: string;
   cause?: unknown;
 }
 
@@ -40,6 +44,8 @@ export class StorageError extends Error {
   readonly aborted: boolean;
   readonly timedOut: boolean;
   readonly permanent: boolean;
+  readonly applied: boolean;
+  readonly appliedEtag?: string;
   override readonly cause?: unknown;
 
   constructor(message: string, options: StorageErrorOptions) {
@@ -58,6 +64,14 @@ export class StorageError extends Error {
     this.aborted = options.aborted === true;
     this.timedOut = options.timedOut === true;
     this.permanent = options.permanent === true;
+    this.applied = options.applied === true;
+    if (
+      this.applied &&
+      options.appliedEtag !== undefined &&
+      isCanonicalStorageEtag(options.appliedEtag)
+    ) {
+      this.appliedEtag = options.appliedEtag;
+    }
     this.cause = options.cause;
   }
 }
@@ -74,6 +88,8 @@ export function isStorageError(error: unknown): error is StorageError {
     const candidate = error as Error & {
       readonly [STORAGE_ERROR_BRAND]?: unknown;
       readonly aborted?: unknown;
+      readonly applied?: unknown;
+      readonly appliedEtag?: unknown;
       readonly code?: unknown;
       readonly key?: unknown;
       readonly operation?: unknown;
@@ -90,6 +106,11 @@ export function isStorageError(error: unknown): error is StorageError {
       typeof candidate.aborted === 'boolean' &&
       typeof candidate.timedOut === 'boolean' &&
       typeof candidate.permanent === 'boolean' &&
+      (candidate.applied === undefined ||
+        typeof candidate.applied === 'boolean') &&
+      (candidate.appliedEtag === undefined ||
+        (candidate.applied === true &&
+          isCanonicalStorageEtag(candidate.appliedEtag))) &&
       (candidate.store === undefined || typeof candidate.store === 'string') &&
       (candidate.operation === undefined ||
         typeof candidate.operation === 'string') &&
