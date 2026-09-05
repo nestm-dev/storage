@@ -375,6 +375,159 @@ materialize the workspace into a per-session container or VM, mount only that
 directory, run the harness there, and synchronize reviewed changes back through
 `StorageWorkspace`. A working directory alone is not a sandbox.
 
+## Durable file workflows and catalog tools
+
+`@nestm/storage` owns byte mechanics and the draft state machine. The host owns
+logical file heads, authorization, persistence and transaction atomicity. No
+database, NestJS, tenant model or runtime lease is required by these contracts.
+
+| Entry point                | Exports                                                                                                                                                                                     |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@nestm/storage/core`      | `StorageStagedContentStore`, `collectStorageBytes`, `storageBytesStream`, `readStorageTextWindow`, `searchStorageText`, `applyStorageTextEdit` and their types                              |
+| `@nestm/storage/workspace` | `StorageFileWorkflow`, draft/persistence/catalog contracts, `protectStorageFileWorkflowWorkspace`, `protectStorageFileWorkflowOperation`, `getStorageFileWorkflow`, `getStorageFileCatalog` |
+| `@nestm/storage/ai-sdk`    | `createAiSdkFileWorkflowTools`, `createAiSdkCatalogFileTools`, their options and tool-name constants; existing `createAiSdkWorkspaceTools` is unchanged                                     |
+| `@nestm/storage/bytes`     | Browser-safe `sha256StorageBytes`, `verifyStorageChunkReceipt`, `trimStorageUtf8Chunk`, `encodeStorageBase64`, `isStorageUtf8Blob`                                                          |
+
+```ts
+import { StorageStagedContentStore } from '@nestm/storage/core';
+import {
+  StorageFileWorkflow,
+  protectStorageFileWorkflowWorkspace,
+} from '@nestm/storage/workspace';
+import {
+  createAiSdkCatalogFileTools,
+  createAiSdkFileWorkflowTools,
+} from '@nestm/storage/ai-sdk';
+
+// These values are supplied by the host, never by the model.
+const content = new StorageStagedContentStore({
+  client,
+  key: (scope: HostScope, payloadId) => hostBodyKey(scope, payloadId),
+});
+const workflows = new StorageFileWorkflow({ content, persistence });
+const workspace = protectStorageFileWorkflowWorkspace({
+  workspace: hostCatalogWorkspace,
+  catalog: hostCatalog,
+  workflows: workflows.mount(trustedScope, {
+    permissions: ['read', 'write', 'commit'],
+    signal: executionSignal,
+  }),
+  signal: executionSignal,
+  authorize: ({ permission, signal }) =>
+    authorizeCurrentHostScope(trustedScope, permission, signal),
+});
+const tools = {
+  ...createAiSdkCatalogFileTools({
+    catalog: workspace.catalog!,
+    commandId: (toolCallId) => hostCommandId(toolCallId),
+  }),
+  ...createAiSdkFileWorkflowTools({
+    workflow: workspace.workflows,
+    idempotencyKey: (toolCallId) => hostCommandId(toolCallId),
+  }),
+};
+```
+
+The catalog delegate implements the existing `StorageWorkspace` against the
+host's logical catalog; do not pass a raw provider-prefix workspace alongside
+an unrelated file service. `StorageFileCatalogCapability` adds opaque file IDs,
+byte windows, literal content search and idempotent small write/edit commands.
+Its `commandId` is host-scoped, stable across retries, and compared against a
+canonical request fingerprint in host persistence. The host preserves its
+additional policy when a generic edit targets a specialized file.
+
+`createAiSdkCatalogFileEditSchemas(maxWriteBytes)` exposes typed append/edit
+Zod objects used by the generic factory itself. A host can `.extend()` these
+with an optional product-only metadata field while retaining the same UTF-8
+byte rules. Delegate ordinary input to the generic tool; dispatch specialized
+input through the same leased product capability and command identity. Do not
+cast an opaque tool schema or rebuild the generic schema locally.
+
+The protector retains the lease/caller signal and reauthorizes every call.
+Create-only base grants cannot replace or edit a catalog file. Workflow
+`restrict({ permissions, mutations, limits, signal })` intersects existing
+grants/ceilings and retains parent cancellation; it never changes scope. The
+protector restricts persisted draft mutations to the base create/replace grants,
+including resumed sealed drafts and replay, without requiring a public read
+grant to perform an otherwise authorized commit. Child mounts do
+not inherit broader catalog/workflow handles. Configure both delegates with the
+same scope and compatible limits; the host catalog must enforce scan budgets
+inside its implementation. Structured extensions on the returned workspace
+are supported: owning features can attach protected product closures while
+retaining the same `.catalog` and `.workflows` members. The structural getters
+are contract checks for trusted handles, not authentication of arbitrary objects.
+These static file operations acquire no lease themselves.
+
+### Host persistence transaction
+
+Implement `StorageFileWorkflowPersistence<Scope, Receipt>.transaction(scope,
+{ permission, signal }, work)`. On **every** call (including replay and body
+preparation reads), reauthorize that intent and serialize the scope's draft and
+idempotency records across replicas. `read` admits readers; `write` and `commit`
+must enforce the host's mutation authority. The callback receives detached
+records through `findDraftByKey`, `getDraft`, `saveDraft`, `listDrafts`,
+`listParts`, `putPart` and `commitHeads`.
+
+`commitHeads` receives sorted `{ draft, body }` changes. It must compare every
+create/expected-ETag predicate and change all logical heads **in the same host
+transaction** as the subsequent committed draft records and receipts. Return
+one non-null receipt per change in the supplied order. A rejection rolls back
+all callback effects. Serial object writes or independently committed database
+calls do not satisfy this port. The package does not claim to implement database
+atomicity. See the packed consumer fixture and filesystem e2e test for executable
+minimal hosts; production hosts need their own cross-replica transaction/locking
+implementation and rollback tests.
+
+Drafts transition `open → sealed → committed` or `open/sealed → cancelled`.
+Appends accept a bounded snapshot of bytes at the exact current byte offset.
+Identical offset/size/SHA-256 replay succeeds; changed bytes or gaps conflict.
+Text chunks must contain complete valid UTF-8. Public summaries and part receipts
+omit staged body IDs and provider keys. A commit seals all requested drafts,
+streams verified chunks into immutable bodies, then commits all heads and draft
+receipts in one host transaction. Failed preparation or stale heads leave sealed
+drafts retryable/cancellable. Mixed committed/uncommitted batches conflict;
+replaying an entirely committed batch returns its stored receipts after checking
+the requested size and optional digest. Cancellation cannot undo committed heads.
+
+Check the signal before durable transaction commit. After commit, return the
+receipt even if cancellation races the response. Do not automatically retry the
+transaction callback. A lost response requires replay/reconciliation, not an
+assumption of rollback. Provider writes happen before the metadata transaction;
+failures, losing concurrent preparations, cancellations and superseded files can
+leave unreferenced bodies. Retention eligibility, reference tracking and cleanup
+scheduling remain host-owned. `StorageStagedContentStore.remove` performs an
+ETag-conditional deletion only after the host proves eligibility; it is not a
+collector and is never called automatically by the workflow.
+
+### Byte and provider guarantees
+
+Staging requires native create-only writes that return an ETag and native exact
+ETag reads; byte ranges additionally require `rangeRead`. Missing primitives
+fail with `NOT_SUPPORTED`, without an existence-check/unconditional-write or
+full-download fallback. Files SDK remains the provider, streaming, range and
+conditional-policy engine. Its multipart upload controls remain distinct from
+the host-persisted draft protocol; it does not provide atomic catalog commits.
+The bundled filesystem and memory drivers and verified native S3 profiles
+support staging. Memory stores are process-local and volatile; their conditional
+comparison/publication is synchronous after asynchronous body consumption.
+Memory publications use canonical SHA-256 ETags. Direct raw-map mutation remains
+a trusted testing escape hatch, outside protected workspace authority.
+
+Windows count UTF-8 bytes, use inclusive provider range ends and preserve BOMs.
+Offsets splitting a character and malformed/truncated UTF-8 at EOF fail. Search
+budgets include the actual requested bytes; follow `nextOffset` even on an empty
+match page. `applyStorageTextEdit` works on an already buffered string, requires a
+result byte ceiling and rejects non-unique replacement targets; it is not a
+streaming document editor. Model text appends default to 8192 bytes per call,
+clamped to the capability. Mutation tools require approval by default; hosts may
+apply an existing approval policy explicitly.
+
+The browser bytes entrypoint imports no Node, provider, NestJS or AI modules.
+`verifyStorageChunkReceipt(blob, receipt, { offset, maxBytes, signal })` verifies
+ordering, bounds and the actual local SHA-256 before returning the next offset.
+Filename/size/mtime are insufficient proof of resumed content identity. Filename
+classification, browser session storage and HTTP transport remain host policy.
+
 ## Configure named stores
 
 Use the package-owned S3 factory when applicable. For other providers, create a

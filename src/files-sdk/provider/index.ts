@@ -125,6 +125,12 @@ async function resolveAdapter(
     throw mapFilesSdkError(error);
   }
   const { adapter } = resolved.files;
+  if (provider === 'memory') {
+    const { withMemoryConditionalOperations } = await import('../memory.js');
+    return withMemoryConditionalOperations(
+      adapter as Parameters<typeof withMemoryConditionalOperations>[0],
+    );
+  }
   if (provider === 'fs') {
     const { withFsConditionalMutation } = await import('../fs/index.js');
     return withFsConditionalMutation(

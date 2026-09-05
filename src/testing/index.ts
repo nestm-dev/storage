@@ -1,4 +1,5 @@
 import type { StorageDriver } from '../storage.driver.js';
+import { withMemoryConditionalOperations } from '../files-sdk/memory.js';
 import {
   createFilesSdkDriver,
   type FilesSdkDriverOptions,
@@ -22,7 +23,7 @@ export function createMemoryStorageDriver(
   const { adapter, ...filesOptions } = options;
   return createFilesSdkDriver({
     ...filesOptions,
-    adapter: memory(adapter),
+    adapter: withMemoryConditionalOperations(memory(adapter)),
   });
 }
 

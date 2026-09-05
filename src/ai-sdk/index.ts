@@ -18,3 +18,12 @@ export {
   type AiSdkWorkspaceToolName,
   type CreateAiSdkWorkspaceToolsOptions,
 } from './ai-sdk-workspace-tools.js';
+export {
+  createAiSdkFileWorkflowTools,
+  createAiSdkCatalogFileTools,
+  createAiSdkCatalogFileEditSchemas,
+  AI_SDK_FILE_WORKFLOW_TOOL_NAMES,
+  AI_SDK_CATALOG_FILE_TOOL_NAMES,
+  type CreateAiSdkFileWorkflowToolsOptions,
+  type CreateAiSdkCatalogFileToolsOptions,
+} from './ai-sdk-file-workflow-tools.js';

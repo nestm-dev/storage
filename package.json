@@ -15,6 +15,10 @@
     "SECURITY.md"
   ],
   "exports": {
+    "./bytes": {
+      "types": "./dist/bytes/index.d.ts",
+      "import": "./dist/bytes/index.js"
+    },
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
