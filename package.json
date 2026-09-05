@@ -171,7 +171,7 @@
     "@types/node": "26.4.0",
     "@types/supertest": "7.2.1",
     "@vitest/coverage-v8": "4.1.11",
-    "ai": "7.0.83",
+    "ai": "7.0.88",
     "fastify": "5.12.1",
     "oxlint": "1.80.0",
     "prettier": "3.9.6",
