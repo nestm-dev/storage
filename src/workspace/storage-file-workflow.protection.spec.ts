@@ -14,10 +14,11 @@ import {
 } from './storage-file-workflow.protection.js';
 import {
   createAiSdkCatalogFileTools,
+  createAiSdkCatalogFileEditSchemas,
   createAiSdkFileWorkflowTools,
 } from '../ai-sdk/ai-sdk-file-workflow-tools.js';
 import type { ToolSet } from 'ai';
-import type { z } from 'zod';
+import { z } from 'zod';
 
 function setup(
   permissions: StorageWorkspacePermission[] = [
@@ -124,6 +125,36 @@ const context = {
 };
 
 describe('protected catalog and AI adapters', () => {
+  it('allows typed product metadata extensions while retaining generic UTF-8 limits', () => {
+    const schemas = createAiSdkCatalogFileEditSchemas(4);
+    const extended = schemas.edit.extend({
+      manifest: z.strictObject({ enabled: z.boolean() }).optional(),
+    });
+    expect(
+      extended.safeParse({
+        path: 'file',
+        expectedEtag: 'etag',
+        oldText: 'a',
+        newText: '😀',
+        manifest: { enabled: true },
+      }).success,
+    ).toBe(true);
+    expect(
+      extended.safeParse({
+        path: 'file',
+        expectedEtag: 'etag',
+        oldText: 'a',
+        newText: '😀a',
+      }).success,
+    ).toBe(false);
+    expect(
+      schemas.append.safeParse({
+        path: 'file',
+        expectedEtag: 'etag',
+        content: '\ud800',
+      }).success,
+    ).toBe(false);
+  });
   it('checks persisted draft intent under narrower grants without requiring read permission', async () => {
     const client = new StorageClient('narrow', createMemoryStorageDriver());
     const content = new StorageStagedContentStore({

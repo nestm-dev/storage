@@ -77,6 +77,20 @@ async function safe<Result>(work: () => Promise<Result>): Promise<Result> {
   }
 }
 
+/** Typed extension seam for host-only metadata; preserves generic byte validation. */
+export function createAiSdkCatalogFileEditSchemas(maxWriteBytes = 8192) {
+  const content = textSchema(maxWriteBytes);
+  return {
+    append: z.strictObject({ path, expectedEtag: etag, content }),
+    edit: z.strictObject({
+      path,
+      expectedEtag: etag,
+      oldText: content.refine((text) => text.length > 0),
+      newText: content,
+    }),
+  };
+}
+
 /** Generic durable-file tools. Provider upload controls are a separate capability. */
 export function createAiSdkFileWorkflowTools<Receipt>(
   options: CreateAiSdkFileWorkflowToolsOptions<Receipt>,
@@ -200,6 +214,9 @@ export function createAiSdkCatalogFileTools<Receipt>(
   const content = textSchema(
     Math.min(options.maxWriteBytes ?? 8192, catalog.limits.maxWriteBytes),
   );
+  const editSchemas = createAiSdkCatalogFileEditSchemas(
+    Math.min(options.maxWriteBytes ?? 8192, catalog.limits.maxWriteBytes),
+  );
   const approval = options.requireApproval ?? true;
   const commandId = options.commandId ?? ((toolCallId: string) => toolCallId);
   if (catalog.allows('read'))
@@ -285,7 +302,7 @@ export function createAiSdkCatalogFileTools<Receipt>(
         needsApproval: approval,
         description:
           'Append a bounded UTF-8 chunk to one exact file revision. Pass the latest ETag; retry identity prevents duplicate appends. Durable drafts support large generation.',
-        inputSchema: z.strictObject({ path, expectedEtag: etag, content }),
+        inputSchema: editSchemas.append,
         execute: (input, context) =>
           safe<unknown>(() =>
             catalog.edit({
@@ -301,12 +318,7 @@ export function createAiSdkCatalogFileTools<Receipt>(
         needsApproval: approval,
         description:
           'Replace one exact unique text span at the latest expectedEtag. oldText must match exactly once. The result carries the next revision receipt.',
-        inputSchema: z.strictObject({
-          path,
-          expectedEtag: etag,
-          oldText: content.refine((text) => text.length > 0),
-          newText: content,
-        }),
+        inputSchema: editSchemas.edit,
         execute: (input, context) =>
           safe<unknown>(() =>
             catalog.edit({

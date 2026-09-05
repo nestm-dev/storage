@@ -436,6 +436,13 @@ Its `commandId` is host-scoped, stable across retries, and compared against a
 canonical request fingerprint in host persistence. The host preserves its
 additional policy when a generic edit targets a specialized file.
 
+`createAiSdkCatalogFileEditSchemas(maxWriteBytes)` exposes typed append/edit
+Zod objects used by the generic factory itself. A host can `.extend()` these
+with an optional product-only metadata field while retaining the same UTF-8
+byte rules. Delegate ordinary input to the generic tool; dispatch specialized
+input through the same leased product capability and command identity. Do not
+cast an opaque tool schema or rebuild the generic schema locally.
+
 The protector retains the lease/caller signal and reauthorizes every call.
 Create-only base grants cannot replace or edit a catalog file. Workflow
 `restrict({ permissions, mutations, limits, signal })` intersects existing
