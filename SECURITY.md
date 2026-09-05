@@ -49,6 +49,33 @@ application's metadata transaction commits.
 
 ## Workspace security boundary
 
+Durable file workflows use opaque host scopes and explicit persistence ports.
+The host must reauthorize `transaction`'s `permission` on every call, including
+idempotent replay, and serialize the scope's draft state across replicas. Head
+predicates, all head changes, and committed draft receipts must share one
+rollback-capable host transaction. Streamed object preparation is outside that
+transaction; the package does not make object-store writes multi-file atomic.
+Provider/network response loss can remain ambiguous. Reconcile by replaying the
+durable request; do not infer rollback from an abort or lost response.
+
+Construct protected catalog/workflow handles from the same trusted host scope,
+bind their execution signal, and keep storage clients and persistence ports
+private. The protector rechecks fresh authorization and composes caller aborts;
+the host transaction independently rechecks authority at commit.
+Workflow restrictions check each persisted draft's create/replace intent on
+mutation and replay; they cannot widen grants, limits or detach parent abort.
+The checks do not depend on a public draft-read permission. Product-only
+feature closures must capture these same checks when the handle is acquired.
+The structural catalog/workflow getters do not authenticate untrusted objects.
+
+Staged bodies use native create-only writes and exact ETag reads. Integrity
+receipts verify full draft chunks during assembly. Conditional body removal is
+available only as a host-invoked primitive: references, eligibility and cleanup
+races are host-owned. Never delete a body merely because a commit request failed
+or timed out; another in-flight or committed request may reference it. The
+memory adapter is volatile and its raw Map is a trusted escape hatch, not an
+authorization boundary.
+
 `StorageWorkspace` is a narrowing capability for storage operations. Construct
 it from trusted application context, keep the underlying `StorageClient` and
 mount prefix private, and pass only the workspace or its AI tool set to

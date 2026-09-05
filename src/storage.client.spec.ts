@@ -185,7 +185,15 @@ describe('StorageClient', () => {
   });
 
   it('fails conditional mutations closed unless the exact primitive is declared', () => {
-    const client = new StorageClient('media', createMemoryStorageDriver());
+    const driver = createMemoryStorageDriver();
+    Object.defineProperty(driver, 'capabilities', {
+      value: {
+        ...driver.capabilities,
+        conditionalCreate: undefined,
+        conditionalDelete: undefined,
+      },
+    });
+    const client = new StorageClient('media', driver);
 
     expect(() =>
       client.uploadConditional('new.txt', 'new', {

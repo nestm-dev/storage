@@ -47,6 +47,13 @@ try {
 
   mkdirSync(join(consumerRoot, 'src'), { recursive: true });
   writeFileSync(
+    join(consumerRoot, 'src/file-workflow-smoke.ts'),
+    readFileSync(
+      join(projectRoot, 'scripts/fixtures/file-workflow-consumer.ts'),
+      'utf8',
+    ),
+  );
+  writeFileSync(
     join(consumerRoot, 'package.json'),
     `${JSON.stringify(
       {
@@ -116,6 +123,7 @@ try {
 
   run('npm', ['exec', '--', 'tsc', '-p', '.'], consumerRoot);
   run(process.execPath, ['dist/smoke.js'], consumerRoot);
+  run(process.execPath, ['dist/file-workflow-smoke.js'], consumerRoot);
   run(process.execPath, ['s3-minimum-peer.mjs'], consumerRoot);
 } finally {
   rmSync(temporaryRoot, { force: true, recursive: true });

@@ -1265,6 +1265,14 @@ describe('StorageWorkspace', () => {
     const driver: StorageDriver = createMemoryStorageDriver({
       adapter: { initial: { 'scope/source.txt': 'body' } },
     });
+    Object.defineProperty(driver, 'capabilities', {
+      value: {
+        ...driver.capabilities,
+        conditionalCreate: undefined,
+        conditionalRead: undefined,
+        conditionalDelete: undefined,
+      },
+    });
     const download = vi.spyOn(driver, 'download');
     const workspace = mountStorageWorkspace(
       new StorageClient('unsupported', driver),
