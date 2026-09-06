@@ -42,6 +42,9 @@ importers:
       '@nestjs/testing':
         specifier: 12.0.1
         version: 12.0.1(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(@nestjs/core@12.0.1)(@nestjs/platform-express@12.0.1)
+      '@nestm/crypto':
+        specifier: 0.1.0-alpha.9
+        version: 0.1.0-alpha.9(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(@nestjs/core@12.0.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)
       '@types/node':
         specifier: 26.4.0
         version: 26.4.0
@@ -425,6 +428,42 @@ packages:
       '@nestjs/microservices':
         optional: true
       '@nestjs/platform-express':
+        optional: true
+
+  '@nestm/crypto@0.1.0-alpha.9':
+    resolution: {integrity: sha512-Zb5YJlhtXqPkHgXEnWXnQikJjz/MUxR1AL97DzdS8U/33fItvL3REa7YfcXgvl/hbAeOmHC6aZ9xiZ/JKZd13Q==}
+    engines: {node: '>=22.13.0'}
+    peerDependencies:
+      '@aws-sdk/client-kms': '>=3.700.0 <4'
+      '@azure/core-auth': '>=1.11.0 <2'
+      '@azure/keyvault-keys': '>=4.10.2 <5'
+      '@google-cloud/kms': '>=5.7.0 <7'
+      '@nestjs/common': ^12.0.0
+      '@nestjs/core': ^12.0.0
+      '@nestm/tenant': '>=0.1.0-alpha.3 <0.2.0'
+      class-transformer: '>=0.5.1 <1'
+      reflect-metadata: ^0.2.2
+      rxjs: ^7.8.0
+    peerDependenciesMeta:
+      '@aws-sdk/client-kms':
+        optional: true
+      '@azure/core-auth':
+        optional: true
+      '@azure/keyvault-keys':
+        optional: true
+      '@google-cloud/kms':
+        optional: true
+      '@nestjs/common':
+        optional: true
+      '@nestjs/core':
+        optional: true
+      '@nestm/tenant':
+        optional: true
+      class-transformer:
+        optional: true
+      reflect-metadata:
+        optional: true
+      rxjs:
         optional: true
 
   '@noble/hashes@1.8.0':
@@ -2627,6 +2666,13 @@ snapshots:
       tslib: 2.8.1
     optionalDependencies:
       '@nestjs/platform-express': 12.0.1(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(@nestjs/core@12.0.1)(supports-color@7.2.0)
+
+  '@nestm/crypto@0.1.0-alpha.9(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(@nestjs/core@12.0.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)':
+    optionalDependencies:
+      '@nestjs/common': 12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0)
+      '@nestjs/core': 12.0.1(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(@nestjs/platform-express@12.0.1)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      reflect-metadata: 0.2.2
+      rxjs: 7.8.2
 
   '@noble/hashes@1.8.0': {}
 

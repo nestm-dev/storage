@@ -59,7 +59,11 @@
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./crypto": {
+      "types": "./dist/crypto/index.d.ts",
+      "import": "./dist/crypto/index.js"
+    }
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -123,7 +127,8 @@
     "ai": ">=7.0.0 <8.0.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
-    "zod": "^4.1.8"
+    "zod": "^4.1.8",
+    "@nestm/crypto": "0.1.0-alpha.9"
   },
   "peerDependenciesMeta": {
     "@aws-sdk/client-s3": {
@@ -155,6 +160,9 @@
     },
     "zod": {
       "optional": true
+    },
+    "@nestm/crypto": {
+      "optional": true
     }
   },
   "devDependencies": {
@@ -181,6 +189,7 @@
     "supertest": "7.2.2",
     "typescript": "7.0.2",
     "vitest": "4.1.11",
-    "zod": "4.4.3"
+    "zod": "4.4.3",
+    "@nestm/crypto": "0.1.0-alpha.9"
   }
 }

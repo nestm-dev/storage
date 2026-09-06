@@ -121,10 +121,34 @@ try {
     throw new Error('The core-only consumer unexpectedly installed NestJS.');
   }
 
+  if (existsSync(join(consumerRoot, 'node_modules', '@nestm', 'crypto'))) {
+    throw new Error('The core-only consumer unexpectedly installed Crypto.');
+  }
+
   run('npm', ['exec', '--', 'tsc', '-p', '.'], consumerRoot);
   run(process.execPath, ['dist/smoke.js'], consumerRoot);
   run(process.execPath, ['dist/file-workflow-smoke.js'], consumerRoot);
   run(process.execPath, ['s3-minimum-peer.mjs'], consumerRoot);
+  run(
+    'npm',
+    [
+      'install',
+      '--ignore-scripts',
+      '--no-audit',
+      '--no-fund',
+      `@nestm/crypto@${rootPackage.devDependencies['@nestm/crypto']}`,
+    ],
+    consumerRoot,
+  );
+  writeFileSync(
+    join(consumerRoot, 'src/encrypted-content-smoke.ts'),
+    readFileSync(
+      join(projectRoot, 'scripts/fixtures/encrypted-content-consumer.ts'),
+      'utf8',
+    ),
+  );
+  run('npm', ['exec', '--', 'tsc', '-p', '.'], consumerRoot);
+  run(process.execPath, ['dist/encrypted-content-smoke.js'], consumerRoot);
 } finally {
   rmSync(temporaryRoot, { force: true, recursive: true });
 }

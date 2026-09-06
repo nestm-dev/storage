@@ -1236,3 +1236,11 @@ or direct filesystem calls.
 ## License
 
 MIT
+
+## Encrypted staged content
+
+`@nestm/storage/crypto` exports `StorageEncryptedContentStore<Scope>`. Install the optional `@nestm/crypto` peer only for this entry point. The store uses a host-owned `FileCipherEngine`, object-address function, fresh AAD buffers, allowed key providers, and metadata callbacks. It prepares detached encryption metadata before uploading and completes metadata only after plaintext and ciphertext accounting agree. Reads pin physical ETags and authenticate full content or bounded frame ranges.
+
+The host authorizes reads, serializes metadata, enforces key policy and atomically proves reference eligibility before `metadata.discard` removes anything. A missing upload receipt means completion is uncertain: keep prepared cleanup inventory for a later sweep. A rejected prepare does not authorize cleanup of another writer's reservation. Engine shutdown stays with its owner. See [the standalone archive consumer](scripts/fixtures/encrypted-content-consumer.ts).
+
+`StorageStagedContentStore.writeReserved(scope, payloadId, stream, options)` accepts a fresh UUID from a trusted caller. It retains create-only semantics and returns that exact identity in the receipt; it never overwrites an existing payload. Ordinary writers continue to use `write`.

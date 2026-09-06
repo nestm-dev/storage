@@ -51,6 +51,16 @@ export class StorageStagedContentStore<
     body: ReadableStream<Uint8Array>,
     options: StorageStagedWriteOptions = {},
   ): Promise<StorageStagedBody> {
+    return this.writeReserved(scope, randomUUID(), body, options);
+  }
+  /** Trusted callers reserve a fresh identity before preparing detached metadata. */
+  async writeReserved(
+    scope: Scope,
+    payloadId: string,
+    body: ReadableStream<Uint8Array>,
+    options: StorageStagedWriteOptions = {},
+  ): Promise<StorageStagedBody> {
+    validatePayloadId(payloadId);
     const { signal } = options;
     const maxBytes = options.maxBytes ?? Number.MAX_SAFE_INTEGER;
     storageInteger(maxBytes, 'maxBytes');
@@ -65,7 +75,6 @@ export class StorageStagedContentStore<
         { code: 'NOT_SUPPORTED' },
       );
     }
-    const payloadId = randomUUID();
     const hash = createHash('sha256');
     let size = 0;
     let completed = false;
@@ -150,14 +159,21 @@ export class StorageStagedContentStore<
   }
 }
 function validateBody(body: StorageStagedBody): void {
-  if (
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
-      body.payloadId,
-    ) ||
-    !/^[0-9a-f]{64}$/u.test(body.sha256)
-  )
+  validatePayloadId(body.payloadId);
+  if (!/^[0-9a-f]{64}$/u.test(body.sha256))
     throw new StorageError('Invalid staged body receipt.', {
       code: 'INVALID_ARGUMENT',
     });
   storageInteger(body.size, 'size');
+}
+
+function validatePayloadId(payloadId: string): void {
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+      payloadId,
+    )
+  )
+    throw new StorageError('Invalid staged payload identity.', {
+      code: 'INVALID_ARGUMENT',
+    });
 }
