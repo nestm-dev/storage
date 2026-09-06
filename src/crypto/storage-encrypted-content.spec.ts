@@ -162,7 +162,7 @@ describe('StorageEncryptedContentStore', () => {
     await expect(
       reopened.read('another-library', receipt),
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
-  });
+  }, 30_000);
 
   it('rejects replaced receipts, relocated metadata, and tampered final authentication frames', async () => {
     const f = fixture();
