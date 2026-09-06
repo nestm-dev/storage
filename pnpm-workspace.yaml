@@ -28,3 +28,4 @@ minimumReleaseAgeExclude:
   - '@aws-sdk/s3-request-presigner@3.1120.0'
   - '@types/node@26.4.0'
   - ai@7.0.83
+  - '@nestm/crypto@0.1.0-alpha.9'
