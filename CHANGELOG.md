@@ -1,5 +1,15 @@
 # @nestm/storage
 
+## 0.1.0-alpha.13
+
+### Minor Changes
+
+- 211e8c4: Add native Azure Blob create-only uploads, ETag-conditional replacement and deletion,
+  and exact ETag reads with ranges through the Files SDK conditional pipeline. Expose
+  `createAzureStorageDriver` and decorate the named Azure provider with the same
+  primitives, allowing staged encrypted content to run on Azure without application
+  provider code.
+
 ## 0.1.0-alpha.12
 
 ### Patch Changes
