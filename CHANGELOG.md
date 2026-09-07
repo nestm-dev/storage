@@ -1,5 +1,11 @@
 # @nestm/storage
 
+## 0.1.0-alpha.14
+
+### Patch Changes
+
+- 79609f1: Use conditional multipart completion for staged content streams when the provider supports create-only completion. This enables encrypted file writes on AWS S3 without buffering the entire content or weakening immutable creation and exact ETag reads.
+
 ## 0.1.0-alpha.13
 
 ### Minor Changes
