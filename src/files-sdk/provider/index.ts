@@ -125,6 +125,13 @@ async function resolveAdapter(
     throw mapFilesSdkError(error);
   }
   const { adapter } = resolved.files;
+  if (provider === 'azure') {
+    const { withAzureConditionalOperations } =
+      await import('../azure/azure-conditional.js');
+    return withAzureConditionalOperations(
+      adapter as Parameters<typeof withAzureConditionalOperations>[0],
+    );
+  }
   if (provider === 'memory') {
     const { withMemoryConditionalOperations } = await import('../memory.js');
     return withMemoryConditionalOperations(
