@@ -124,6 +124,9 @@ try {
   if (existsSync(join(consumerRoot, 'node_modules', '@nestm', 'crypto'))) {
     throw new Error('The core-only consumer unexpectedly installed Crypto.');
   }
+  if (existsSync(join(consumerRoot, 'node_modules', '@azure'))) {
+    throw new Error('The core-only consumer unexpectedly installed Azure.');
+  }
 
   run('npm', ['exec', '--', 'tsc', '-p', '.'], consumerRoot);
   run(process.execPath, ['dist/smoke.js'], consumerRoot);
@@ -149,6 +152,29 @@ try {
   );
   run('npm', ['exec', '--', 'tsc', '-p', '.'], consumerRoot);
   run(process.execPath, ['dist/encrypted-content-smoke.js'], consumerRoot);
+  run(
+    'npm',
+    [
+      'install',
+      '--ignore-scripts',
+      '--no-audit',
+      '--no-fund',
+      ...['@azure/storage-blob', '@azure/core-auth'].map(
+        (name) =>
+          `${name}@${caretMinimum(rootPackage.peerDependencies[name], name)}`,
+      ),
+    ],
+    consumerRoot,
+  );
+  writeFileSync(
+    join(consumerRoot, 'src/azure-smoke.ts'),
+    readFileSync(
+      join(projectRoot, 'scripts/fixtures/azure-consumer.ts'),
+      'utf8',
+    ),
+  );
+  run('npm', ['exec', '--', 'tsc', '-p', '.'], consumerRoot);
+  run(process.execPath, ['dist/azure-smoke.js'], consumerRoot);
 } finally {
   rmSync(temporaryRoot, { force: true, recursive: true });
 }

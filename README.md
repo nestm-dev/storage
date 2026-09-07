@@ -528,6 +528,54 @@ ordering, bounds and the actual local SHA-256 before returning the next offset.
 Filename/size/mtime are insufficient proof of resumed content identity. Filename
 classification, browser session storage and HTTP transport remain host policy.
 
+### Azure Blob staged content
+
+Use the Azure entrypoint for native create-only uploads, ETag-conditional
+replacement/deletion, and exact ETag reads, including byte ranges. These operations
+run through the Files SDK conditional pipeline, so hooks, retries, prefix policy,
+readonly checks, and sanitized errors apply to them. The named `azure` provider
+also receives these primitives.
+
+```ts
+import { DefaultAzureCredential } from '@azure/identity';
+import { createAzureStorageDriver } from '@nestm/storage/files-sdk/azure';
+
+const driver = createAzureStorageDriver({
+  adapter: {
+    accountName: 'workspacestorage',
+    container: 'private-content',
+    credential: new DefaultAzureCredential(),
+    useUserDelegationSas: false,
+  },
+});
+```
+
+Install `@azure/storage-blob`, `@azure/core-auth`, and the credential provider used
+by the host. The Blob container must already exist. Grant the workload identity
+the required Blob data permissions; signed URLs are unnecessary for protected
+server-side content operations. Explicit token credentials cannot be combined
+with shared keys, SAS tokens, or connection strings, and cannot be overridden by
+ambient shared-key environment variables.
+
+Conditional uploads stream through bounded Azure SDK blocks and atomically apply
+their predicate when committing. They return the committed ETag and actual byte
+count without a separate metadata read. Failed uploads may leave uncommitted
+blocks for Azure's own expiration; they never fall back to unconditional writes.
+Exact reads verify the response ETag before exposing its body. The driver uses a
+conservative 1024-byte UTF-8 physical-key budget within Azure's name limit.
+Conditional server-side copy, version-ID predicates, and explicit conditional
+multipart completion are not advertised. Workspace safe copy/move can use the
+existing exact-read/create/delete workflow. The generic staged and encrypted
+content stores require no Azure-specific changes.
+
+Run `test/azure-content.e2e-spec.ts` with `STORAGE_AZURE_CONFORMANCE=true` and
+`STORAGE_AZURE_TEST_CONNECTION_STRING` against a dedicated account or Azurite.
+For live identity tests, supply `STORAGE_AZURE_TEST_ACCOUNT_NAME` instead; the
+suite uses `DefaultAzureCredential`. It creates and deletes its own uniquely
+named test container. The CI Azure job covers native predicates, competing
+writes, bounded streams, ranges, encrypted content, and the provider conformance
+suite on Azurite. Live Azure identity remains a separate deployment check.
+
 ## Configure named stores
 
 Use the package-owned S3 factory when applicable. For other providers, create a

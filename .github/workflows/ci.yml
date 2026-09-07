@@ -58,6 +58,30 @@ jobs:
       - run: pnpm run test
         env: { CI: 'true' }
 
+  azure-content:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/setup@v2
+        with:
+          install: false
+      - uses: actions/setup-node@v7
+        with: { node-version: 24, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - name: Start isolated Azure Blob emulator
+        run: >-
+          docker run --rm -d --name nestm-azurite
+          -p 127.0.0.1:10047:10000
+          -e AZURITE_ACCOUNTS=nestmaudit:BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=
+          mcr.microsoft.com/azure-storage/azurite:3.35.0
+          azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --silent
+      - run: pnpm exec vitest run --config vitest.config.e2e.ts test/azure-content.e2e-spec.ts
+        env:
+          STORAGE_AZURE_CONFORMANCE: 'true'
+          STORAGE_AZURE_TEST_CONNECTION_STRING: 'DefaultEndpointsProtocol=http;AccountName=nestmaudit;AccountKey=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=;BlobEndpoint=http://127.0.0.1:10047/nestmaudit;'
+      - if: always()
+        run: docker stop nestm-azurite
+
   # Non-blocking early warning for changes in Nest's next release line.
   canary:
     runs-on: ubuntu-latest
