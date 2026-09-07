@@ -104,6 +104,11 @@ export class StorageStagedContentStore<
         {
           condition: { type: 'create' },
           contentType: 'application/octet-stream',
+          // Unknown-length streams need bounded parts on providers such as S3.
+          // Only opt in when the provider can enforce create at completion.
+          ...(capabilities.conditionalMultipartCompletion?.create === true && {
+            multipart: true,
+          }),
           retries: 0,
           ...(signal === undefined ? {} : { signal }),
         },
