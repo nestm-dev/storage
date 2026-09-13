@@ -1,5 +1,11 @@
 # @nestm/storage
 
+## 0.1.0-alpha.17
+
+### Patch Changes
+
+- e1e7779: Export draft and catalog batch edit alternatives as portable `anyOf` schemas for OpenAPI-based model transports. Preserve disjoint literal kinds, strict object fields, and all text and aggregate byte validation.
+
 ## 0.1.0-alpha.16
 
 ### Patch Changes
