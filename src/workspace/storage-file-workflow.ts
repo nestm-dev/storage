@@ -331,6 +331,46 @@ export class StorageFileWorkflow<Scope, Receipt> {
           : { content: null, offset, nextOffset: null };
         return { ...summary(draft), ...window };
       },
+      readText: async (request) => {
+        const input = { ...request };
+        const signal = operation('read', input);
+        storageInteger(input.expectedSize, 'expectedSize');
+        if (input.expectedSize > limits.maxTextBytes)
+          throw new StorageError('Text read exceeds the buffered text limit.', {
+            code: 'LIMIT_EXCEEDED',
+          });
+        const draft = await transaction(signal, (tx) =>
+          requireDraft(tx, input.draftId),
+        );
+        if (
+          !draft.text ||
+          draft.status === 'cancelled' ||
+          draft.size !== input.expectedSize
+        )
+          conflict(
+            'The source must be an available text draft at the expected size.',
+          );
+        const bytes = await collectStorageBytes(
+          this.#stream(scope, draft, limits, signal),
+          limits.maxTextBytes,
+          signal,
+        );
+        const current = await transaction(signal, (tx) =>
+          requireDraft(tx, input.draftId),
+        );
+        if (
+          current.status === 'cancelled' ||
+          current.size !== input.expectedSize
+        )
+          conflict('The source draft changed while reading.');
+        return {
+          ...summary(current),
+          content: new TextDecoder('utf-8', {
+            fatal: true,
+            ignoreBOM: true,
+          }).decode(bytes),
+        };
+      },
       append: async (input) => {
         const signal = operation('write', input);
         storageInteger(input.offset, 'offset');

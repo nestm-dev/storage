@@ -182,6 +182,10 @@ export interface StorageFileWorkflowCapability<Receipt = unknown> {
   read(
     input: StorageFileDraftRequest & StorageFileDraftPageRequest,
   ): Promise<StorageFileDraft<Receipt> & StorageTextWindow>;
+  /** Buffer one exact text revision within maxTextBytes for host validation. */
+  readText(
+    input: StorageFileDraftRequest & { readonly expectedSize: number },
+  ): Promise<StorageFileDraft<Receipt> & { readonly content: string }>;
   append(input: StorageFileDraftAppend): Promise<StorageFileDraft<Receipt>>;
   parts(
     input: StorageFileDraftRequest & StorageFileDraftPageRequest,

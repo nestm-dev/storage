@@ -139,7 +139,8 @@ assert.equal(
   '# Notes\nold',
 );
 assert.equal(
-  (await workflow.read({ draftId: edited.id })).content,
+  (await workflow.readText({ draftId: edited.id, expectedSize: edited.size }))
+    .content,
   '# Notes\nnew',
 );
 await workflow.commit({ drafts: [{ draftId: edited.id, size: edited.size }] });

@@ -510,6 +510,8 @@ reason, and at most two source windows of 320 Unicode characters each. Window
 offsets count UTF-8 bytes; line/column are one-based UTF-16 coordinates. Contexts
 are untrusted source data from the intermediate buffer, not persisted changes.
 
+`workflow.readText({ draftId, expectedSize })` provides a bounded exact source
+buffer for host validation; concurrent size changes and cancellation conflict.
 `workflow.stageText` saves a bounded text buffer as a sealed checkpoint.
 `workflow.reviseText({ draftId, expectedSize, idempotencyKey, changes })` saves a
 new sealed checkpoint, retains the original path/head ETag, and records

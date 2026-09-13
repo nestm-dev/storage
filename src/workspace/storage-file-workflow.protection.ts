@@ -145,6 +145,8 @@ export function protectStorageFileWorkflowWorkspace<Receipt>(
       workflowRead(input, (signal) => workflows.list({ ...input, signal })),
     read: (input) =>
       workflowRead(input, (signal) => workflows.read({ ...input, signal })),
+    readText: (input) =>
+      workflowRead(input, (signal) => workflows.readText({ ...input, signal })),
     parts: (input) =>
       workflowRead(input, (signal) => workflows.parts({ ...input, signal })),
     append: (input) => {
@@ -323,6 +325,7 @@ export function getStorageFileWorkflow<Receipt = unknown>(
       'reviseText',
       'list',
       'read',
+      'readText',
       'parts',
       'append',
       'cancel',

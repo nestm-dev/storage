@@ -393,3 +393,32 @@ describe('recoverable text checkpoints', () => {
     ).rejects.toMatchObject({ code: 'CONFLICT' });
   });
 });
+
+it('buffers exact draft text for host validation while enforcing size and scope', async () => {
+  const { service, capability: files } = setup();
+  const draft = await files.stageText({
+    path: 'data.json',
+    content: '{"value":"😀"}',
+    idempotencyKey: 'json',
+  });
+  expect(
+    await files.readText({ draftId: draft.id, expectedSize: draft.size }),
+  ).toMatchObject({ content: '{"value":"😀"}', id: draft.id });
+  await expect(
+    files.readText({ draftId: draft.id, expectedSize: 0 }),
+  ).rejects.toMatchObject({ code: 'CONFLICT' });
+  await expect(
+    files
+      .restrict({ limits: { maxTextBytes: 2 } })
+      .readText({ draftId: draft.id, expectedSize: draft.size }),
+  ).rejects.toMatchObject({ code: 'LIMIT_EXCEEDED' });
+  await expect(
+    service
+      .mount('other')
+      .readText({ draftId: draft.id, expectedSize: draft.size }),
+  ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  await files.cancel({ draftId: draft.id });
+  await expect(
+    files.readText({ draftId: draft.id, expectedSize: draft.size }),
+  ).rejects.toMatchObject({ code: 'CONFLICT' });
+});
