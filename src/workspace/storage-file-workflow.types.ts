@@ -2,6 +2,7 @@ import type {
   StorageStagedBody,
   StorageStagedContent,
 } from '../core/storage-staged-content.js';
+import type { StorageTextChange } from '../core/storage-text-edit.js';
 import type { StorageTextWindow } from '../core/storage-streams.js';
 
 export type StorageFileWorkflowPermission = 'read' | 'write' | 'commit';
@@ -12,6 +13,9 @@ export interface StorageFileWorkflowLimits {
   maxPageSize: number;
   maxCommitFiles: number;
   maxPathBytes: number;
+  /** Buffered text staging/editing ceiling; chunked binary workflows remain streaming. */
+  maxTextBytes: number;
+  maxEdits: number;
 }
 export const DEFAULT_STORAGE_FILE_WORKFLOW_LIMITS: Readonly<StorageFileWorkflowLimits> =
   Object.freeze({
@@ -20,6 +24,8 @@ export const DEFAULT_STORAGE_FILE_WORKFLOW_LIMITS: Readonly<StorageFileWorkflowL
     maxPageSize: 64,
     maxCommitFiles: 20,
     maxPathBytes: 1024,
+    maxTextBytes: 16 * 1024 * 1024,
+    maxEdits: 64,
   });
 export interface StorageFileWorkflowOperation {
   readonly signal?: AbortSignal | undefined;
@@ -29,6 +35,17 @@ export interface StorageFileDraftBegin extends StorageFileWorkflowOperation {
   readonly idempotencyKey: string;
   readonly text: boolean;
   readonly expectedEtag?: string | undefined;
+}
+export interface StorageFileDraftStageText extends Omit<
+  StorageFileDraftBegin,
+  'text'
+> {
+  readonly content: string;
+}
+export interface StorageFileDraftReviseText extends StorageFileDraftRequest {
+  readonly expectedSize: number;
+  readonly idempotencyKey: string;
+  readonly changes: readonly StorageTextChange[];
 }
 export interface StorageFileDraftRequest extends StorageFileWorkflowOperation {
   readonly draftId: string;
@@ -52,6 +69,8 @@ export interface StorageFileDraft<Receipt> {
   readonly id: string;
   readonly path: string;
   readonly expectedEtag: string | null;
+  /** Predecessor checkpoint; null for a new draft or catalog checkout. */
+  readonly sourceDraftId: string | null;
   readonly text: boolean;
   readonly status: 'open' | 'sealed' | 'committed' | 'cancelled';
   readonly size: number;
@@ -148,6 +167,14 @@ export interface StorageFileWorkflowCapability<Receipt = unknown> {
   restrict(
     options: MountStorageFileWorkflowOptions,
   ): StorageFileWorkflowCapability<Receipt>;
+  /** Atomically save a bounded text buffer as a sealed, resumable checkpoint. */
+  stageText(
+    input: StorageFileDraftStageText,
+  ): Promise<StorageFileDraft<Receipt>>;
+  /** Save a new sealed checkpoint; preserve the source and original head precondition. */
+  reviseText(
+    input: StorageFileDraftReviseText,
+  ): Promise<StorageFileDraft<Receipt>>;
   begin(input: StorageFileDraftBegin): Promise<StorageFileDraft<Receipt>>;
   list(
     input?: StorageFileDraftPageRequest,
@@ -155,6 +182,10 @@ export interface StorageFileWorkflowCapability<Receipt = unknown> {
   read(
     input: StorageFileDraftRequest & StorageFileDraftPageRequest,
   ): Promise<StorageFileDraft<Receipt> & StorageTextWindow>;
+  /** Buffer one exact text revision within maxTextBytes for host validation. */
+  readText(
+    input: StorageFileDraftRequest & { readonly expectedSize: number },
+  ): Promise<StorageFileDraft<Receipt> & { readonly content: string }>;
   append(input: StorageFileDraftAppend): Promise<StorageFileDraft<Receipt>>;
   parts(
     input: StorageFileDraftRequest & StorageFileDraftPageRequest,

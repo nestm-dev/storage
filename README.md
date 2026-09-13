@@ -499,6 +499,46 @@ scheduling remain host-owned. `StorageStagedContentStore.remove` performs an
 ETag-conditional deletion only after the host proves eligibility; it is not a
 collector and is never called automatically by the workflow.
 
+### Text editing and checkpoints
+
+`applyStorageTextEdit` accepts one exact replacement/append or `{ kind: 'batch',
+changes }`. A batch applies in order to an intermediate buffer: later targets
+see earlier changes. Persist only its final return value. Each target must match
+exactly once, including overlapping matches; there is no fuzzy replacement.
+`StorageTextEditConflict.diagnostic` identifies the failing zero-based edit index,
+reason, and at most two source windows of 320 Unicode characters each. Window
+offsets count UTF-8 bytes; line/column are one-based UTF-16 coordinates. Contexts
+are untrusted source data from the intermediate buffer, not persisted changes.
+
+`workflow.readText({ draftId, expectedSize })` provides a bounded exact source
+buffer for host validation; concurrent size changes and cancellation conflict.
+`workflow.stageText` saves a bounded text buffer as a sealed checkpoint.
+`workflow.reviseText({ draftId, expectedSize, idempotencyKey, changes })` saves a
+new sealed checkpoint, retains the original path/head ETag, and records
+`sourceDraftId`. Its predecessor is sealed in the same host transaction; a
+failed edit leaves even an open predecessor unchanged. A competing append,
+cancellation or commit fails the revision check. Replays return the saved draft;
+a key reused for different edits conflicts. Persist the new nullable
+`sourceDraftId` field with every draft record. Keep it scoped like the draft.
+
+`checkoutStorageCatalogText(catalog, workflow, input)` copies a bounded exact
+catalog revision into a sealed draft. Supplying the catalog to
+`createAiSdkFileWorkflowTools` enables `workspace_checkout_file`;
+`workspace_edit_file_draft` edits checkpoints without resending the source.
+The catalog factory also exposes `workspace_edit_file_batch`. Tool inputs bound
+all edit text together to the configured write/chunk budget. Exact-match failures
+return structured `{ applied: false, code: 'CONFLICT', diagnostic, guidance }`;
+provider failures retain the existing sanitized error contract.
+
+Text staging, checkout and draft editing explicitly buffer at most `maxTextBytes`
+(default 16 MiB); `maxEdits` defaults to 64 and restrictions only narrow limits.
+Chunked creation and commit remain streaming. Read and write authority are both
+required to revise a draft. The current file changes only when the host accepts
+`commitHeads`; content validation, authorization, preview, retention and repair
+budgets belong to that host. Earlier checkpoints remain readable until explicitly
+cancelled. They do not implement published version history or undo committed
+heads; restoring one after a commit requires the host's current-head precondition.
+
 ### Byte and provider guarantees
 
 Staging requires native create-only writes that return an ETag and native exact
