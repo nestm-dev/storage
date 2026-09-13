@@ -1,5 +1,11 @@
 # @nestm/storage
 
+## 0.1.0-alpha.15
+
+### Minor Changes
+
+- fa233b6: Add neutral atomic text-edit batches with bounded conflict contexts, sealed draft checkpoints and exact catalog checkout. Preserve predecessor drafts and target ETags, fence concurrent source changes, and expose generic AI SDK editing tools. Hosts persist sourceDraftId and continue to own validation, authorization and commit policy.
+
 ## 0.1.0-alpha.14
 
 ### Patch Changes
