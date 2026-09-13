@@ -4,7 +4,10 @@ import { StorageStagedContentStore } from '../core/storage-staged-content.js';
 import { createMemoryStorageDriver } from '../testing/index.js';
 import { StorageFileWorkflow } from '../workspace/storage-file-workflow.js';
 import { TestFileHost } from '../../test/helpers/file-workflow-host.js';
-import { createAiSdkFileWorkflowTools } from './ai-sdk-file-workflow-tools.js';
+import {
+  createAiSdkCatalogFileEditSchemas,
+  createAiSdkFileWorkflowTools,
+} from './ai-sdk-file-workflow-tools.js';
 
 function setup(maxChunkBytes: number) {
   const workflow = new StorageFileWorkflow({
@@ -22,6 +25,54 @@ function setup(maxChunkBytes: number) {
 }
 
 describe('model-visible durable file contracts', () => {
+  it('exports portable object alternatives without accepting malformed edit items', () => {
+    for (const schema of [
+      setup(32768).workspace_edit_file_draft!.inputSchema,
+      createAiSdkCatalogFileEditSchemas(32768).batch,
+    ]) {
+      if (!(schema instanceof z.ZodObject))
+        throw new Error('Expected object schema');
+      const json = z.toJSONSchema(schema);
+      expect(json.properties?.changes).toMatchObject({
+        type: 'array',
+        items: {
+          anyOf: [
+            {
+              type: 'object',
+              properties: { kind: { const: 'replace' } },
+              required: ['kind', 'oldText', 'newText'],
+              additionalProperties: false,
+            },
+            {
+              type: 'object',
+              properties: { kind: { const: 'append' } },
+              required: ['kind', 'text'],
+              additionalProperties: false,
+            },
+          ],
+        },
+      });
+      expect(JSON.stringify(json)).not.toContain('"oneOf"');
+      const changes = schema.shape.changes;
+      expect(
+        changes.safeParse([
+          { kind: 'replace', oldText: 'Old', newText: 'New' },
+          { kind: 'append', text: 'More' },
+        ]).success,
+      ).toBe(true);
+      for (const invalid of [
+        null,
+        '{"kind":"replace","oldText":"Old","newText":"New"}',
+        { oldText: 'Old', newText: 'New' },
+        { kind: 'replace', oldText: 'Old' },
+        { kind: 'append', text: 'More', oldText: 'Old' },
+        { kind: 'replace', oldText: '', newText: 'New' },
+      ]) {
+        expect(changes.safeParse([invalid]).success).toBe(false);
+      }
+    }
+  });
+
   it.each([8192, 32768])(
     'publishes effective %i-byte limits in descriptions and enforces Unicode bytes',
     (limit) => {

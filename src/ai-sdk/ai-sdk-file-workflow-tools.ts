@@ -99,7 +99,9 @@ function textChangesSchema(maxBytes: number, maxEdits = 64) {
   const content = textSchema(maxBytes);
   return z
     .array(
-      z.discriminatedUnion('kind', [
+      // These literal kinds are disjoint, so anyOf preserves the exact union
+      // contract while remaining usable by OpenAPI-based model transports.
+      z.union([
         z.strictObject({
           kind: z.literal('replace'),
           oldText: content
