@@ -122,6 +122,25 @@ export function protectStorageFileWorkflowWorkspace<Receipt>(
         workflows.begin({ ...snapshot, signal }),
       );
     },
+    stageText: (input) => {
+      const snapshot = { ...input };
+      requireMutation(snapshot.expectedEtag);
+      return workflowWrite('write', snapshot, (signal) =>
+        workflows.stageText({ ...snapshot, signal }),
+      );
+    },
+    reviseText: (input) => {
+      requireBase('read');
+      const snapshot = {
+        ...input,
+        changes: input.changes.map((change) => ({ ...change })),
+      };
+      return workflowRead(snapshot, () =>
+        workflowWrite('write', snapshot, (signal) =>
+          workflows.reviseText({ ...snapshot, signal }),
+        ),
+      );
+    },
     list: (input = {}) =>
       workflowRead(input, (signal) => workflows.list({ ...input, signal })),
     read: (input) =>
@@ -247,12 +266,31 @@ export function protectStorageFileWorkflowWorkspace<Receipt>(
         );
       },
       edit: (input) => {
-        const snapshot = { ...input, change: { ...input.change } };
+        const change =
+          input.change.kind === 'batch'
+            ? {
+                ...input.change,
+                changes: input.change.changes.map((entry) => ({ ...entry })),
+              }
+            : { ...input.change };
+        const snapshot = { ...input, change };
         requireBase('replace');
-        if (snapshot.change.kind === 'append') textLimit(snapshot.change.text);
+        if (change.kind === 'batch') {
+          if (change.changes.length < 1 || change.changes.length > 64)
+            throw new StorageError('Edit batch exceeds the operation limit.', {
+              code: 'LIMIT_EXCEEDED',
+            });
+          let total = '';
+          for (const entry of change.changes)
+            total +=
+              entry.kind === 'append'
+                ? entry.text
+                : entry.oldText + entry.newText;
+          textLimit(total);
+        } else if (change.kind === 'append') textLimit(change.text);
         else {
-          textLimit(snapshot.change.oldText);
-          textLimit(snapshot.change.newText);
+          textLimit(change.oldText);
+          textLimit(change.newText);
         }
         return catalogRun('write', snapshot, (signal) =>
           catalog.edit({ ...snapshot, signal }),
@@ -281,6 +319,8 @@ export function getStorageFileWorkflow<Receipt = unknown>(
       'allows',
       'restrict',
       'begin',
+      'stageText',
+      'reviseText',
       'list',
       'read',
       'parts',

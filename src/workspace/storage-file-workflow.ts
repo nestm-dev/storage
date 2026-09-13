@@ -1,3 +1,5 @@
+import { applyStorageTextEdit } from '../core/storage-text-edit.js';
+import { stageStorageTextDraft } from './storage-text-draft.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { StorageError } from '../storage.error.js';
 import { assertWorkspacePath } from './storage-workspace.path.js';
@@ -145,6 +147,7 @@ export class StorageFileWorkflow<Scope, Receipt> {
             id: randomUUID(),
             path: input.path,
             expectedEtag: input.expectedEtag ?? null,
+            sourceDraftId: null,
             text: input.text,
             status: 'open',
             size: 0,
@@ -157,6 +160,129 @@ export class StorageFileWorkflow<Scope, Receipt> {
           await tx.saveDraft(record);
           return summary(record);
         });
+      },
+      stageText: async (request) => {
+        const input = { ...request };
+        const signal = operation('write', input);
+        requireMutation(input.expectedEtag);
+        validateIdentity(input.idempotencyKey);
+        assertWorkspacePath(input.path, limits.maxPathBytes, {
+          allowRoot: false,
+        });
+        if (
+          input.expectedEtag !== undefined &&
+          (input.expectedEtag.length < 1 || input.expectedEtag.length > 1024)
+        )
+          invalid('Invalid ETag.');
+        if (
+          new TextEncoder().encode(input.content).byteLength >
+          limits.maxTextBytes
+        )
+          throw new StorageError(
+            'Text checkpoint exceeds the buffered text limit.',
+            { code: 'LIMIT_EXCEEDED' },
+          );
+        return summary(
+          await stageStorageTextDraft({
+            scope,
+            signal,
+            limits,
+            content,
+            requireMutation,
+            transaction: (work) => transaction(signal, work),
+            idempotencyKey: input.idempotencyKey,
+            fingerprint: digest(
+              new TextEncoder().encode(
+                JSON.stringify([
+                  'stage-text',
+                  input.path,
+                  input.expectedEtag ?? null,
+                  input.content,
+                ]),
+              ),
+            ),
+            load: async () => ({
+              content: input.content,
+              path: input.path,
+              expectedEtag: input.expectedEtag ?? null,
+              source: null,
+            }),
+          }),
+        );
+      },
+      reviseText: async (request) => {
+        const input = {
+          ...request,
+          changes: request.changes.map((change) => ({ ...change })),
+        };
+        operation('read', input);
+        const signal = operation('write', input);
+        validateIdentity(input.idempotencyKey);
+        validateIdentity(input.draftId);
+        storageInteger(input.expectedSize, 'expectedSize');
+        if (
+          input.expectedSize > limits.maxTextBytes ||
+          input.changes.length < 1 ||
+          input.changes.length > limits.maxEdits
+        )
+          throw new StorageError(
+            'Text editing exceeds the configured limits.',
+            { code: 'LIMIT_EXCEEDED' },
+          );
+        return summary(
+          await stageStorageTextDraft({
+            scope,
+            signal,
+            limits,
+            content,
+            requireMutation,
+            transaction: (work) => transaction(signal, work),
+            idempotencyKey: input.idempotencyKey,
+            fingerprint: digest(
+              new TextEncoder().encode(
+                JSON.stringify([
+                  'revise-text',
+                  input.draftId,
+                  input.expectedSize,
+                  input.changes,
+                ]),
+              ),
+            ),
+            load: async () => {
+              const source = await transaction(signal, (tx) =>
+                requireDraft(tx, input.draftId),
+              );
+              requireMutation(source.expectedEtag);
+              if (
+                !source.text ||
+                !['open', 'sealed'].includes(source.status) ||
+                source.size !== input.expectedSize
+              )
+                conflict(
+                  'The source must be an unfinished text draft at the expected size.',
+                );
+              const bytes = await collectStorageBytes(
+                this.#stream(scope, source, limits, signal),
+                limits.maxTextBytes,
+                signal,
+              );
+              const original = new TextDecoder('utf-8', {
+                fatal: true,
+                ignoreBOM: true,
+              }).decode(bytes);
+              return {
+                source,
+                path: source.path,
+                expectedEtag: source.expectedEtag,
+                content: applyStorageTextEdit(
+                  original,
+                  { kind: 'batch', changes: input.changes },
+                  { maxBytes: limits.maxTextBytes, maxEdits: limits.maxEdits },
+                ),
+              };
+            },
+          }),
+        );
       },
       list: async (input = {}) => {
         const signal = operation('read', input);
@@ -543,12 +669,22 @@ async function appendState<R>(
   return { draft, replay: false };
 }
 function summary<R>(draft: StorageFileDraftRecord<R>): StorageFileDraft<R> {
-  const { id, path, expectedEtag, text, status, size, result, createdAt } =
-    draft;
+  const {
+    id,
+    path,
+    expectedEtag,
+    sourceDraftId,
+    text,
+    status,
+    size,
+    result,
+    createdAt,
+  } = draft;
   return Object.freeze({
     id,
     path,
     expectedEtag,
+    sourceDraftId,
     text,
     status,
     size,

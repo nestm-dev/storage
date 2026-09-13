@@ -122,6 +122,27 @@ assert.deepEqual(
   await collectStorageBytes(await content.read('scope', body), 100),
   bytes,
 );
+const checkpoint = await workflow.stageText({
+  path: 'notes.md',
+  content: '# Notes\nold',
+  idempotencyKey: 'checkpoint',
+});
+const edited = await workflow.reviseText({
+  draftId: checkpoint.id,
+  expectedSize: checkpoint.size,
+  idempotencyKey: 'edit',
+  changes: [{ kind: 'replace', oldText: 'old', newText: 'new' }],
+});
+assert.equal(edited.sourceDraftId, checkpoint.id);
+assert.equal(
+  (await workflow.read({ draftId: checkpoint.id })).content,
+  '# Notes\nold',
+);
+assert.equal(
+  (await workflow.read({ draftId: edited.id })).content,
+  '# Notes\nnew',
+);
+await workflow.commit({ drafts: [{ draftId: edited.id, size: edited.size }] });
 controller.abort();
 await assert.rejects(workflow.list(), { name: 'AbortError' });
 await client.onApplicationShutdown();

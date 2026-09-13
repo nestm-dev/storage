@@ -40,3 +40,11 @@ export {
   type StorageStagedReadOptions,
   type StorageStagedWriteOptions,
 } from './storage-staged-content.js';
+
+export {
+  StorageTextEditConflict,
+  storageTextContext,
+  type StorageTextChange,
+  type StorageTextContext,
+  type StorageTextEditDiagnostic,
+} from './storage-text-edit.js';

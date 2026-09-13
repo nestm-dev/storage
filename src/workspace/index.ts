@@ -54,3 +54,5 @@ export {
   type StorageWorkspaceUnconditionalDeleteOptions,
   type StorageWorkspaceWriteOptions,
 } from './storage-workspace.types.js';
+
+export { checkoutStorageCatalogText } from './storage-catalog-checkout.js';

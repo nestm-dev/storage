@@ -340,3 +340,89 @@ describe('protected catalog and AI adapters', () => {
     ).toEqual(result);
   });
 });
+
+it('checks out exact catalog text and exposes neutral recoverable edit conflicts', async () => {
+  const { workspace, revoke } = setup();
+  const workflow = getStorageFileWorkflow(workspace);
+  const tools = createAiSdkFileWorkflowTools({
+    workflow,
+    catalog: getStorageFileCatalog(workspace),
+    requireApproval: false,
+  });
+  const checkout = await tool(tools, 'workspace_checkout_file').execute!(
+    { path: 'file.txt', expectedEtag: 'etag' },
+    context,
+  );
+  const parsed = z
+    .object({ id: z.string(), size: z.number(), status: z.literal('sealed') })
+    .parse(checkout);
+  const execute = tool(tools, 'workspace_edit_file_draft').execute!;
+  const failure = await execute(
+    {
+      draftId: parsed.id,
+      expectedSize: parsed.size,
+      changes: [{ kind: 'replace', oldText: 'missing', newText: 'new' }],
+    },
+    { ...context, toolCallId: 'edit' },
+  );
+  expect(failure).toMatchObject({
+    applied: false,
+    code: 'CONFLICT',
+    diagnostic: { reason: 'missing_target', contexts: [{ text: 'a' }] },
+  });
+  expect((await workflow.list()).items).toHaveLength(1);
+  const revised = await execute(
+    {
+      draftId: parsed.id,
+      expectedSize: parsed.size,
+      changes: [{ kind: 'replace', oldText: 'a', newText: 'b' }],
+    },
+    { ...context, toolCallId: 'edit' },
+  );
+  expect(revised).toMatchObject({ sourceDraftId: parsed.id, status: 'sealed' });
+  revoke();
+  await expect(
+    execute(
+      {
+        draftId: parsed.id,
+        expectedSize: parsed.size,
+        changes: [{ kind: 'append', text: '!' }],
+      },
+      { ...context, toolCallId: 'revoked' },
+    ),
+  ).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+});
+it('bounds aggregate batch input and protects catalog batch dispatch', async () => {
+  const schemas = createAiSdkCatalogFileEditSchemas(5);
+  expect(
+    schemas.batch.safeParse({
+      path: 'file.txt',
+      expectedEtag: 'etag',
+      changes: [{ kind: 'replace', oldText: 'a', newText: '😀' }],
+    }).success,
+  ).toBe(true);
+  expect(
+    schemas.batch.safeParse({
+      path: 'file.txt',
+      expectedEtag: 'etag',
+      changes: [{ kind: 'replace', oldText: 'aa', newText: '😀' }],
+    }).success,
+  ).toBe(false);
+  const { workspace, edit } = setup();
+  const catalog = getStorageFileCatalog(workspace);
+  await catalog.edit({
+    path: 'file.txt',
+    expectedEtag: 'etag',
+    commandId: 'batch',
+    change: { kind: 'batch', changes: [{ kind: 'append', text: 'new' }] },
+  });
+  expect(edit).toHaveBeenCalledWith(
+    expect.objectContaining({
+      change: { kind: 'batch', changes: [{ kind: 'append', text: 'new' }] },
+    }),
+  );
+  const narrowed = getStorageFileWorkflow(workspace)
+    .restrict({ limits: { maxTextBytes: 2, maxEdits: 1 } })
+    .restrict({ limits: { maxTextBytes: 100, maxEdits: 10 } });
+  expect(narrowed.limits).toMatchObject({ maxTextBytes: 2, maxEdits: 1 });
+});

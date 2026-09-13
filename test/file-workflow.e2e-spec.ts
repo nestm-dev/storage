@@ -93,6 +93,33 @@ it('reopens durable metadata and filesystem bodies, resumes Unicode chunks and s
       { start: chunk.length, end: chunk.length + 4095 },
       undefined,
     );
+    const checkpoint = await current.files.stageText({
+      path: 'notes.md',
+      idempotencyKey: 'checkpoint',
+      content: '# Notes\r\n😀 original',
+    });
+    const editRequest = {
+      draftId: checkpoint.id,
+      expectedSize: checkpoint.size,
+      idempotencyKey: 'edit-checkpoint',
+      changes: [
+        { kind: 'replace' as const, oldText: 'original', newText: 'revised' },
+      ],
+    };
+    const edited = await current.files.reviseText(editRequest);
+    await current.client.onApplicationShutdown();
+    current = open(true);
+    expect(await current.files.reviseText(editRequest)).toEqual(edited);
+    expect((await current.files.read({ draftId: checkpoint.id })).content).toBe(
+      '# Notes\r\n😀 original',
+    );
+    expect((await current.files.read({ draftId: edited.id })).content).toBe(
+      '# Notes\r\n😀 revised',
+    );
+    expect(edited.sourceDraftId).toBe(checkpoint.id);
+    await current.files.commit({
+      drafts: [{ draftId: edited.id, size: edited.size }],
+    });
     await current.client.onApplicationShutdown();
   } finally {
     rmSync(root, { recursive: true, force: true });

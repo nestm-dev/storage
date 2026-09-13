@@ -97,50 +97,7 @@ export async function searchStorageText(
   return { matches, nextOffset: cursor < size ? pendingOffset : null };
 }
 
-export type StorageTextEdit =
-  | { readonly kind: 'append'; readonly text: string }
-  | {
-      readonly kind: 'replace';
-      readonly oldText: string;
-      readonly newText: string;
-    };
-
-/** Whole-text operation; callers must also bound the original buffered read. */
-export function applyStorageTextEdit(
-  content: string,
-  change: StorageTextEdit,
-  options: { readonly maxBytes: number },
-): string {
-  storageInteger(options.maxBytes, 'maxBytes');
-  const strings =
-    change.kind === 'append'
-      ? [content, change.text]
-      : [content, change.oldText, change.newText];
-  if (strings.some((value) => /[\uD800-\uDFFF]/u.test(value)))
-    throw new StorageError('Text must be well-formed UTF-8.', {
-      code: 'INVALID_ARGUMENT',
-    });
-  let result: string;
-  if (change.kind === 'append') result = content + change.text;
-  else {
-    const first = content.indexOf(change.oldText);
-    if (
-      change.oldText.length === 0 ||
-      first < 0 ||
-      content.indexOf(change.oldText, first + 1) >= 0
-    )
-      throw new StorageError(
-        'The replacement target must match exactly once.',
-        { code: 'CONFLICT' },
-      );
-    result =
-      content.slice(0, first) +
-      change.newText +
-      content.slice(first + change.oldText.length);
-  }
-  if (new TextEncoder().encode(result).byteLength > options.maxBytes)
-    throw new StorageError('Edited content exceeds the byte budget.', {
-      code: 'LIMIT_EXCEEDED',
-    });
-  return result;
-}
+export {
+  applyStorageTextEdit,
+  type StorageTextEdit,
+} from './storage-text-edit.js';
