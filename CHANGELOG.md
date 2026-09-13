@@ -1,5 +1,11 @@
 # @nestm/storage
 
+## 0.1.0-alpha.16
+
+### Patch Changes
+
+- 5df13a1: Describe effective UTF-8 chunk and aggregate edit limits in file-tool and schema-field descriptions. Clarify exact edit arguments, byte receipts and repair of open or sealed checkpoints without discarding retained source.
+
 ## 0.1.0-alpha.15
 
 ### Minor Changes
