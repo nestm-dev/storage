@@ -65,6 +65,9 @@ function textSchema(maxBytes: number) {
     .refine(
       (text) => new TextEncoder().encode(text).byteLength <= maxBytes,
       `Use at most ${maxBytes} UTF-8 bytes per call.`,
+    )
+    .describe(
+      `Well-formed text of at most ${maxBytes} UTF-8 bytes. Non-ASCII characters can use multiple bytes. This is a per-call transport limit, not a file-size limit.`,
     );
 }
 async function safe<Result>(work: () => Promise<Result>) {
@@ -99,7 +102,11 @@ function textChangesSchema(maxBytes: number, maxEdits = 64) {
       z.discriminatedUnion('kind', [
         z.strictObject({
           kind: z.literal('replace'),
-          oldText: content.refine((text) => text.length > 0),
+          oldText: content
+            .refine((text) => text.length > 0)
+            .describe(
+              `Non-empty exact unique source span, at most ${maxBytes} UTF-8 bytes; counts toward the combined edit-text budget.`,
+            ),
           newText: content,
         }),
         z.strictObject({ kind: z.literal('append'), text: content }),
@@ -120,6 +127,9 @@ function textChangesSchema(maxBytes: number, maxEdits = 64) {
           0,
         ) <= maxBytes,
       `Use at most ${maxBytes} UTF-8 bytes across all edit text.`,
+    )
+    .describe(
+      `Supply 1–${maxEdits} ordered changes with at most ${maxBytes} aggregate UTF-8 bytes across all oldText, newText and append text. Replacement shape: {"kind":"replace","oldText":"exact unique text","newText":"replacement"}. Append shape: {"kind":"append","text":"new text"}. Every replacement must match exactly once in the intermediate buffer. Split oversized batches and use each returned checkpoint before continuing.`,
     );
 }
 
@@ -136,7 +146,11 @@ export function createAiSdkCatalogFileEditSchemas(maxWriteBytes = 8192) {
     edit: z.strictObject({
       path,
       expectedEtag: etag,
-      oldText: content.refine((text) => text.length > 0),
+      oldText: content
+        .refine((text) => text.length > 0)
+        .describe(
+          `Non-empty exact unique source span, at most ${maxWriteBytes} UTF-8 bytes. Read or search the current revision after a mismatch.`,
+        ),
       newText: content,
     }),
   };
@@ -148,9 +162,11 @@ export function createAiSdkFileWorkflowTools<Receipt>(
 ): ToolSet {
   const { workflow } = options;
   const tools: ToolSet = {};
-  const content = textSchema(
-    Math.min(options.maxChunkBytes ?? 8192, workflow.limits.maxChunkBytes),
+  const maxChunkBytes = Math.min(
+    options.maxChunkBytes ?? 8192,
+    workflow.limits.maxChunkBytes,
   );
+  const content = textSchema(maxChunkBytes);
   const approval = options.requireApproval ?? true;
   if (workflow.allows('read'))
     Object.assign(tools, {
@@ -197,12 +213,17 @@ export function createAiSdkFileWorkflowTools<Receipt>(
       }),
       workspace_append_file_draft: tool({
         needsApproval: approval,
-        description:
-          'Append a bounded UTF-8 chunk at the draft’s returned byte size. Replaying identical bytes at the same offset is safe; different bytes or a stale offset fail.',
+        description: `Append at most ${maxChunkBytes} UTF-8 bytes to an open draft. Required arguments: draftId, offset, content. Copy draftId and offset from the latest receipt's id and size; never estimate byte offsets from character counts. Example shape only: {"draftId":"<returned id>","offset":0,"content":"<main>New section</main>"}; offset 0 applies only to an empty draft. Split larger content into complete Unicode sections. Replaying identical bytes at the same offset is safe; different bytes or a stale offset fail. Revise sealed drafts with workspace_edit_file_draft.`,
         inputSchema: z.strictObject({
           draftId: identity,
-          offset,
-          content: content.refine((text) => text.length > 0),
+          offset: offset.describe(
+            'Copy the current draft size in UTF-8 bytes from its latest receipt.',
+          ),
+          content: content
+            .refine((text) => text.length > 0)
+            .describe(
+              `Non-empty new section of at most ${maxChunkBytes} UTF-8 bytes, ending at a complete Unicode character. Do not repeat already accepted content.`,
+            ),
         }),
         execute: (input, context) =>
           safe(() =>
@@ -228,18 +249,13 @@ export function createAiSdkFileWorkflowTools<Receipt>(
   if (workflow.allows('read') && workflow.allows('write')) {
     tools.workspace_edit_file_draft = tool({
       needsApproval: approval,
-      description:
-        'Apply a sequential batch of exact edits to a draft and save a new sealed checkpoint. Supply its exact byte size. Each oldText must match once in the intermediate buffer. All edits succeed or none are saved. The original draft and current file stay intact. Use the returned draft ID for further edits or commit; sourceDraftId identifies the previous checkpoint.',
+      description: `Apply 1–${workflow.limits.maxEdits} sequential exact changes to an open or sealed draft and save a new sealed checkpoint. Required arguments: draftId, expectedSize, changes. Copy expectedSize from the latest receipt's size. All oldText, newText and append text together must fit ${maxChunkBytes} UTF-8 bytes. Example changes: [{"kind":"replace","oldText":"<h1>Old</h1>","newText":"<h1>New</h1>"}]. Each oldText must match exactly once in the intermediate buffer; read the draft for a unique surrounding span after a conflict. All edits succeed or none are saved. The original draft and current file stay intact. Use the returned id and size for further edits or commit; sourceDraftId identifies the previous checkpoint. A sealed checkpoint can be edited again, but cannot receive workspace_append_file_draft calls.`,
       inputSchema: z.strictObject({
         draftId: identity,
-        expectedSize: offset,
-        changes: textChangesSchema(
-          Math.min(
-            options.maxChunkBytes ?? 8192,
-            workflow.limits.maxChunkBytes,
-          ),
-          workflow.limits.maxEdits,
+        expectedSize: offset.describe(
+          'Copy this draft checkpoint’s exact size in UTF-8 bytes from its receipt; do not use the current file ETag or estimate the size.',
         ),
+        changes: textChangesSchema(maxChunkBytes, workflow.limits.maxEdits),
       }),
       execute: (input, context) =>
         safe(() =>
@@ -308,12 +324,12 @@ export function createAiSdkCatalogFileTools<Receipt>(
 ): ToolSet {
   const { catalog } = options;
   const tools: ToolSet = {};
-  const content = textSchema(
-    Math.min(options.maxWriteBytes ?? 8192, catalog.limits.maxWriteBytes),
+  const maxWriteBytes = Math.min(
+    options.maxWriteBytes ?? 8192,
+    catalog.limits.maxWriteBytes,
   );
-  const editSchemas = createAiSdkCatalogFileEditSchemas(
-    Math.min(options.maxWriteBytes ?? 8192, catalog.limits.maxWriteBytes),
-  );
+  const content = textSchema(maxWriteBytes);
+  const editSchemas = createAiSdkCatalogFileEditSchemas(maxWriteBytes);
   const approval = options.requireApproval ?? true;
   const commandId = options.commandId ?? ((toolCallId: string) => toolCallId);
   if (catalog.allows('read'))
@@ -379,8 +395,7 @@ export function createAiSdkCatalogFileTools<Receipt>(
       workspace_write_file: tool({
         strict: false,
         needsApproval: approval,
-        description:
-          'Create or conditionally replace a small UTF-8 file. Omit expectedEtag to create; supply the exact current ETag to replace. Use durable drafts for substantial content.',
+        description: `Create or conditionally replace a file with at most ${maxWriteBytes} UTF-8 content bytes. Omit expectedEtag to create; supply the exact current ETag to replace. Use durable drafts for larger content.`,
         inputSchema: z.strictObject({
           path,
           expectedEtag: etag.optional(),
@@ -397,8 +412,7 @@ export function createAiSdkCatalogFileTools<Receipt>(
       }),
       workspace_append_file: tool({
         needsApproval: approval,
-        description:
-          'Append a bounded UTF-8 chunk to one exact file revision. Pass the latest ETag; retry identity prevents duplicate appends. Durable drafts support large generation.',
+        description: `Append at most ${maxWriteBytes} UTF-8 content bytes to one exact file revision. Required arguments: path, expectedEtag, content. Pass the latest ETag; retry identity prevents duplicate appends. Durable drafts support large generation.`,
         inputSchema: editSchemas.append,
         execute: (input, context) =>
           safe<unknown>(() =>
@@ -413,8 +427,7 @@ export function createAiSdkCatalogFileTools<Receipt>(
       }),
       workspace_edit_file_batch: tool({
         needsApproval: approval,
-        description:
-          'Apply sequential exact edits to one file at its expected ETag. Each replacement must match exactly once; all changes are persisted together or none are. For recoverable checkpoints, checkout and edit a draft instead.',
+        description: `Apply 1–64 sequential exact changes at the latest expectedEtag, with at most ${maxWriteBytes} aggregate UTF-8 bytes across all oldText, newText and append text. Example changes: [{"kind":"replace","oldText":"exact unique text","newText":"replacement"}]. Each replacement must match exactly once; all changes are persisted together or none are. For recoverable checkpoints, checkout and edit a draft instead.`,
         inputSchema: editSchemas.batch,
         execute: (input, context) =>
           safe<unknown>(() =>
@@ -429,8 +442,7 @@ export function createAiSdkCatalogFileTools<Receipt>(
       }),
       workspace_edit_file: tool({
         needsApproval: approval,
-        description:
-          'Replace one exact unique text span at the latest expectedEtag. oldText must match exactly once. The result carries the next revision receipt.',
+        description: `Replace one exact unique text span at the latest expectedEtag. Required arguments: path, expectedEtag, oldText, newText. oldText and newText each allow at most ${maxWriteBytes} UTF-8 bytes. oldText must match exactly once; inspect the current source for a unique span after a mismatch. The result carries the next revision receipt.`,
         inputSchema: editSchemas.edit,
         execute: (input, context) =>
           safe<unknown>(() =>
