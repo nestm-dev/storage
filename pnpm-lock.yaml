@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       files-sdk:
-        specifier: 2.3.0
-        version: 2.3.0(@aws-sdk/client-s3@3.1120.0)(@aws-sdk/lib-storage@3.1120.0(@aws-sdk/client-s3@3.1120.0))(@aws-sdk/s3-presigned-post@3.1120.0)(@aws-sdk/s3-request-presigner@3.1120.0)(@azure/core-auth@1.11.0(supports-color@7.2.0))(@azure/identity@4.13.2(supports-color@7.2.0))(@azure/storage-blob@12.33.0(supports-color@7.2.0))(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.83(zod@4.4.3))(fastify@5.12.1)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3)
+        specifier: 2.4.1
+        version: 2.4.1(@aws-sdk/client-s3@3.1120.0)(@aws-sdk/lib-storage@3.1120.0(@aws-sdk/client-s3@3.1120.0))(@aws-sdk/s3-presigned-post@3.1120.0)(@aws-sdk/s3-request-presigner@3.1120.0)(@azure/core-auth@1.11.0(supports-color@7.2.0))(@azure/identity@4.13.2(supports-color@7.2.0))(@azure/storage-blob@12.33.0(supports-color@7.2.0))(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.83(zod@4.4.3))(fastify@5.12.1)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3)
     devDependencies:
       '@aws-sdk/client-s3':
         specifier: 3.1120.0
@@ -1359,8 +1359,8 @@ packages:
     resolution: {integrity: sha512-0H8TsCUGBLx+V5adH3EY52hTAcyLKbV1D4gq5cIOJ6DnQAHeV9Z2Hhuc5CoBX4YmvB2oL+JIC84z0qO7JsCoNw==}
     engines: {node: '>=22'}
 
-  files-sdk@2.3.0:
-    resolution: {integrity: sha512-YOlRvcYPgrVf23Q7+E5rj7NTRwmym6VZG3vbr87HMS6jYluf2wd1zA9XCjJgtm1lTTmLzbJgs5UHLXl8CYOBJQ==}
+  files-sdk@2.4.1:
+    resolution: {integrity: sha512-3T5SN/JJry7NYS30x8UaafLWJySyLgda/WNH1DXFjR8dp3UCbSf+2w8/IZxwBke0OevAB/T8+r8QItQpN0GH8g==}
     hasBin: true
     peerDependencies:
       '@anthropic-ai/claude-agent-sdk': ^0.3.0
@@ -1372,35 +1372,35 @@ packages:
       '@azure/identity': ^4.5.0
       '@azure/storage-blob': ^12.26.0
       '@bunny.net/storage-sdk': ^0.3.1
-      '@google-cloud/storage': ^7.19.0
-      '@googleapis/drive': ^20.0.0
+      '@google-cloud/storage': ^7.19.0 || ^8.0.0
+      '@googleapis/drive': ^20.0.0 || ^21.0.0 || ^22.0.0
       '@microsoft/microsoft-graph-client': ^3.0.7
-      '@nestjs/common': ^10.0.0 || ^11.0.0
-      '@netlify/blobs': ^10.7.4
-      '@openai/agents': ^0.11.0
+      '@nestjs/common': ^10.0.0 || ^11.0.0 || ^12.0.0
+      '@netlify/blobs': ^10.7.4 || ^11.0.0
+      '@openai/agents': '>=0.11.0 <1.0.0'
       '@opentelemetry/api': ^1.9.0
       '@supabase/storage-js': ^2.105.4
       '@sveltejs/kit': ^2.0.0
       '@tanstack/react-start': ^1.0.0
       '@vercel/blob': ^2.4.0
-      ai: ^6.0.0
-      astro: ^4.0.0 || ^5.0.0 || ^6.0.0
+      ai: ^6.0.0 || ^7.0.0
+      astro: ^4.0.0 || ^5.0.0 || ^6.0.0 || ^7.0.0
       basic-ftp: ^6.0.1
       box-typescript-sdk-gen: ^1.19.1
       cloudinary: ^2.10.0
       convex: ^1.16.0
-      disk: ^0.8.18
+      disk: ^0.8.18 || ^1.0.0
       dropbox: ^10.34.0
       fastify: ^4.0.0 || ^5.0.0
       firebase-admin: ^14.1.0
-      google-auth-library: ^10.0.0
+      google-auth-library: ^10.0.0 || ^11.0.0
       h3: ^1.0.0
       hono: ^4.0.0
       koa: ^2.0.0 || ^3.0.0
       next: ^14.0.0 || ^15.0.0 || ^16.0.0
-      node-appwrite: ^26.0.0
-      openai: ^6.0.0
-      pocketbase: ^0.27.0
+      node-appwrite: ^26.0.0 || ^27.0.0 || ^28.0.0 || ^29.0.0
+      openai: ^6.0.0 || ^7.0.0
+      pocketbase: ^0.27.0 || ^0.28.0
       react: ^18.0.0 || ^19.0.0
       react-dom: ^18.0.0 || ^19.0.0
       ssh2-sftp-client: ^12.1.1
@@ -1909,8 +1909,8 @@ packages:
       vite-plus:
         optional: true
 
-  p-map@7.0.6:
-    resolution: {integrity: sha512-I4Prw6ivkd6p8PiYR1tXASOAOBzIJwu0TB7fqaX0c/8c3QAehNYmX57EijyGGGBt3c/BIowGwV03RVBtXvHEVg==}
+  p-map@7.0.8:
+    resolution: {integrity: sha512-MitaVsCuCFIvOLLPIU7NnfrZvS9H9h7kwMUkDo+T2pEISaJD48IV9S8iIdXB7PsvvdxyYcsSTTrr90XKsbulNw==}
     engines: {node: '>=18'}
 
   package-manager-detector@1.8.0:
@@ -1939,6 +1939,10 @@ packages:
 
   picomatch@4.0.5:
     resolution: {integrity: sha512-RvwwcruNjI1ncT5xRakeyS9Lf8lcItv34KD+aif+VH9kduAyfYBipGh12274xtenIPZ119/R9BdTBa8gAwSh0A==}
+    engines: {node: '>=12'}
+
+  picomatch@4.0.7:
+    resolution: {integrity: sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA==}
     engines: {node: '>=12'}
 
   pino-abstract-transport@3.0.0:
@@ -3717,14 +3721,14 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  files-sdk@2.3.0(@aws-sdk/client-s3@3.1120.0)(@aws-sdk/lib-storage@3.1120.0(@aws-sdk/client-s3@3.1120.0))(@aws-sdk/s3-presigned-post@3.1120.0)(@aws-sdk/s3-request-presigner@3.1120.0)(@azure/core-auth@1.11.0(supports-color@7.2.0))(@azure/identity@4.13.2(supports-color@7.2.0))(@azure/storage-blob@12.33.0(supports-color@7.2.0))(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.83(zod@4.4.3))(fastify@5.12.1)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3):
+  files-sdk@2.4.1(@aws-sdk/client-s3@3.1120.0)(@aws-sdk/lib-storage@3.1120.0(@aws-sdk/client-s3@3.1120.0))(@aws-sdk/s3-presigned-post@3.1120.0)(@aws-sdk/s3-request-presigner@3.1120.0)(@azure/core-auth@1.11.0(supports-color@7.2.0))(@azure/identity@4.13.2(supports-color@7.2.0))(@azure/storage-blob@12.33.0(supports-color@7.2.0))(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.83(zod@4.4.3))(fastify@5.12.1)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3):
     dependencies:
       aws4fetch: 1.0.20
       commander: 15.0.0
       fflate: 0.8.3
       mime: 4.1.0
-      p-map: 7.0.6
-      picomatch: 4.0.5
+      p-map: 7.0.8
+      picomatch: 4.0.7
       safe-regex2: 5.1.1
     optionalDependencies:
       '@aws-sdk/client-s3': 3.1120.0
@@ -4120,7 +4124,7 @@ snapshots:
       '@oxlint/binding-win32-ia32-msvc': 1.80.0
       '@oxlint/binding-win32-x64-msvc': 1.80.0
 
-  p-map@7.0.6: {}
+  p-map@7.0.8: {}
 
   package-manager-detector@1.8.0: {}
 
@@ -4138,6 +4142,8 @@ snapshots:
   picocolors@1.1.1: {}
 
   picomatch@4.0.5: {}
+
+  picomatch@4.0.7: {}
 
   pino-abstract-transport@3.0.0:
     dependencies:

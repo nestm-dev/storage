@@ -205,42 +205,50 @@ describe('createProviderStorageDriver', () => {
     }
   });
 
-  it('forces a named S3-backed provider unverified and read-only', async () => {
-    const send = vi
-      .spyOn(S3Client.prototype, 'send')
-      .mockRejectedValue(new Error('unexpected S3 dispatch') as never);
-    const driver = await createProviderStorageDriver({
-      config: {
-        accessKeyId: 'test',
-        bucket: 'artifacts',
-        endpoint: 'https://minio.example.test',
-        region: 'us-east-1',
-        secretAccessKey: 'test',
-      },
-      provider: 'minio',
-      readonly: false,
-    });
-
-    expect(driver.capabilities.conditionalCreate).toBeUndefined();
-    expect(driver.capabilities.conditionalRead).toBeUndefined();
-    expect(driver.capabilities.physicalKey).toEqual({ maxBytes: 1_024 });
-    expect(driver.capabilities.signedUpload).toBe(false);
-    expect(driver.capabilities.signedDownloadPolicy).toEqual({
-      expiresIn: false,
-    });
-    const client = new StorageClient('unverified-minio', driver);
-    try {
-      await expect(
-        client.upload('blocked.txt', 'blocked'),
-      ).rejects.toMatchObject({
-        code: StorageErrorCode.READ_ONLY,
+  it.each(['minio', 'r2', 's3-fetch'] as const)(
+    'keeps lazy or fetch S3 provider %s unverified and read-only',
+    async (provider) => {
+      const send = vi
+        .spyOn(S3Client.prototype, 'send')
+        .mockRejectedValue(new Error('unexpected S3 dispatch') as never);
+      const driver = await createProviderStorageDriver({
+        config: {
+          accessKeyId: 'test',
+          bucket: 'artifacts',
+          endpoint: 'https://minio.example.test',
+          region: 'us-east-1',
+          secretAccessKey: 'test',
+        },
+        provider,
+        readonly: false,
       });
-      expect(send).not.toHaveBeenCalled();
-    } finally {
-      await client.onApplicationShutdown();
-      send.mockRestore();
-    }
-  });
+
+      expect(driver.capabilities.conditionalCreate).toBeUndefined();
+      expect(driver.capabilities.conditionalRead).toBeUndefined();
+      expect(driver.capabilities.physicalKey).toEqual({ maxBytes: 1_024 });
+      expect(driver.capabilities.signedUpload).toBe(false);
+      expect(driver.capabilities.signedDownloadPolicy).toEqual({
+        expiresIn: false,
+      });
+      const client = new StorageClient('unverified-minio', driver);
+      try {
+        for (const operation of [
+          () => client.upload('blocked.txt', 'blocked'),
+          () => client.delete('blocked.txt'),
+          () => client.copy('a', 'b'),
+          () => client.signUpload('blocked.txt', { expiresIn: 60 }),
+        ]) {
+          await expect(operation()).rejects.toMatchObject({
+            code: StorageErrorCode.READ_ONLY,
+          });
+        }
+        expect(send).not.toHaveBeenCalled();
+      } finally {
+        await client.onApplicationShutdown();
+        send.mockRestore();
+      }
+    },
+  );
 
   it('forwards an explicit verified profile to a custom S3 endpoint', async () => {
     const configJson = Object.freeze({

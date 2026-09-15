@@ -85,9 +85,18 @@ export async function createProviderStorageDriver(
   const adapter = await resolveAdapter(provider, config, s3ProviderProfile);
   return createFilesSdkDriver({
     ...filesOptions,
+    ...(LAZY_S3_PROVIDERS.has(provider) ? { readonly: true } : {}),
     adapter,
   });
 }
+
+// Files SDK 2.4 defers these AWS clients until the first operation; fetch engines
+// expose a different raw client. Neither form constitutes verified S3 authority.
+const LAZY_S3_PROVIDERS = new Set<StorageProviderName>([
+  'minio',
+  'r2',
+  's3-fetch',
+]);
 
 function isS3BackedAdapter(adapter: Adapter): adapter is S3Adapter {
   try {
@@ -145,6 +154,12 @@ async function resolveAdapter(
     );
   }
   if (!isS3BackedAdapter(adapter)) {
+    if (LAZY_S3_PROVIDERS.has(provider)) {
+      return Object.assign(Object.create(adapter) as Adapter, {
+        physicalKey: Object.freeze({ maxBytes: 1024 }),
+        signedDownloadPolicy: Object.freeze({ expiresIn: false }),
+      });
+    }
     return adapter;
   }
   // Every AWS-SDK-backed wrapper gets fail-closed S3 provenance and endpoint

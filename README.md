@@ -521,10 +521,30 @@ cancellation or commit fails the revision check. Replays return the saved draft;
 a key reused for different edits conflicts. Persist the new nullable
 `sourceDraftId` field with every draft record. Keep it scoped like the draft.
 
-`checkoutStorageCatalogText(catalog, workflow, input)` copies a bounded exact
+`checkoutStorageCatalogText(catalog, workflow, input)` streams an exact
 catalog revision into a sealed draft. Supplying the catalog to
 `createAiSdkFileWorkflowTools` enables `workspace_checkout_file`;
 `workspace_edit_file_draft` edits checkpoints without resending the source.
+For path-based authoring, wrap the protected catalog and workflow in
+`new StorageWorkingFiles(catalog, workflow)` and pass its `.catalog` to
+`createAiSdkWorkingFileTools`. Ordinary write, append and edit calls return an
+opaque working ETag. Reads and discovery include unfinished checkpoint leaves;
+listing remains paginated. A host can resolve `working.draft({ path,
+expectedEtag })`, perform domain admission, then commit the exact draft. Failed
+admission leaves that same path and ETag editable. This adapter never commits
+implicitly. Committed checkpoint ETags resolve to their receipt's saved ETag and
+still enforce the current head; concurrent changes cannot be silently adopted.
+
+`workflow.stageStream` stages a lazy source using bounded UTF-8-safe chunks and a
+host-provided stable content identity. `reviseText` applies exact ordered edits
+as a stream; file size is independent of the per-operation edit-text budget.
+`maxTextBytes` still bounds buffered `stageText` inputs and `readText` validation.
+Hosts must set their own admission and export resource limits. Stream failures
+leave no partial checkpoint; immutable unreferenced chunks follow normal staged
+content retention. `workflow.lookup` recovers host command receipts after
+response loss, with fresh scope authorization. Replaying the original mutation
+still verifies its full fingerprint and current mutation authority.
+
 The catalog factory also exposes `workspace_edit_file_batch`. Tool inputs bound
 all edit text together to the configured write/chunk budget. Exact-match failures
 return structured `{ applied: false, code: 'CONFLICT', diagnostic, guidance }`;

@@ -3,6 +3,7 @@ import type {
   StorageStagedContent,
 } from '../core/storage-staged-content.js';
 import type { StorageTextChange } from '../core/storage-text-edit.js';
+import type { StorageTextSearchResult } from '../core/storage-text.js';
 import type { StorageTextWindow } from '../core/storage-streams.js';
 
 export type StorageFileWorkflowPermission = 'read' | 'write' | 'commit';
@@ -13,7 +14,7 @@ export interface StorageFileWorkflowLimits {
   maxPageSize: number;
   maxCommitFiles: number;
   maxPathBytes: number;
-  /** Buffered text staging/editing ceiling; chunked binary workflows remain streaming. */
+  /** Buffered input and host read ceiling; streamed file edits are not limited by total file size. */
   maxTextBytes: number;
   maxEdits: number;
 }
@@ -42,7 +43,17 @@ export interface StorageFileDraftStageText extends Omit<
 > {
   readonly content: string;
 }
+export interface StorageFileDraftStageStream extends StorageFileDraftBegin {
+  /** Stable trusted source identity used to detect conflicting command replay. */
+  readonly contentIdentity: string;
+  /** Open only after authorization and replay lookup; bytes are never exposed to the model. */
+  readonly body: () => ReadableStream<Uint8Array>;
+  readonly sourceDraftId?: string | undefined;
+  readonly expectedSize?: number | undefined;
+}
 export interface StorageFileDraftReviseText extends StorageFileDraftRequest {
+  /** Optional host request identity, included in replay validation. */
+  readonly requestIdentity?: string | undefined;
   readonly expectedSize: number;
   readonly idempotencyKey: string;
   readonly changes: readonly StorageTextChange[];
@@ -171,10 +182,18 @@ export interface StorageFileWorkflowCapability<Receipt = unknown> {
   stageText(
     input: StorageFileDraftStageText,
   ): Promise<StorageFileDraft<Receipt>>;
+  /** Stage arbitrary-size text or binary source in bounded, integrity-checked chunks. */
+  stageStream(
+    input: StorageFileDraftStageStream,
+  ): Promise<StorageFileDraft<Receipt>>;
   /** Save a new sealed checkpoint; preserve the source and original head precondition. */
   reviseText(
     input: StorageFileDraftReviseText,
   ): Promise<StorageFileDraft<Receipt>>;
+  /** Recover a host command receipt without reopening its source. */
+  lookup(
+    input: StorageFileWorkflowOperation & { readonly idempotencyKey: string },
+  ): Promise<StorageFileDraft<Receipt> | null>;
   begin(input: StorageFileDraftBegin): Promise<StorageFileDraft<Receipt>>;
   list(
     input?: StorageFileDraftPageRequest,
@@ -182,6 +201,15 @@ export interface StorageFileWorkflowCapability<Receipt = unknown> {
   read(
     input: StorageFileDraftRequest & StorageFileDraftPageRequest,
   ): Promise<StorageFileDraft<Receipt> & StorageTextWindow>;
+  searchText(
+    input: StorageFileDraftRequest &
+      StorageFileDraftPageRequest & {
+        readonly expectedSize: number;
+        readonly query: string;
+      },
+  ): Promise<
+    StorageTextSearchResult & { readonly path: string; readonly etag: string }
+  >;
   /** Buffer one exact text revision within maxTextBytes for host validation. */
   readText(
     input: StorageFileDraftRequest & { readonly expectedSize: number },

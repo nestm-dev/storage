@@ -21,6 +21,7 @@ export {
 export {
   createAiSdkFileWorkflowTools,
   createAiSdkCatalogFileTools,
+  createAiSdkWorkingFileTools,
   createAiSdkCatalogFileEditSchemas,
   AI_SDK_FILE_WORKFLOW_TOOL_NAMES,
   AI_SDK_CATALOG_FILE_TOOL_NAMES,

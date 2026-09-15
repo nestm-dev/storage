@@ -56,3 +56,8 @@ export {
 } from './storage-workspace.types.js';
 
 export { checkoutStorageCatalogText } from './storage-catalog-checkout.js';
+
+export {
+  StorageWorkingFiles,
+  type StorageWorkingFile,
+} from './storage-working-files.js';

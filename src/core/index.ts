@@ -48,3 +48,5 @@ export {
   type StorageTextContext,
   type StorageTextEditDiagnostic,
 } from './storage-text-edit.js';
+
+export { editStorageTextStream } from './storage-text-stream-edit.js';
