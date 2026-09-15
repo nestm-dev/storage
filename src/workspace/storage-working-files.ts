@@ -245,6 +245,7 @@ export class StorageWorkingFiles<Receipt extends StorageWorkingFileReceipt> {
     const pending = await this.pending(input);
     const paths = new Set(pending.map((draft) => draft.path));
     const items: StorageCatalogFile[] = [];
+    const savedByPath = new Map<string, StorageCatalogFile>();
     let cursor: number | null = 0;
     do {
       const page: StorageFileWorkflowPage<StorageCatalogFile> =
@@ -255,6 +256,7 @@ export class StorageWorkingFiles<Receipt extends StorageWorkingFileReceipt> {
               query: input.query!,
               offset: cursor,
             });
+      for (const file of page.items) savedByPath.set(file.path, file);
       items.push(...page.items.filter((file) => !paths.has(file.path)));
       if (page.nextOffset !== null && page.nextOffset <= cursor)
         throw new StorageError('Invalid catalog pagination.', {
@@ -272,7 +274,10 @@ export class StorageWorkingFiles<Receipt extends StorageWorkingFileReceipt> {
               directory === '.' ||
               draft.path.startsWith(`${directory}/`),
         )
-        .map((draft) => this.receipt(draft)),
+        .map((draft) => ({
+          ...savedByPath.get(draft.path),
+          ...this.receipt(draft),
+        })),
     );
     items.sort(
       (a, b) => a.path.localeCompare(b.path) || a.etag.localeCompare(b.etag),
