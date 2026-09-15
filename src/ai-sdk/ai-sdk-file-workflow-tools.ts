@@ -464,3 +464,30 @@ export function createAiSdkCatalogFileTools<Receipt>(
     } satisfies ToolSet);
   return Object.freeze(tools);
 }
+
+/** Ordinary path tools over a working catalog; hosts own validation and final promotion. */
+export function createAiSdkWorkingFileTools<Receipt>(
+  options: CreateAiSdkCatalogFileToolsOptions<Receipt>,
+): ToolSet {
+  const tools = { ...createAiSdkCatalogFileTools(options) };
+  const descriptions: Record<string, string> = {
+    workspace_write_file:
+      'Create or replace working text at a path. Omit expectedEtag for a new file; otherwise use its latest returned ETag. For larger content, write the first section and append subsequent sections. Changes are saved durably and remain editable before finish.',
+    workspace_append_file:
+      'Append the next text section to the exact working file. Supply path, latest expectedEtag and content. Use the returned ETag for the next section. No byte counting or separate draft is required.',
+    workspace_edit_file_batch:
+      'Apply ordered exact replacements or appends to the latest working ETag. All changes succeed together or none are saved. Each replacement must match exactly once. Use bounded failure context to correct the batch, then retry it.',
+  };
+  for (const [name, description] of Object.entries(descriptions)) {
+    const original = tools[name];
+    if (
+      original &&
+      (original.type === undefined || original.type === 'function')
+    )
+      tools[name] = {
+        ...original,
+        description: `${description} Text inputs are bounded per call; the total file may span many calls.`,
+      };
+  }
+  return Object.freeze(tools);
+}

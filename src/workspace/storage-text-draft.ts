@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { chunkStorageDraftStream } from './storage-draft-stream.js';
 import { StorageError } from '../storage.error.js';
 import { storageBytesStream } from '../core/storage-streams.js';
 import type { StorageStagedContent } from '../core/storage-staged-content.js';
@@ -22,7 +23,8 @@ export async function stageStorageTextDraft<Scope, Receipt>(options: {
     work: (tx: StorageFileWorkflowTransaction<Receipt>) => Promise<T>,
   ) => Promise<T>;
   readonly load: () => Promise<{
-    content: string;
+    content: string | ReadableStream<Uint8Array>;
+    text?: boolean;
     path: string;
     expectedEtag: string | null;
     source: StorageFileDraftRecord<Receipt> | null;
@@ -45,26 +47,26 @@ export async function stageStorageTextDraft<Scope, Receipt>(options: {
   if (prior !== null) return prior;
   const loaded = await options.load();
   options.requireMutation(loaded.expectedEtag);
-  if (/[\uD800-\uDFFF]/u.test(loaded.content))
+  if (
+    typeof loaded.content === 'string' &&
+    /[\uD800-\uDFFF]/u.test(loaded.content)
+  )
     throw new StorageError('Text must be well-formed UTF-8.', {
       code: 'INVALID_ARGUMENT',
     });
-  const bytes = new TextEncoder().encode(loaded.content);
-  if (bytes.byteLength > limits.maxTextBytes)
-    throw new StorageError('Text checkpoint exceeds the buffered text limit.', {
-      code: 'LIMIT_EXCEEDED',
-    });
-  if (limits.maxChunkBytes < 4)
-    throw new StorageError(
-      'Text checkpoints require a chunk limit of at least four bytes.',
-      { code: 'LIMIT_EXCEEDED' },
-    );
+  const source =
+    typeof loaded.content === 'string'
+      ? storageBytesStream(new TextEncoder().encode(loaded.content))
+      : loaded.content;
   const parts: StorageFilePartRecord[] = [];
-  for (let offset = 0; offset < bytes.length;) {
+  let size = 0;
+  for await (const chunk of chunkStorageDraftStream(
+    source,
+    limits.maxChunkBytes,
+    loaded.text ?? true,
+    signal,
+  )) {
     signal.throwIfAborted();
-    let end = Math.min(bytes.length, offset + limits.maxChunkBytes);
-    while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--;
-    const chunk = bytes.subarray(offset, end);
     const body = await options.content.write(
       options.scope,
       storageBytesStream(chunk),
@@ -74,11 +76,16 @@ export async function stageStorageTextDraft<Scope, Receipt>(options: {
       body.size !== chunk.length ||
       body.sha256 !== createHash('sha256').update(chunk).digest('hex')
     )
-      throw new StorageError('Invalid text chunk receipt.', {
+      throw new StorageError('Invalid draft chunk receipt.', {
         code: 'PROVIDER',
       });
-    parts.push({ offset, size: body.size, sha256: body.sha256, body });
-    offset = end;
+    parts.push({ offset: size, size: body.size, sha256: body.sha256, body });
+    size += chunk.length;
+    if (!Number.isSafeInteger(size))
+      throw new StorageError(
+        'Draft size exceeds supported integer precision.',
+        { code: 'LIMIT_EXCEEDED' },
+      );
   }
   return transaction(async (tx) => {
     const concurrent = await replay(tx);
@@ -101,9 +108,9 @@ export async function stageStorageTextDraft<Scope, Receipt>(options: {
       path: loaded.path,
       expectedEtag: loaded.expectedEtag,
       sourceDraftId: loaded.source?.id ?? null,
-      text: true,
+      text: loaded.text ?? true,
       status: 'sealed',
-      size: bytes.length,
+      size,
       result: null,
       createdAt: new Date().toISOString(),
       idempotencyKey: options.idempotencyKey,

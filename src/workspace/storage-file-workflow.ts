@@ -1,4 +1,5 @@
-import { applyStorageTextEdit } from '../core/storage-text-edit.js';
+import { searchStorageText } from '../core/storage-text.js';
+import { editStorageTextStream } from '../core/storage-text-stream-edit.js';
 import { stageStorageTextDraft } from './storage-text-draft.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { StorageError } from '../storage.error.js';
@@ -112,6 +113,14 @@ export class StorageFileWorkflow<Scope, Receipt> {
           ),
         });
       },
+      lookup: async (input) => {
+        const signal = operation('read', input);
+        validateIdentity(input.idempotencyKey);
+        return transaction(signal, async (tx) => {
+          const draft = await tx.findDraftByKey(input.idempotencyKey);
+          return draft === null ? null : summary(draft);
+        });
+      },
       begin: async (input) => {
         const signal = operation('write', input);
         requireMutation(input.expectedEtag);
@@ -210,6 +219,75 @@ export class StorageFileWorkflow<Scope, Receipt> {
           }),
         );
       },
+      stageStream: async (request) => {
+        const input = { ...request };
+        if (input.sourceDraftId !== undefined) operation('read', input);
+        const signal = operation('write', input);
+        requireMutation(input.expectedEtag);
+        validateIdentity(input.idempotencyKey);
+        assertWorkspacePath(input.path, limits.maxPathBytes, {
+          allowRoot: false,
+        });
+        if (
+          typeof input.text !== 'boolean' ||
+          typeof input.contentIdentity !== 'string' ||
+          !input.contentIdentity.length ||
+          input.contentIdentity.length > 1024
+        )
+          invalid('Invalid streaming draft identity.');
+        if (
+          input.expectedEtag !== undefined &&
+          (!input.expectedEtag.length || input.expectedEtag.length > 1024)
+        )
+          invalid('Invalid ETag.');
+        return summary(
+          await stageStorageTextDraft({
+            scope,
+            signal,
+            limits,
+            content,
+            requireMutation,
+            transaction: (work) => transaction(signal, work),
+            idempotencyKey: input.idempotencyKey,
+            fingerprint: digest(
+              new TextEncoder().encode(
+                JSON.stringify([
+                  'stage-stream',
+                  input.path,
+                  input.expectedEtag ?? null,
+                  input.text,
+                  input.contentIdentity,
+                  input.sourceDraftId ?? null,
+                  input.expectedSize ?? null,
+                ]),
+              ),
+            ),
+            load: async () => {
+              const source =
+                input.sourceDraftId === undefined
+                  ? null
+                  : await transaction(signal, (tx) =>
+                      requireDraft(tx, input.sourceDraftId!),
+                    );
+              if (
+                source !== null &&
+                (source.path !== input.path ||
+                  source.expectedEtag !== (input.expectedEtag ?? null) ||
+                  source.size !== input.expectedSize ||
+                  !['open', 'sealed'].includes(source.status))
+              )
+                conflict('The source checkpoint changed.');
+              return {
+                path: input.path,
+                expectedEtag: input.expectedEtag ?? null,
+                source,
+                text: input.text,
+                content: input.body(),
+              };
+            },
+          }),
+        );
+      },
       reviseText: async (request) => {
         const input = {
           ...request,
@@ -219,12 +297,13 @@ export class StorageFileWorkflow<Scope, Receipt> {
         const signal = operation('write', input);
         validateIdentity(input.idempotencyKey);
         validateIdentity(input.draftId);
-        storageInteger(input.expectedSize, 'expectedSize');
         if (
-          input.expectedSize > limits.maxTextBytes ||
-          input.changes.length < 1 ||
-          input.changes.length > limits.maxEdits
+          input.requestIdentity !== undefined &&
+          input.requestIdentity.length > 4096
         )
+          invalid('Invalid edit request identity.');
+        storageInteger(input.expectedSize, 'expectedSize');
+        if (input.changes.length < 1 || input.changes.length > limits.maxEdits)
           throw new StorageError(
             'Text editing exceeds the configured limits.',
             { code: 'LIMIT_EXCEEDED' },
@@ -245,6 +324,9 @@ export class StorageFileWorkflow<Scope, Receipt> {
                   input.draftId,
                   input.expectedSize,
                   input.changes,
+                  ...(input.requestIdentity === undefined
+                    ? []
+                    : [input.requestIdentity]),
                 ]),
               ),
             ),
@@ -261,23 +343,18 @@ export class StorageFileWorkflow<Scope, Receipt> {
                 conflict(
                   'The source must be an unfinished text draft at the expected size.',
                 );
-              const bytes = await collectStorageBytes(
-                this.#stream(scope, source, limits, signal),
-                limits.maxTextBytes,
-                signal,
-              );
-              const original = new TextDecoder('utf-8', {
-                fatal: true,
-                ignoreBOM: true,
-              }).decode(bytes);
               return {
                 source,
                 path: source.path,
                 expectedEtag: source.expectedEtag,
-                content: applyStorageTextEdit(
-                  original,
-                  { kind: 'batch', changes: input.changes },
-                  { maxBytes: limits.maxTextBytes, maxEdits: limits.maxEdits },
+                content: editStorageTextStream(
+                  this.#stream(scope, source, limits, signal),
+                  input.changes,
+                  {
+                    maxEditBytes: limits.maxTextBytes,
+                    maxEdits: limits.maxEdits,
+                    signal,
+                  },
                 ),
               };
             },
@@ -330,6 +407,40 @@ export class StorageFileWorkflow<Scope, Receipt> {
             )
           : { content: null, offset, nextOffset: null };
         return { ...summary(draft), ...window };
+      },
+      searchText: async (input) => {
+        const signal = operation('read', input);
+        const draft = await transaction(signal, (tx) =>
+          requireDraft(tx, input.draftId),
+        );
+        if (
+          !draft.text ||
+          draft.status === 'cancelled' ||
+          draft.size !== input.expectedSize
+        )
+          conflict('The source checkpoint changed.');
+        const result = await searchStorageText(
+          async (range) =>
+            this.#stream(
+              scope,
+              draft,
+              limits,
+              signal,
+              range.start,
+              range.end + 1,
+            ),
+          {
+            size: draft.size,
+            query: input.query,
+            offset: input.offset,
+            maxScanBytes: 262144,
+            maxMatches: 12,
+            maxSnippetCharacters: 320,
+            maxReadBytes: limits.maxReadBytes,
+            signal,
+          },
+        );
+        return { ...result, path: draft.path, etag: draft.id };
       },
       readText: async (request) => {
         const input = { ...request };

@@ -115,6 +115,8 @@ export function protectStorageFileWorkflowWorkspace<Receipt>(
       (permission === 'read'
         ? workspace.allows('read')
         : workspace.allows('create') || workspace.allows('replace')),
+    lookup: (input) =>
+      workflowRead(input, (signal) => workflows.lookup({ ...input, signal })),
     begin: (input) => {
       const snapshot = { ...input };
       requireMutation(snapshot.expectedEtag);
@@ -128,6 +130,17 @@ export function protectStorageFileWorkflowWorkspace<Receipt>(
       return workflowWrite('write', snapshot, (signal) =>
         workflows.stageText({ ...snapshot, signal }),
       );
+    },
+    stageStream: (input) => {
+      const snapshot = { ...input };
+      requireMutation(snapshot.expectedEtag);
+      const write = () =>
+        workflowWrite('write', snapshot, (signal) =>
+          workflows.stageStream({ ...snapshot, signal }),
+        );
+      return snapshot.sourceDraftId === undefined
+        ? write()
+        : workflowRead(snapshot, write);
     },
     reviseText: (input) => {
       requireBase('read');
@@ -145,6 +158,10 @@ export function protectStorageFileWorkflowWorkspace<Receipt>(
       workflowRead(input, (signal) => workflows.list({ ...input, signal })),
     read: (input) =>
       workflowRead(input, (signal) => workflows.read({ ...input, signal })),
+    searchText: (input) =>
+      workflowRead(input, (signal) =>
+        workflows.searchText({ ...input, signal }),
+      ),
     readText: (input) =>
       workflowRead(input, (signal) => workflows.readText({ ...input, signal })),
     parts: (input) =>
