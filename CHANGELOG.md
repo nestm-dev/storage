@@ -1,5 +1,11 @@
 # @nestm/storage
 
+## 0.1.0-alpha.18
+
+### Minor Changes
+
+- 1e39e8c: Add durable path-based working files and AI file tools, streamed exact text editing and catalog checkout, and replay-safe streaming checkpoints. Preserve saved heads until host admission and commit, bound discovery and edit context, and upgrade Files SDK to 2.4.1 with native NestJS 12 and AI SDK 7 peer support.
+
 ## 0.1.0-alpha.17
 
 ### Patch Changes
