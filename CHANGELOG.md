@@ -1,5 +1,11 @@
 # @nestm/storage
 
+## 0.1.0-alpha.19
+
+### Patch Changes
+
+- 6402887: Add protected revision-pinned host streams for file catalogs and checkpoints. Apply saved-file edits directly from one stream into an atomic candidate, avoiding intermediate checkouts and repeated small range reads.
+
 ## 0.1.0-alpha.18
 
 ### Minor Changes
