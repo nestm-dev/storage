@@ -47,7 +47,8 @@ export interface StorageFileDraftStageStream extends StorageFileDraftBegin {
   /** Stable trusted source identity used to detect conflicting command replay. */
   readonly contentIdentity: string;
   /** Open only after authorization and replay lookup; bytes are never exposed to the model. */
-  readonly body: () => ReadableStream<Uint8Array>;
+  readonly body: () =>
+    ReadableStream<Uint8Array> | Promise<ReadableStream<Uint8Array>>;
   readonly sourceDraftId?: string | undefined;
   readonly expectedSize?: number | undefined;
 }
@@ -201,6 +202,16 @@ export interface StorageFileWorkflowCapability<Receipt = unknown> {
   read(
     input: StorageFileDraftRequest & StorageFileDraftPageRequest,
   ): Promise<StorageFileDraft<Receipt> & StorageTextWindow>;
+  /** Host-only stream of an exact checkpoint; end is exclusive. */
+  readStream(
+    input: StorageFileDraftRequest & {
+      readonly expectedSize: number;
+      readonly start?: number | undefined;
+      readonly end?: number | undefined;
+    },
+  ): Promise<
+    StorageFileDraft<Receipt> & { readonly body: ReadableStream<Uint8Array> }
+  >;
   searchText(
     input: StorageFileDraftRequest &
       StorageFileDraftPageRequest & {

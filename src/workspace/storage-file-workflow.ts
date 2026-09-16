@@ -282,7 +282,7 @@ export class StorageFileWorkflow<Scope, Receipt> {
                 expectedEtag: input.expectedEtag ?? null,
                 source,
                 text: input.text,
-                content: input.body(),
+                content: await input.body(),
               };
             },
           }),
@@ -377,6 +377,23 @@ export class StorageFileWorkflow<Scope, Receipt> {
                 : null,
           };
         });
+      },
+      readStream: async (input) => {
+        const signal = operation('read', input);
+        const draft = await transaction(signal, (tx) =>
+          requireDraft(tx, input.draftId),
+        );
+        if (draft.status === 'cancelled' || draft.size !== input.expectedSize)
+          conflict('The source checkpoint changed.');
+        const start = input.start ?? 0;
+        const end = input.end ?? draft.size;
+        storageInteger(start, 'start');
+        storageInteger(end, 'end');
+        if (start > end || end > draft.size) invalid('Invalid stream range.');
+        return {
+          ...summary(draft),
+          body: this.#stream(scope, draft, limits, signal, start, end),
+        };
       },
       read: async (input) => {
         const signal = operation('read', input);

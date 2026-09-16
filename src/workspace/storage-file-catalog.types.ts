@@ -56,6 +56,16 @@ export interface StorageFileCatalogCapability<Receipt = unknown> {
       readonly totalBytes: number;
     }
   >;
+  /** Host-only bytes pinned to expectedEtag; end is exclusive. Never project as a model tool. */
+  readStream(
+    input: StorageCatalogPath & {
+      readonly expectedEtag: string;
+      readonly start?: number | undefined;
+      readonly end?: number | undefined;
+    },
+  ): Promise<
+    StorageCatalogFile & { readonly body: ReadableStream<Uint8Array> }
+  >;
   searchContent(
     input: StorageCatalogPath &
       StorageCatalogPage & {

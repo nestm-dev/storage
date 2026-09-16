@@ -54,6 +54,24 @@ function setup() {
       };
     },
     search: async (input) => files.list(input),
+    readStream: async (input) => {
+      const file = await files.stat(input);
+      const head = persistence.state.heads[`scope/${input.path}`]!;
+      return {
+        ...file,
+        body: await content.read('scope', head.body, {
+          signal: input.signal,
+          ...(input.start === undefined
+            ? {}
+            : {
+                range: {
+                  start: input.start,
+                  end: (input.end ?? file.size) - 1,
+                },
+              }),
+        }),
+      };
+    },
     readWindow: async (input) => {
       const file = await files.stat(input);
       const head = persistence.state.heads[`scope/${input.path}`]!;
@@ -230,4 +248,47 @@ it('streams a file far above the buffered text limit and atomically rejects a fa
     drafts: [{ draftId: changed.id, size: changed.size }],
   });
   expect(saved!.size).toBe(changed.size);
+});
+
+it('edits a saved file with one pinned stream, no windows or checkout, and replays after commit', async () => {
+  const { working, files, workflow, persistence } = setup();
+  const created = await working.catalog.write({
+    path: 'stream.txt',
+    commandId: 'create',
+    content: 'before 😀',
+  });
+  const [saved] = await workflow.commit({
+    drafts: [{ draftId: created.etag, size: created.size }],
+  });
+  const windows = vi.spyOn(files, 'readWindow');
+  const streams = vi.spyOn(files, 'readStream');
+  const request = {
+    path: 'stream.txt',
+    expectedEtag: saved!.etag,
+    commandId: 'replace',
+    change: { kind: 'replace' as const, oldText: 'before', newText: 'after' },
+  };
+  const result = await working.catalog.edit(request);
+  expect(streams).toHaveBeenCalledTimes(1);
+  expect(windows).not.toHaveBeenCalled();
+  expect(Object.values(persistence.state.drafts)).toHaveLength(2);
+  expect(
+    (
+      await workflow.readText({
+        draftId: result.etag,
+        expectedSize: result.size,
+      })
+    ).content,
+  ).toBe('after 😀');
+  const [committed] = await workflow.commit({
+    drafts: [{ draftId: result.etag, size: result.size }],
+  });
+  expect(await working.catalog.edit(request)).toEqual(committed);
+  expect(streams).toHaveBeenCalledTimes(1);
+  await expect(
+    working.catalog.edit({
+      ...request,
+      change: { ...request.change, newText: 'different' },
+    }),
+  ).rejects.toMatchObject({ code: 'CONFLICT' });
 });
