@@ -10,7 +10,7 @@ importers:
     dependencies:
       files-sdk:
         specifier: 2.4.1
-        version: 2.4.1(@aws-sdk/client-s3@3.1120.0)(@aws-sdk/lib-storage@3.1120.0(@aws-sdk/client-s3@3.1120.0))(@aws-sdk/s3-presigned-post@3.1120.0)(@aws-sdk/s3-request-presigner@3.1120.0)(@azure/core-auth@1.11.0(supports-color@7.2.0))(@azure/identity@4.13.2(supports-color@7.2.0))(@azure/storage-blob@12.33.0(supports-color@7.2.0))(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.83(zod@4.4.3))(fastify@5.12.1)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3)
+        version: 2.4.1(@aws-sdk/client-s3@3.1120.0)(@aws-sdk/lib-storage@3.1120.0(@aws-sdk/client-s3@3.1120.0))(@aws-sdk/s3-presigned-post@3.1120.0)(@aws-sdk/s3-request-presigner@3.1120.0)(@azure/core-auth@1.11.0(supports-color@7.2.0))(@azure/identity@4.13.2(supports-color@7.2.0))(@azure/storage-blob@12.33.0(supports-color@7.2.0))(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.83(zod@4.6.2))(fastify@5.12.1)(hono@4.13.0)(supports-color@7.2.0)(zod@4.6.2)
     devDependencies:
       '@aws-sdk/client-s3':
         specifier: 3.1120.0
@@ -65,7 +65,7 @@ importers:
         version: 4.1.11(vitest@4.1.11)
       ai:
         specifier: 7.0.83
-        version: 7.0.83(zod@4.4.3)
+        version: 7.0.83(zod@4.6.2)
       fastify:
         specifier: 5.12.1
         version: 5.12.1
@@ -94,8 +94,8 @@ importers:
         specifier: 4.1.11
         version: 4.1.11(@types/node@26.4.0)(@vitest/coverage-v8@4.1.11)(vite@8.1.5(@types/node@26.4.0)(yaml@2.9.0))
       zod:
-        specifier: 4.4.3
-        version: 4.4.3
+        specifier: 4.6.2
+        version: 4.6.2
 
 packages:
 
@@ -2358,26 +2358,26 @@ packages:
     peerDependencies:
       zod: ^3.25.28 || ^4
 
-  zod@4.4.3:
-    resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
+  zod@4.6.2:
+    resolution: {integrity: sha512-lh5RCAGFa1Cm2hjtNwLQhSs/AsqdWnTQaBER9fEwN/88pSh7KOtJavtBx/0VlkN/uFd61SwYmljLMDAsHlvzBQ==}
 
 snapshots:
 
-  '@ai-sdk/gateway@4.0.67(zod@4.4.3)':
+  '@ai-sdk/gateway@4.0.67(zod@4.6.2)':
     dependencies:
       '@ai-sdk/provider': 4.0.8
-      '@ai-sdk/provider-utils': 5.0.32(zod@4.4.3)
+      '@ai-sdk/provider-utils': 5.0.32(zod@4.6.2)
       '@vercel/oidc': 3.2.0
-      zod: 4.4.3
+      zod: 4.6.2
 
-  '@ai-sdk/provider-utils@5.0.32(zod@4.4.3)':
+  '@ai-sdk/provider-utils@5.0.32(zod@4.6.2)':
     dependencies:
       '@ai-sdk/provider': 4.0.8
       '@standard-schema/spec': 1.1.0
       '@workflow/serde': 4.1.0
       eventsource-parser: 3.1.0
       undici: 7.29.0
-      zod: 4.4.3
+      zod: 4.6.2
 
   '@ai-sdk/provider@4.0.8':
     dependencies:
@@ -2935,7 +2935,7 @@ snapshots:
       tinyglobby: 0.2.17
       yaml: 2.9.0
 
-  '@modelcontextprotocol/sdk@1.30.0(supports-color@7.2.0)(zod@4.4.3)':
+  '@modelcontextprotocol/sdk@1.30.0(supports-color@7.2.0)(zod@4.6.2)':
     dependencies:
       '@hono/node-server': 2.1.0(hono@4.13.0)
       ajv: 8.20.0
@@ -2952,8 +2952,8 @@ snapshots:
       json-schema-typed: 8.0.2
       pkce-challenge: 5.0.1
       raw-body: 3.0.2
-      zod: 4.4.3
-      zod-to-json-schema: 3.25.2(zod@4.4.3)
+      zod: 4.6.2
+      zod-to-json-schema: 3.25.2(zod@4.6.2)
     transitivePeerDependencies:
       - supports-color
     optional: true
@@ -3378,12 +3378,12 @@ snapshots:
 
   agent-base@7.1.4: {}
 
-  ai@7.0.83(zod@4.4.3):
+  ai@7.0.83(zod@4.6.2):
     dependencies:
-      '@ai-sdk/gateway': 4.0.67(zod@4.4.3)
+      '@ai-sdk/gateway': 4.0.67(zod@4.6.2)
       '@ai-sdk/provider': 4.0.8
-      '@ai-sdk/provider-utils': 5.0.32(zod@4.4.3)
-      zod: 4.4.3
+      '@ai-sdk/provider-utils': 5.0.32(zod@4.6.2)
+      zod: 4.6.2
 
   ajv-formats@3.0.1(ajv@8.20.0):
     optionalDependencies:
@@ -3706,9 +3706,9 @@ snapshots:
     dependencies:
       reusify: 1.1.0
 
-  fdir@6.5.0(picomatch@4.0.5):
+  fdir@6.5.0(picomatch@4.0.7):
     optionalDependencies:
-      picomatch: 4.0.5
+      picomatch: 4.0.7
 
   fflate@0.8.3: {}
 
@@ -3721,7 +3721,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  files-sdk@2.4.1(@aws-sdk/client-s3@3.1120.0)(@aws-sdk/lib-storage@3.1120.0(@aws-sdk/client-s3@3.1120.0))(@aws-sdk/s3-presigned-post@3.1120.0)(@aws-sdk/s3-request-presigner@3.1120.0)(@azure/core-auth@1.11.0(supports-color@7.2.0))(@azure/identity@4.13.2(supports-color@7.2.0))(@azure/storage-blob@12.33.0(supports-color@7.2.0))(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.83(zod@4.4.3))(fastify@5.12.1)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3):
+  files-sdk@2.4.1(@aws-sdk/client-s3@3.1120.0)(@aws-sdk/lib-storage@3.1120.0(@aws-sdk/client-s3@3.1120.0))(@aws-sdk/s3-presigned-post@3.1120.0)(@aws-sdk/s3-request-presigner@3.1120.0)(@azure/core-auth@1.11.0(supports-color@7.2.0))(@azure/identity@4.13.2(supports-color@7.2.0))(@azure/storage-blob@12.33.0(supports-color@7.2.0))(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.83(zod@4.6.2))(fastify@5.12.1)(hono@4.13.0)(supports-color@7.2.0)(zod@4.6.2):
     dependencies:
       aws4fetch: 1.0.20
       commander: 15.0.0
@@ -3738,12 +3738,12 @@ snapshots:
       '@azure/core-auth': 1.11.0(supports-color@7.2.0)
       '@azure/identity': 4.13.2(supports-color@7.2.0)
       '@azure/storage-blob': 12.33.0(supports-color@7.2.0)
-      '@modelcontextprotocol/sdk': 1.30.0(supports-color@7.2.0)(zod@4.4.3)
+      '@modelcontextprotocol/sdk': 1.30.0(supports-color@7.2.0)(zod@4.6.2)
       '@nestjs/common': 12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0)
-      ai: 7.0.83(zod@4.4.3)
+      ai: 7.0.83(zod@4.6.2)
       fastify: 5.12.1
       hono: 4.13.0
-      zod: 4.4.3
+      zod: 4.6.2
     transitivePeerDependencies:
       - '@cfworker/json-schema'
       - supports-color
@@ -4423,8 +4423,8 @@ snapshots:
 
   tinyglobby@0.2.17:
     dependencies:
-      fdir: 6.5.0(picomatch@4.0.5)
-      picomatch: 4.0.5
+      fdir: 6.5.0(picomatch@4.0.7)
+      picomatch: 4.0.7
 
   tinyrainbow@3.1.1: {}
 
@@ -4495,7 +4495,7 @@ snapshots:
   vite@8.1.5(@types/node@26.4.0)(yaml@2.9.0):
     dependencies:
       lightningcss: 1.33.0
-      picomatch: 4.0.5
+      picomatch: 4.0.7
       postcss: 8.5.25
       rolldown: 1.1.5
       tinyglobby: 0.2.17
@@ -4552,9 +4552,9 @@ snapshots:
 
   yaml@2.9.0: {}
 
-  zod-to-json-schema@3.25.2(zod@4.4.3):
+  zod-to-json-schema@3.25.2(zod@4.6.2):
     dependencies:
-      zod: 4.4.3
+      zod: 4.6.2
     optional: true
 
-  zod@4.4.3: {}
+  zod@4.6.2: {}
