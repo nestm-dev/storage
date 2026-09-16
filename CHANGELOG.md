@@ -1,5 +1,11 @@
 # @nestm/storage
 
+## 0.1.0-alpha.20
+
+### Patch Changes
+
+- 7e9cd04: Preserve separate timeout and cancellation categories across workspace and working-file AI tool error wrappers without exposing provider details.
+
 ## 0.1.0-alpha.19
 
 ### Patch Changes
