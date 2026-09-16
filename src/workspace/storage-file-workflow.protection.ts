@@ -162,6 +162,10 @@ export function protectStorageFileWorkflowWorkspace<Receipt>(
       workflowRead(input, (signal) =>
         workflows.searchText({ ...input, signal }),
       ),
+    readStream: (input) =>
+      workflowRead(input, (signal) =>
+        workflows.readStream({ ...input, signal }),
+      ),
     readText: (input) =>
       workflowRead(input, (signal) => workflows.readText({ ...input, signal })),
     parts: (input) =>
@@ -267,6 +271,45 @@ export function protectStorageFileWorkflowWorkspace<Receipt>(
             limits.maxReadBytes,
           );
           return page;
+        }),
+      readStream: (input) =>
+        catalogRun('read', input, async (signal) => {
+          const result = await catalog.readStream({ ...input, signal });
+          const reader = result.body.getReader();
+          return {
+            ...result,
+            body: new ReadableStream<Uint8Array>(
+              {
+                async pull(controller) {
+                  try {
+                    const part = await catalogRun(
+                      'read',
+                      { signal },
+                      async (current) => {
+                        current.throwIfAborted();
+                        const part = await reader.read();
+                        current.throwIfAborted();
+                        return part;
+                      },
+                    );
+                    if (part.done) {
+                      reader.releaseLock();
+                      controller.close();
+                    } else controller.enqueue(part.value);
+                  } catch (error) {
+                    await reader.cancel(error).catch(() => {});
+                    reader.releaseLock();
+                    controller.error(error);
+                  }
+                },
+                async cancel(reason) {
+                  await reader.cancel(reason);
+                  reader.releaseLock();
+                },
+              },
+              { highWaterMark: 0 },
+            ),
+          };
         }),
       searchContent: (input) => {
         requireBase('search');

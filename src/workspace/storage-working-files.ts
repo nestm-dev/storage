@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { StorageError, isStorageError } from '../storage.error.js';
 import { storageBytesStream, storageInteger } from '../core/storage-streams.js';
-import { checkoutStorageCatalogText } from './storage-catalog-checkout.js';
+import { editStorageTextStream } from '../core/storage-text-stream-edit.js';
 import type {
   StorageFileCatalogCapability,
   StorageCatalogFile,
@@ -63,6 +63,19 @@ export class StorageWorkingFiles<Receipt extends StorageWorkingFileReceipt> {
           totalBytes: page.size,
         };
       },
+      readStream: async (input) => {
+        const draft = await this.draft(input);
+        if (!draft || draft.status === 'committed')
+          return files.readStream(this.saved(input, draft));
+        const stream = await workflow.readStream({
+          draftId: draft.id,
+          expectedSize: draft.size,
+          start: input.start,
+          end: input.end,
+          signal: input.signal,
+        });
+        return { ...this.receipt(draft), body: stream.body };
+      },
       searchContent: async (input) => {
         const draft = await this.draft(input);
         if (!draft || draft.status === 'committed')
@@ -93,17 +106,41 @@ export class StorageWorkingFiles<Receipt extends StorageWorkingFileReceipt> {
           idempotencyKey: input.commandId,
           signal: input.signal,
         });
-        let source: StorageFileDraft<Receipt> | null = prior?.sourceDraftId
+        const source: StorageFileDraft<Receipt> | null = prior?.sourceDraftId
           ? await workflow.read({
               draftId: prior.sourceDraftId,
               signal: input.signal,
             })
           : await this.draft(input);
-        if (!source || (!prior && source.status === 'committed'))
-          source = await checkoutStorageCatalogText(files, workflow, {
-            ...this.saved(input, source),
-            commandId: `checkout:${input.commandId}`,
+        if (!source || (!prior && source.status === 'committed')) {
+          const saved = this.saved(input, source);
+          const result = await workflow.stageStream({
+            path: input.path,
+            expectedEtag: saved.expectedEtag,
+            text: true,
+            signal: input.signal,
+            idempotencyKey: input.commandId,
+            contentIdentity: createHash('sha256')
+              .update(
+                JSON.stringify([
+                  'catalog-edit',
+                  input.path,
+                  input.expectedEtag,
+                  changes,
+                ]),
+              )
+              .digest('hex'),
+            body: async () => {
+              const stream = await files.readStream(saved);
+              return editStorageTextStream(stream.body, changes, {
+                maxEditBytes: files.limits.maxWriteBytes,
+                maxEdits: workflow.limits.maxEdits,
+                ...(input.signal ? { signal: input.signal } : {}),
+              });
+            },
           });
+          return this.result(result);
+        }
         const result = await workflow.reviseText({
           draftId: source.id,
           expectedSize: source.size,

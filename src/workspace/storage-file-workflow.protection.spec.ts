@@ -62,6 +62,18 @@ function setup(
     list: async () => ({ items: [file], nextOffset: null }),
     stat: async () => file,
     search: async () => ({ items: [file], nextOffset: null }),
+    readStream: async () => ({
+      ...file,
+      body: new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            controller.enqueue(new Uint8Array([97]));
+            controller.close();
+          },
+        },
+        { highWaterMark: 0 },
+      ),
+    }),
     readWindow: async () => ({
       ...file,
       content: 'a',
@@ -425,4 +437,16 @@ it('bounds aggregate batch input and protects catalog batch dispatch', async () 
     .restrict({ limits: { maxTextBytes: 2, maxEdits: 1 } })
     .restrict({ limits: { maxTextBytes: 100, maxEdits: 10 } });
   expect(narrowed.limits).toMatchObject({ maxTextBytes: 2, maxEdits: 1 });
+});
+
+it('reauthorizes host stream reads after opening and propagates revocation', async () => {
+  const { workspace, revoke } = setup();
+  const opened = await workspace.catalog!.readStream({
+    path: 'file.txt',
+    expectedEtag: 'etag',
+  });
+  const reader = opened.body.getReader();
+  expect((await reader.read()).value).toEqual(new Uint8Array([97]));
+  revoke();
+  await expect(reader.read()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
 });

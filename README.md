@@ -1352,3 +1352,15 @@ MIT
 The host authorizes reads, serializes metadata, enforces key policy and atomically proves reference eligibility before `metadata.discard` removes anything. A missing upload receipt means completion is uncertain: keep prepared cleanup inventory for a later sweep. A rejected prepare does not authorize cleanup of another writer's reservation. Engine shutdown stays with its owner. See [the standalone archive consumer](scripts/fixtures/encrypted-content-consumer.ts).
 
 `StorageStagedContentStore.writeReserved(scope, payloadId, stream, options)` accepts a fresh UUID from a trusted caller. It retains create-only semantics and returns that exact identity in the receipt; it never overwrites an existing payload. Ordinary writers continue to use `write`.
+
+### Revision-pinned host streams
+
+Catalog `readStream({ path, expectedEtag, start?, end?, signal? })` and workflow
+`readStream({ draftId, expectedSize, start?, end?, signal? })` return metadata and
+a byte stream. Ranges use an inclusive start and exclusive end. These host-only
+operations retain read authorization and linked cancellation; they are never
+projected as unbounded model tools. Catalog hosts must pin immutable content to
+the requested revision and reject stale heads. Saved-file working edits consume
+one stream directly into an atomic candidate without creating a checkout first.
+`stageStream.body` may asynchronously open its source after authorization and
+replay validation.
