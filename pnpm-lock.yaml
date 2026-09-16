@@ -10,7 +10,7 @@ importers:
     dependencies:
       files-sdk:
         specifier: 2.4.1
-        version: 2.4.1(@aws-sdk/client-s3@3.1120.0)(@aws-sdk/lib-storage@3.1120.0(@aws-sdk/client-s3@3.1120.0))(@aws-sdk/s3-presigned-post@3.1120.0)(@aws-sdk/s3-request-presigner@3.1120.0)(@azure/core-auth@1.11.0(supports-color@7.2.0))(@azure/identity@4.13.2(supports-color@7.2.0))(@azure/storage-blob@12.33.0(supports-color@7.2.0))(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.83(zod@4.4.3))(fastify@5.12.1)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3)
+        version: 2.4.1(@aws-sdk/client-s3@3.1120.0)(@aws-sdk/lib-storage@3.1120.0(@aws-sdk/client-s3@3.1120.0))(@aws-sdk/s3-presigned-post@3.1120.0)(@aws-sdk/s3-request-presigner@3.1131.0)(@azure/core-auth@1.11.0(supports-color@7.2.0))(@azure/identity@4.13.2(supports-color@7.2.0))(@azure/storage-blob@12.33.0(supports-color@7.2.0))(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.83(zod@4.4.3))(fastify@5.12.1)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3)
     devDependencies:
       '@aws-sdk/client-s3':
         specifier: 3.1120.0
@@ -22,8 +22,8 @@ importers:
         specifier: 3.1120.0
         version: 3.1120.0
       '@aws-sdk/s3-request-presigner':
-        specifier: 3.1120.0
-        version: 3.1120.0
+        specifier: 3.1131.0
+        version: 3.1131.0
       '@azure/core-auth':
         specifier: 1.11.0
         version: 1.11.0(supports-color@7.2.0)
@@ -127,6 +127,10 @@ packages:
     resolution: {integrity: sha512-reqPFEQrZxDZpeGj4PFMepBeR5LGYHRqq/L0motTzgFkCRBA4rFdaVXDSLYyGHhxVz7sT2PDnPN9CluGSfgyJA==}
     engines: {node: '>=20.0.0'}
 
+  '@aws-sdk/core@3.978.0':
+    resolution: {integrity: sha512-2yX9LUmxPklVjSGTb8dfnWRJSiFQ3TeH2nn7G1mdKHTfnabzF0+gfrS8rYfLWmZrQ8A3mEcxMJjRc51dL5KWaA==}
+    engines: {node: '>=20.0.0'}
+
   '@aws-sdk/credential-provider-env@3.972.70':
     resolution: {integrity: sha512-H404B7dJl2mCrBqahDEYsanB0xhdDp6tXnXcTUnXmmpy2Q3J0Ho0bUajZ2jr/RdwzCyS59Gi8xXIFwPLGBl6Uw==}
     engines: {node: '>=20.0.0'}
@@ -177,8 +181,8 @@ packages:
     resolution: {integrity: sha512-XscUlDxgDVI/EnkrutpyVUo0CpSXDcUQs/CWWbkcHwbTBlFIRRL9mRwTZYuN2MvxiiMuH2YlNXZGStZhE8HuvQ==}
     engines: {node: '>=20.0.0'}
 
-  '@aws-sdk/s3-request-presigner@3.1120.0':
-    resolution: {integrity: sha512-KDPKX7uFulSb6AmWloSQRmHOm1ad5c9+W76ljxDmL4rndCYX4mBDdHwdWXIVNaLn6gXrm7G/3CQyiEdPe69lwQ==}
+  '@aws-sdk/s3-request-presigner@3.1131.0':
+    resolution: {integrity: sha512-n22qXGWwWmngjM0LVY6RU6KkZ29W5BbD6FfwLSBYHTWqXX/bK/2RIFXSCBS9J8b1D+mtcylB9kiYZadb61rEFw==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/signature-v4-multi-region@3.996.46':
@@ -2416,6 +2420,17 @@ snapshots:
       bowser: 2.14.1
       tslib: 2.8.1
 
+  '@aws-sdk/core@3.978.0':
+    dependencies:
+      '@aws-sdk/types': 3.974.5
+      '@aws-sdk/xml-builder': 3.972.40
+      '@aws/lambda-invoke-store': 0.3.0
+      '@smithy/core': 3.33.3
+      '@smithy/signature-v4': 5.6.12
+      '@smithy/types': 4.17.2
+      bowser: 2.14.1
+      tslib: 2.8.1
+
   '@aws-sdk/credential-provider-env@3.972.70':
     dependencies:
       '@aws-sdk/core': 3.977.9
@@ -2540,9 +2555,9 @@ snapshots:
       '@smithy/types': 4.17.2
       tslib: 2.8.1
 
-  '@aws-sdk/s3-request-presigner@3.1120.0':
+  '@aws-sdk/s3-request-presigner@3.1131.0':
     dependencies:
-      '@aws-sdk/core': 3.977.9
+      '@aws-sdk/core': 3.978.0
       '@aws-sdk/signature-v4-multi-region': 3.996.46
       '@aws-sdk/types': 3.974.5
       '@smithy/core': 3.33.3
@@ -3706,9 +3721,9 @@ snapshots:
     dependencies:
       reusify: 1.1.0
 
-  fdir@6.5.0(picomatch@4.0.5):
+  fdir@6.5.0(picomatch@4.0.7):
     optionalDependencies:
-      picomatch: 4.0.5
+      picomatch: 4.0.7
 
   fflate@0.8.3: {}
 
@@ -3721,7 +3736,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  files-sdk@2.4.1(@aws-sdk/client-s3@3.1120.0)(@aws-sdk/lib-storage@3.1120.0(@aws-sdk/client-s3@3.1120.0))(@aws-sdk/s3-presigned-post@3.1120.0)(@aws-sdk/s3-request-presigner@3.1120.0)(@azure/core-auth@1.11.0(supports-color@7.2.0))(@azure/identity@4.13.2(supports-color@7.2.0))(@azure/storage-blob@12.33.0(supports-color@7.2.0))(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.83(zod@4.4.3))(fastify@5.12.1)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3):
+  files-sdk@2.4.1(@aws-sdk/client-s3@3.1120.0)(@aws-sdk/lib-storage@3.1120.0(@aws-sdk/client-s3@3.1120.0))(@aws-sdk/s3-presigned-post@3.1120.0)(@aws-sdk/s3-request-presigner@3.1131.0)(@azure/core-auth@1.11.0(supports-color@7.2.0))(@azure/identity@4.13.2(supports-color@7.2.0))(@azure/storage-blob@12.33.0(supports-color@7.2.0))(@nestjs/common@12.0.1(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@7.2.0))(ai@7.0.83(zod@4.4.3))(fastify@5.12.1)(hono@4.13.0)(supports-color@7.2.0)(zod@4.4.3):
     dependencies:
       aws4fetch: 1.0.20
       commander: 15.0.0
@@ -3734,7 +3749,7 @@ snapshots:
       '@aws-sdk/client-s3': 3.1120.0
       '@aws-sdk/lib-storage': 3.1120.0(@aws-sdk/client-s3@3.1120.0)
       '@aws-sdk/s3-presigned-post': 3.1120.0
-      '@aws-sdk/s3-request-presigner': 3.1120.0
+      '@aws-sdk/s3-request-presigner': 3.1131.0
       '@azure/core-auth': 1.11.0(supports-color@7.2.0)
       '@azure/identity': 4.13.2(supports-color@7.2.0)
       '@azure/storage-blob': 12.33.0(supports-color@7.2.0)
@@ -4423,8 +4438,8 @@ snapshots:
 
   tinyglobby@0.2.17:
     dependencies:
-      fdir: 6.5.0(picomatch@4.0.5)
-      picomatch: 4.0.5
+      fdir: 6.5.0(picomatch@4.0.7)
+      picomatch: 4.0.7
 
   tinyrainbow@3.1.1: {}
 
@@ -4495,7 +4510,7 @@ snapshots:
   vite@8.1.5(@types/node@26.4.0)(yaml@2.9.0):
     dependencies:
       lightningcss: 1.33.0
-      picomatch: 4.0.5
+      picomatch: 4.0.7
       postcss: 8.5.25
       rolldown: 1.1.5
       tinyglobby: 0.2.17
