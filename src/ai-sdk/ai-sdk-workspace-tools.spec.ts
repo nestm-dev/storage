@@ -1062,6 +1062,36 @@ describe('createAiSdkWorkspaceTools', () => {
     });
   });
 
+  it('distinguishes a deadline from user cancellation without leaking its reason', async () => {
+    const fixture = createWorkspaceDouble(['read']);
+    fixture.stat.mockRejectedValueOnce(new Error('private provider failure'));
+    const tools = createAiSdkWorkspaceTools({ workspace: fixture.workspace });
+    const controller = new AbortController();
+    controller.abort(
+      new DOMException('private timeout context', 'TimeoutError'),
+    );
+    await expect(
+      executeTool(
+        tools,
+        'workspace_stat',
+        { path: 'file.txt' },
+        controller.signal,
+      ),
+    ).rejects.toMatchObject({
+      code: StorageErrorCode.TIMEOUT,
+      message: 'The workspace operation timed out.',
+    });
+    fixture.stat.mockRejectedValueOnce(
+      new DOMException('private provider deadline', 'TimeoutError'),
+    );
+    await expect(
+      executeTool(tools, 'workspace_stat', { path: 'file.txt' }),
+    ).rejects.toMatchObject({
+      code: StorageErrorCode.TIMEOUT,
+      message: 'The workspace operation timed out.',
+    });
+  });
+
   it('rejects invalid factory read limits before creating tools', () => {
     const fixture = createWorkspaceDouble(['read']);
 
