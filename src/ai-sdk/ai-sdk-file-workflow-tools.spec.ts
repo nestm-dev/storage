@@ -25,6 +25,28 @@ function setup(maxChunkBytes: number) {
 }
 
 describe('model-visible durable file contracts', () => {
+  it.each(['TimeoutError', 'AbortError'])(
+    'preserves %s for interrupted workflow tools',
+    async (name) => {
+      const controller = new AbortController();
+      controller.abort(new DOMException('private source detail', name));
+      const tool = setup(32768).workspace_begin_file_draft!;
+      await expect(
+        tool.execute!(
+          { path: 'file.txt', text: true },
+          {
+            toolCallId: 'cancelled',
+            messages: [],
+            context: undefined,
+            abortSignal: controller.signal,
+          },
+        ),
+      ).rejects.toMatchObject({
+        code: name === 'TimeoutError' ? 'TIMEOUT' : 'ABORTED',
+      });
+    },
+  );
+
   it('exports portable object alternatives without accepting malformed edit items', () => {
     for (const schema of [
       setup(32768).workspace_edit_file_draft!.inputSchema,

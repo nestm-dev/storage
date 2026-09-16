@@ -320,7 +320,9 @@ function sanitizeToolError(
       : {};
   if (signal?.aborted === true) {
     return new AiSdkWorkspaceToolError(
-      StorageErrorCode.ABORTED,
+      signal.reason instanceof Error && signal.reason.name === 'TimeoutError'
+        ? StorageErrorCode.TIMEOUT
+        : StorageErrorCode.ABORTED,
       reconciliation,
     );
   }
@@ -330,6 +332,16 @@ function sanitizeToolError(
   if (isStorageError(error)) {
     return new AiSdkWorkspaceToolError(error.code, reconciliation);
   }
+  if (error instanceof Error && error.name === 'TimeoutError')
+    return new AiSdkWorkspaceToolError(
+      StorageErrorCode.TIMEOUT,
+      reconciliation,
+    );
+  if (error instanceof Error && error.name === 'AbortError')
+    return new AiSdkWorkspaceToolError(
+      StorageErrorCode.ABORTED,
+      reconciliation,
+    );
   return new AiSdkWorkspaceToolError(StorageErrorCode.PROVIDER);
 }
 

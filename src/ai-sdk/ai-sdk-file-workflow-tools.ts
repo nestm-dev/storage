@@ -89,7 +89,9 @@ async function safe<Result>(work: () => Promise<Result>) {
           ? {}
           : { appliedEtag: error.appliedEtag }),
       });
-    if (error instanceof DOMException && error.name === 'AbortError')
+    if (error instanceof Error && error.name === 'TimeoutError')
+      throw new AiSdkWorkspaceToolError('TIMEOUT');
+    if (error instanceof Error && error.name === 'AbortError')
       throw new AiSdkWorkspaceToolError('ABORTED');
     throw new AiSdkWorkspaceToolError('PROVIDER');
   }
